@@ -164,7 +164,7 @@ def build_material_rows(design_dir, log=None) -> Optional[List[dict]]:
         try:
             rows.extend(parse_boxspec(f, log))
         except BoxspecError as e:
-            log.error(f"boxspec の解析に失敗したため material.csv を作成しません: {e}")
+            log.warning(f"boxspec の解析に失敗したため material.csv を作成しません(部分的な一覧は出さず、他の処理は続行します): {e}")
             return None
     return rows
 

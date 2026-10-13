@@ -71,6 +71,14 @@ class ParseTest(BoxspecBase):
         self.assertEqual(spec["STEEL-ROOF"], "ROOF-X")
         self.assertNotEqual(bm.NOTHING, bm.NOT_DESCRIBED)
 
+    def test_empty_value_and_missing_key_are_both_not_described_but_not_nothing(self):
+        write_boxspec(self.design, "8.boxspec", ["シンボル名$BSP-STEELA-H|STEEL-BASE$|STEEL-SIDE$無し|"])
+        spec = {r["COMPONENT_CODE"]: r["MATERIAL_SPEC"] for r in bm.parse_boxspec(self.design / "8.boxspec")}
+        self.assertEqual(spec["STEEL-BASE"], "未記載")           # 値が空
+        self.assertEqual(spec["STEEL-DOOR"], "未記載")           # キー無し
+        self.assertEqual(spec["STEEL-SIDE"], "無し")             # 明示値は別
+        self.assertEqual(sum(v == "無し" for v in spec.values()), 1)
+
     def test_unknown_steel_key_is_kept_and_logged(self):
         write_boxspec(self.design, "3.boxspec", ["シンボル名$BSP-STEELA-H|STEEL-BASE$B|STEEL-NEWPART$NEW-X|"])
         with self.assertLogs("cad_data.boxspec_material", level="WARNING") as cm:
@@ -150,8 +158,9 @@ class BuildTest(BoxspecBase):
     def test_one_bad_file_makes_the_whole_list_unavailable(self):
         write_boxspec(self.design, "1.boxspec", [STEEL_ALL])
         write_boxspec(self.design, "2.boxspec", ["シンボル名$BSP-STEELA-H|oops|"])
-        with self.assertLogs("cad_data.boxspec_material", level="ERROR"):
+        with self.assertLogs("cad_data.boxspec_material", level="WARNING") as cm:
             self.assertIsNone(bm.build_material_rows(self.design))
+        self.assertEqual([r.levelname for r in cm.records], ["WARNING"])
 
 
 class ExportTest(BoxspecBase):
@@ -169,12 +178,14 @@ class ExportTest(BoxspecBase):
         self.assertEqual(read_rows(path)[0]["COMPONENT_NAME"], "基礎ベース")
 
     def test_no_boxspec_creates_no_file(self):
-        self.assertIsNone(bm.export_material_csv(self.design, self.out))
+        with self.assertLogs("cad_data.boxspec_material", level="INFO") as cm:
+            self.assertIsNone(bm.export_material_csv(self.design, self.out))
+        self.assertEqual([r.levelname for r in cm.records], ["INFO"])
         self.assertFalse((self.out / "material.csv").exists())
 
     def test_parse_failure_creates_no_file_and_does_not_raise(self):
         write_boxspec(self.design, "1.boxspec", ["シンボル名$BSP-STEELA-H|oops|"])
-        with self.assertLogs("cad_data.boxspec_material", level="ERROR"):
+        with self.assertLogs("cad_data.boxspec_material", level="WARNING"):
             self.assertIsNone(bm.export_material_csv(self.design, self.out))
         self.assertEqual(list(self.out.iterdir()), [])
 
