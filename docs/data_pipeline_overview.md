@@ -59,3 +59,4 @@
 4. `estimate_code_processer.py`: ~~`estcode_stack_plate` が 2 回定義~~ → **S4 で解消**(2 つ目を `estcode_passage` へ改名)。集計用 DF の生成は純関数 `build_estcode_df` に分離済み。積算コードのうち集計されるのは操作パネル(`PANEL`)と盤内トランス(`TRANS`)のみで、他の列は常に初期値(`UNIMPLEMENTED_ESTCODE_COLUMNS` に一覧)。未実装コードの集計追加は別件。
 5. `app.py` に使われていない import(`cv2`、`re`、`time`、`datetime`/`timedelta`、`pd`)、デバッグ出力 `print(f"{log_text = }")`、ログの誤り(座標計算用 DF の CSV 名に外形図のパスを出している、対象ページの行が重複)がある。
 6. `docs/app.md` などの自動生成ドキュメントが古い(行数・関数一覧が実体と一致しない)。
+7. ~~`cad_data_process.py` が約 780 行で、表データ処理・図枠・印刷/変換が同居~~ → **S5 で解消**: `cad_data/` の 3 モジュール(`baninf_tables`・`frame_scale`・`print_convert`)に分割し、`cad_data_process.py` は公開名を再エクスポートする窓口。呼び出し側は従来どおり `cad_mod.<関数名>` を使う(`docs/refactor_plan.md` §9)。

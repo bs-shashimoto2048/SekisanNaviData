@@ -28,11 +28,11 @@
 | S2 | `main()` の製番処理を `process_product(ctx)` と Step.1〜5 の関数に分割。`ProductContext`(パス・設定・logger・DF)と `ProductResult` を導入し、後始末(`_safe_rmtree`)を 1 か所へ | なし(統合テスト・契約テストが不変であること) | **完了**(§7) |
 | S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | **完了**(§7) |
 | S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | **完了**(§8) |
-| S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | 未着手 |
+| S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | **完了**(§9) |
 | S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | 未着手 |
 | S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
 
-## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8)
+## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8、S5 は §9)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
@@ -40,6 +40,7 @@
 | 2026-10-13 | S2 | `pipeline/product_flow.py`、`tests/test_product_flow.py`(28 件)を追加。`app.main()` の製番ループを Step 関数へ分割、後始末・結果記録を `run_product` に集約 | データ側 109 件・推論側 27 件 OK・`pip check` OK。12 シナリオで分割前後のログ・削除要求・生成物が一致 | なし(§6) |
 | 2026-10-13 | S3 | `pipeline/settings.py`(`Settings`・`load_settings`・`build_inference_manager`)、`tests/test_settings.py`(15 件)を追加。`app.main()` の設定読込・サンプル設定の拒否・推論サーバー設定の検証を移動 | データ側 124 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S2 時点と一致。設定エラーの特性化テスト 4 件は S3 適用前のコードでも通過 | なし(§7) |
 | 2026-10-13 | S4 | `estimate_code_processer.py`: `build_estcode_df`(純関数)・`_base_diagram_maps` を切り出し、`estcode_stack_plate` の重複定義を解消(2 つ目を `estcode_passage` へ改名)、未実装の列・関数を `UNIMPLEMENTED_ESTCODE_COLUMNS` と docstring で明記。`tests/test_estimate_code_rules.py`(17 件)を追加 | データ側 141 件・推論側 27 件 OK・`pip check` OK。旧モジュールとの差分比較(36 通り: DataFrame・dtype・CSV バイト列・後続集計・例外)が完全一致 | なし(§8) |
+| 2026-10-13 | S5 | `cad_data_process.py`(778 行)を `cad_data/baninf_tables.py`・`frame_scale.py`・`print_convert.py` に分割し、窓口(52 行)から公開名を再エクスポート。`tests/test_cad_data_split.py`(12 件)を追加 | データ側 153 件・推論側 27 件 OK・`pip check` OK。関数本体が分割前と AST で同一(24 関数 + 定数 1)、12 シナリオのログ・削除要求・生成物が S4 時点と一致 | なし(§9) |
 
 ## 6. S2 の実施結果(2026-10-13)
 `app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
@@ -119,6 +120,33 @@
 - 名前の変更は `estcode_stack_plate`(2 つ目)→ `estcode_passage` のみ。この名前を参照するコードは無い(`docs/estimate_code_processer.md` の関数一覧は更新済み)。
 - 残課題(S4 の範囲外): 未実装の積算コードの集計追加(出力に数量が入るため SekisanNavi 側の確認が要る)。`estcode_panel` と `estcode_transformer` の共通処理(`safe_int` など)の共通化は、挙動を変えないことの検証が要るため見送った。
 
-## 9. 未確認・入力待ち(改修では解消しない)
+## 9. S5 の実施結果(2026-10-13)
+`cad_data_process.py`(778 行)を、役割別の 3 モジュールに分割した。**関数本体は 1 文字も変えていない**(移動のみ)。公開名(関数 24 + 定数 1)・呼び出し方(`import cad_data_process as cad_mod` → `cad_mod.<名前>`)・挙動・ログ・出力は分割前と同じ。
+
+### 構成
+| ファイル | 役割 | 内容 |
+|---|---|---|
+| `cad_data/baninf_tables.py`(約 400 行) | 設計データ → 盤情報の表(pandas とファイルのみ。CAD・画像・サブプロセスに依存しない) | `to_numeric_safe`、`clean_zumei`、`safe_apply`、`export_csv`、`assign_detect_area_standard`、`assign_detect_area_foundation`、`load_baninf`、`side_view_classifier`、`filter_calc_export`、`natural_key`、`export_ban_data`、`merge_and_sort_csvs` |
+| `cad_data/frame_scale.py`(約 180 行) | 図枠の検出(画像)・寸法の取得(DXF)・縮尺の書き戻し | `specified_frame_detection`(cv2)、`get_frame_size`(ezdxf)、`update_frame_info` |
+| `cad_data/print_convert.py`(約 180 行) | 印刷・変換・ファイル補助 | `EXCLUDED_PAGE_PREFIX`、`is_excluded_page`、`list_print_pages`、`chunk_list`、`countdown`、`convert_dwg2dxf`、`copy_files_from_list`、`is_file_in_use`(msvcrt)、`file_exists`、`listing_files` |
+| `cad_data_process.py`(52 行) | **窓口**。上の 25 の名前を再エクスポートするだけ(同一オブジェクト) | |
+
+### 守った点
+- **テストの差し替え点**: 既存テストは `mock.patch.object(app.cad_mod, "countdown" など, ...)` で窓口の属性を差し替える。呼び出し側(`app.py`・`pipeline/`・各スクリプト)は必ず窓口経由で呼ぶ(`cad_data/` を直接 import しない)ことをテストで固定した。実装モジュール内の関数同士の呼び出し(`list_print_pages` → `is_excluded_page`)は差し替えの対象外(従来も、テストが差し替えるのは `countdown`・`is_file_in_use`・`convert_dwg2dxf` など外部に触れる関数だけ)。
+- **実装モジュール同士・窓口へは import しない**(循環・依存の逆転を防ぐ)。移動した 24 関数は、分割前から相互の呼び出しが分割後の同じモジュール内に収まる(依存は `baninf_tables` 内の関数同士と `print_convert` 内の 1 組のみ)。
+
+### 検証
+- 機械的な確認(手元のスクリプト): (1) 24 関数と定数 1 の **AST が分割前と完全一致**、(2) 各モジュールに**未定義名がない**(最初の分割で `Path`・`OrderedDict`・`List` の import 漏れを検出し、補った)、(3) 窓口が 25 の名前すべてを実装と同一のオブジェクトで公開。
+- 擬似環境の 12 シナリオ(S2 の §6 と同じ。図枠検出・DXF 読込・縮尺計算は実際の関数を通る)で、S4 時点とログ全文・`rmtree` の呼び出し・生成物・外部呼び出し・標準出力が完全一致。
+- `tests/test_cad_data_split.py`(12 件): 挙動 7 件(`chunk_list`・`natural_key`・`update_frame_info`・`merge_and_sort_csvs`・`get_frame_size`・`file_exists`/`listing_files`・除外ページ。**分割前のコードでも同じ結果で通る**ことを確認)、構造 5 件(窓口の公開名と実装の同一性、役割ごとの import の分離、呼び出し側が窓口経由であること、窓口の差し替えが呼び出し側に効くこと)。
+- テスト: データ側 153 件 OK(従来 141 件 + 12 件)、推論側 27 件 OK、`pip check` OK。
+
+### 互換性への影響・残課題
+- 出力契約・SekisanNavi の読み込み契約・処理順・ログ・失敗/スキップ・後始末・推論サーバー連携・IJCAD の `close y`・積算ロジック(未実装列を含む): **変更なし**。呼び出し側(`app.py`・`pipeline/`・`0.py`・`create_template.py`・`app_20251204.py`・`tools/`・tests)の変更なし。
+- 変わるのは、各関数の `__module__`(`cad_data.<モジュール名>`)と、例外のトレースバックに出るファイルパスだけ。
+- 未実装の積算列の集計は、今回も追加していない(数量・集計ロジックの仕様確認が先。確認事項: 各列の積算コードの判定条件、検出クラス名との対応、`INPUT_CU_COEFF` の係数の算出方法。いずれも仕様が資料にないため推測しない)。
+- 残課題(S5 の範囲外): 関数内のデバッグ `print`・未使用変数の整理(S7)。`docs/cad_data_process.md`(自動生成の解説)は構成の注記のみ追加し、全面的な再生成は S7。
+
+## 10. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。

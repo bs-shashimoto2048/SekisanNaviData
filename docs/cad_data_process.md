@@ -1,5 +1,7 @@
 # `cad_data_process.py` 詳細分析
 
+> **S5(2026-10-13)で役割別に分割した。** `cad_data_process.py` は窓口で、実装は `cad_data/baninf_tables.py`(表データ処理)・`cad_data/frame_scale.py`(図枠・縮尺)・`cad_data/print_convert.py`(印刷・変換・ファイル補助)にある。関数の仕様は以下のとおりで変わらない。呼び出し側は従来どおり `import cad_data_process as cad_mod` を使う(`docs/refactor_plan.md` §9)。
+
 ## このコードが行うこと
 `cad_data_process.py` は、図面解析パイプラインの中核ユーティリティです。  
 役割は大きく5系統あります。
