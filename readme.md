@@ -1,5 +1,7 @@
 > **セットアップ**: 社内共通パッケージ `bs_pkg` はこのリポジトリに含まれません。導入手順は [docs/setup.md](docs/setup.md) を参照してください。
 
+> **処理フロー・出力契約・改修計画**は [docs/data_pipeline_overview.md](docs/data_pipeline_overview.md) と [docs/refactor_plan.md](docs/refactor_plan.md) を参照してください(ブランチ `refactor/data-pipeline` で大規改修中)。
+
 > **図面印刷の仕様**(印刷対象・X始まりの除外・印刷位置)は [docs/print_spec.md](docs/print_spec.md) を参照してください。
 
 
