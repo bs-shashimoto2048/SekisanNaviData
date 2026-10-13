@@ -35,6 +35,7 @@ from bs_pkg import config_loader, design_mod, host_mod, image_mod, util_mod
 # Dedicated Module: 専用モジュール, スクリプト内の処理は全て外出しのモジュールで行う。
 import cad_data_process as cad_mod        # CAD/設計データ・画像解析用
 import estimate_code_processer as est_mod # 積算コード集計・算出用
+from pipeline import page_plan as page_plan_mod # 印刷・推論の対象ページ選別(純粋な処理)
 import print_support                      # 印刷スクリプト(WIRING.SCR)作成: 印刷位置を用紙中央に配置
 import inference_support                  # 推論サーバー(別プロセス・別venv)の起動・確認・停止(検証設定でのみ使用)
 
@@ -300,23 +301,21 @@ def main(config_path=None): # 社内図面解析処理
                     logger.info(f"{'-'*60}\n")
     
                     logger.info(f"対象ページ取得:")
-                    baninf_pages = product_df["PAGE"].dropna().unique().tolist()
-                    baninf_pages = sorted([str(p) for p in baninf_pages]) # 昇順にソート
-                    # X/x 始まりの図面は、印刷・画像化・推論・データ作成のいずれにも入れない
-                    baninf_pages = [p for p in baninf_pages if not cad_mod.is_excluded_page(p)]
-                    product_df = product_df[~product_df["PAGE"].astype(str).map(cad_mod.is_excluded_page)]
+                    # X/x 始まりの図面は、印刷・画像化・推論・データ作成のいずれにも入れない。選別は pipeline.page_plan
+                    plan = page_plan_mod.build_page_plan(product_df, dir_design_product, converter_extension)
+                    product_df = plan.product_df
+                    baninf_pages = plan.inference_pages
                     logger.info(f" └> 推論対象ページ(従来の選び方、X始まりを除く): {baninf_pages = }")
 
                     # 印刷対象: 設計製番フォルダの図面のうちX/x始まりを除く全ページ。推論対象以外はPDF印刷だけ行う
-                    print_pages = cad_mod.list_print_pages(dir_design_product, converter_extension)
-                    pdf_only_pages = [p for p in print_pages if p not in baninf_pages]
+                    print_pages = plan.print_pages
+                    pdf_only_pages = plan.pdf_only_pages
                     logger.info(f" └> 印刷対象ページ({len(print_pages)}件): {print_pages = }")
                     logger.info(f" └> PDF印刷のみのページ({len(pdf_only_pages)}件): {pdf_only_pages = }\n")
-                    missing_pages = [p for p in baninf_pages if p not in print_pages]
-                    if not baninf_pages or missing_pages:
-                        if missing_pages:
-                            logger.warning(f"推論対象ページの図面が設計フォルダにありません: {missing_pages}")
-                            results["failed"][product] = f"推論対象の図面がありません: {missing_pages}(未完了)"
+                    if plan.status != page_plan_mod.OK:
+                        if plan.status == page_plan_mod.MISSING_DRAWINGS:
+                            logger.warning(f"推論対象ページの図面が設計フォルダにありません: {plan.missing_pages}")
+                            results["failed"][product] = f"推論対象の図面がありません: {plan.missing_pages}(未完了)"
                         else:
                             logger.warning(f"推論対象ページがありません(印刷対象 {len(print_pages)} 件): {product}")
                             results["skipped"][product] = "推論対象ページなし"
