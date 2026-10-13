@@ -29,10 +29,10 @@
 | S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | **完了**(§7) |
 | S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | **完了**(§8) |
 | S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | **完了**(§9) |
-| S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | 未着手 |
+| S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | **完了**(§10) |
 | S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
 
-## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8、S5 は §9)
+## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8、S5 は §9、S6 は §10)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
@@ -41,6 +41,7 @@
 | 2026-10-13 | S3 | `pipeline/settings.py`(`Settings`・`load_settings`・`build_inference_manager`)、`tests/test_settings.py`(15 件)を追加。`app.main()` の設定読込・サンプル設定の拒否・推論サーバー設定の検証を移動 | データ側 124 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S2 時点と一致。設定エラーの特性化テスト 4 件は S3 適用前のコードでも通過 | なし(§7) |
 | 2026-10-13 | S4 | `estimate_code_processer.py`: `build_estcode_df`(純関数)・`_base_diagram_maps` を切り出し、`estcode_stack_plate` の重複定義を解消(2 つ目を `estcode_passage` へ改名)、未実装の列・関数を `UNIMPLEMENTED_ESTCODE_COLUMNS` と docstring で明記。`tests/test_estimate_code_rules.py`(17 件)を追加 | データ側 141 件・推論側 27 件 OK・`pip check` OK。旧モジュールとの差分比較(36 通り: DataFrame・dtype・CSV バイト列・後続集計・例外)が完全一致 | なし(§8) |
 | 2026-10-13 | S5 | `cad_data_process.py`(778 行)を `cad_data/baninf_tables.py`・`frame_scale.py`・`print_convert.py` に分割し、窓口(52 行)から公開名を再エクスポート。`tests/test_cad_data_split.py`(12 件)を追加 | データ側 153 件・推論側 27 件 OK・`pip check` OK。関数本体が分割前と AST で同一(24 関数 + 定数 1)、12 シナリオのログ・削除要求・生成物が S4 時点と一致 | なし(§9) |
+| 2026-10-13 | S6 | `pipeline/inference_client.py`(推論に関する `image_mod` への依存を集約)、`docs/inference_contract.md`(契約)、`tests/test_inference_contract.py`(11 件)を追加。`product_flow` の推論呼び出し・失敗ログを置き換え | データ側 164 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S5 時点と一致 | なし(§10) |
 
 ## 6. S2 の実施結果(2026-10-13)
 `app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
@@ -147,6 +148,30 @@
 - 未実装の積算列の集計は、今回も追加していない(数量・集計ロジックの仕様確認が先。確認事項: 各列の積算コードの判定条件、検出クラス名との対応、`INPUT_CU_COEFF` の係数の算出方法。いずれも仕様が資料にないため推測しない)。
 - 残課題(S5 の範囲外): 関数内のデバッグ `print`・未使用変数の整理(S7)。`docs/cad_data_process.md`(自動生成の解説)は構成の注記のみ追加し、全面的な再生成は S7。
 
-## 10. 未確認・入力待ち(改修では解消しない)
+## 10. S6 の実施結果(2026-10-13)
+推論サーバー統合の「依存点の集約」と「契約の文書化・テスト化」を行った。本番サーバーの版・`torch` など管理者情報が要る項目は、契約から分離して「未確認」として記録した。**リクエスト・応答・ファイル形式・処理順・ログ・失敗/スキップ・後始末・推論サーバーの起動/停止は変えていない。**
+
+### 変更内容
+| 項目 | 内容 |
+|---|---|
+| 依存点の集約 | `pipeline/inference_client.py` を追加。推論に関する `bs_pkg.image_mod` の機能(`slice_prediction_request`・`log_formater`・`InferenceRequestError`)は、ここだけが呼ぶ。`step4_detect_objects` の依頼・戻り値の正規化(`None` / `bytes` / その他 → `str`、注意のログ)・ログ整形と、`run_product` の失敗内容のログを置き換えた。`timeout` は指定したときだけ渡す(従来どおり)。`image_mod` はモジュール属性経由で呼ぶため、テストの差し替え(`mock.patch.object(app.image_mod, "slice_prediction_request", …)`)はそのまま有効 |
+| 契約の文書化 | `docs/inference_contract.md`: 登場者と依存点、リクエスト(フォーム 3 項目)、応答(エンドポイントごとのステータス)、ファイル(`{page}_detected.txt` の形式・書き込み順・空ファイル・区切り文字の置換)、失敗の意味、設定のキー、**確定していないこと(本番サーバー側)** |
+| 契約テスト | `tests/test_inference_contract.py`(11 件)。クライアント層の単体(正規化・`timeout`・失敗の素通し・`product_flow` が推論に関する `image_mod` を直接使わないこと)と、クライアントが実際に送る内容 ⇔ サーバーの `validate_request`、サーバーの書式化関数の出力 ⇔ 後続の `create_detected_csv` の突き合わせ |
+
+### 検証
+- 擬似環境の 12 シナリオ(S2 の §6 と同じ。API が `InferenceRequestError` / 想定外の例外になる場合を含む)で、ログ全文・`rmtree` の呼び出し・生成物・外部呼び出し・標準出力が S5 時点と完全一致。
+- テスト: データ側 164 件 OK(従来 153 件 + 11 件)、推論側 27 件 OK、`pip check` OK。既存の統合・E2E・契約テストは変更なしで通過(`test_slice_prediction_request`・`test_inference_e2e` を含む)。
+
+### 契約から分離した「未確認」(コード変更なし。詳細は `docs/inference_contract.md` §7)
+- 本番の `server.py` の版・モデルのハッシュ、`torch` の版(2.5.1 か 2.6.0)、本番サーバーが同じ契約か、実図面での検出結果。
+- **本番サーバーが書く `_detected.txt` の文字コード**: 後続処理は UTF-8(`errors="ignore"`)で読むため、UTF-8 以外だと日本語のクラス名の文字がエラーにならず欠落するおそれがある(今回新たに明文化した確認事項。コードは変えていない)。
+- 後続処理が形式の崩れた行を黙ってスキップする挙動は、現行どおり(契約に明記。変更すると出力に影響しうるため別件)。
+
+### 互換性への影響・残課題
+- 出力契約・SekisanNavi の読み込み契約・処理順・ログ・失敗/スキップ・後始末・IJCAD の `close y`・推論サーバー連携: **変更なし**。
+- `product_flow` が `image_mod` を直接使うのは、推論に関係しない画像の作成(`pdf_to_images`・`process_images_from_jpeg`)だけ。
+- 残課題(S6 の範囲外): 形式の崩れた行をスキップせず警告する案(出力への影響の検討が要る)、本番サーバーの管理者確認(`docs/acceptance_handoff.md` §5)、デバッグ `print`・未使用 import の整理(S7)。
+
+## 11. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。

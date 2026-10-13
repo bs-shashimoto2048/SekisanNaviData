@@ -19,6 +19,7 @@ import cad_data_process as cad_mod        # CAD/設計データ・画像解析�
 import estimate_code_processer as est_mod # 積算コード集計・算出用
 import inference_support                  # 推論サーバー(別プロセス)との作業フォルダ共有確認
 import print_support                      # 印刷スクリプト(WIRING.SCR)作成: 印刷位置を用紙中央に配置
+from pipeline import inference_client       # 推論 API クライアント層(推論に関する image_mod への依存はここだけ)
 from pipeline import page_plan as page_plan_mod
 
 COMPLETED = "completed"
@@ -113,8 +114,9 @@ def run_product(ctx: ProductContext, results: dict):
         logger.error(f"Process Failed for product {ctx.product}: {e}\n")
         logger.error(traceback.format_exc())
         results["failed"][ctx.product] = f"{type(e).__name__}: {str(e)[:200]}"
-        if isinstance(e, image_mod.InferenceRequestError) and e.log_text:
-            logger.error(f"推論APIの失敗内容(製番 {ctx.product} は未完了):\n{image_mod.log_formater(e.log_text)}")
+        failure_log = inference_client.describe_failure(e)
+        if failure_log is not None:
+            logger.error(f"推論APIの失敗内容(製番 {ctx.product} は未完了):\n{failure_log}")
         cleanup_after_exception(ctx)
 
 
@@ -417,16 +419,13 @@ def step4_detect_objects(ctx: ProductContext) -> Optional[ProductResult]:
         logger.info(f" └> work_dir をサーバーと共有できていることを確認: {dir_product = }")
         request_kwargs["timeout"] = ctx.request_timeout
     # 失敗(HTTPエラー・接続失敗・検出ファイル未生成)は InferenceRequestError で送出され、この製番は失敗として扱われる
-    log_text = image_mod.slice_prediction_request(dir_product, ctx.baninf_pages, api_cnf_path, use_proxy=use_proxy, **request_kwargs)
-    if log_text is None:
-        logger.warning("API request log is None.")
-        log_text = ""
-    elif isinstance(log_text, (bytes, bytearray)):
-        log_text = log_text.decode("utf-8", errors="replace")
-    elif not isinstance(log_text, str):
-        logger.warning(f"Unexpected API request log type: {type(log_text)}")
-        log_text = str(log_text)
-    formatted_log = image_mod.log_formater(log_text) if log_text else ""
+    # (image_mod への依存は pipeline.inference_client に集約。契約は docs/inference_contract.md)
+    response = inference_client.request_detections(
+        dir_product, ctx.baninf_pages, api_cnf_path, use_proxy=use_proxy, **request_kwargs)
+    log_text = response.log_text
+    if response.warning:
+        logger.warning(response.warning)
+    formatted_log = inference_client.format_log(log_text)
     logger.info(f" └> リクエスト内容:\n{formatted_log}\n")
     print(f"{log_text = }")
 

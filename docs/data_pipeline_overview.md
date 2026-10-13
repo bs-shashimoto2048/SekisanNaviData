@@ -49,7 +49,7 @@
 
 ## 4. 推論サーバー統合
 - `inference_server/`(Flask、別 venv・別プロセス)を `inference_support.InferenceServerManager` が子プロセスとして起動・停止する(検証設定のみ)。loopback 限定、本番共有パスは拒否、親プロセス終了で自動終了。
-- クライアントは `image_mod.slice_prediction_request`(`bs_pkg`、社内コード)。失敗は `InferenceRequestError` で製番の失敗として扱う。
+- クライアントは `image_mod.slice_prediction_request`(`bs_pkg`、社内コード)。推論に関する `image_mod` への依存は `pipeline/inference_client.py` に集約(S6)。失敗は `InferenceRequestError` で製番の失敗として扱う。リクエスト・応答・ファイル形式・失敗の意味は [inference_contract.md](inference_contract.md)。
 - 本番の推論サーバー(`server.py`・モデル・`torch` の版)の正本は未確認(`docs/acceptance_handoff.md` §5)。
 
 ## 5. 読み取れた構造上の課題(改修の動機。挙動は未変更)
