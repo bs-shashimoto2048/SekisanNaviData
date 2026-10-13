@@ -213,6 +213,14 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info(f" └> CSV作成: 座標計算用 -> {config_loader.convert_win_path(ctx.product_df_path)}")
     logger.info(f" └> DataFrame作成(解析座標復元用): product_df \n")
 
+    # 材料一覧: 設計フォルダの *.boxspec -> material.csv(失敗しても製番の処理は続行。boxspec が無いのは通常の欠損)
+    logger.info("材料情報(boxspec -> material.csv):")
+    material_path = cad_mod.export_material_csv(ctx.dir_design_product, dir_product, log=logger)
+    if material_path:
+        logger.info(f" └> CSV作成: 材料 -> {config_loader.convert_win_path(material_path)}\n")
+    else:
+        logger.info(" └> material.csv は作成しませんでした\n")
+
     # 共通製作仕様書印刷 -> あれば焼く_2025/11/28
     logger.info(f"共通製作仕様書 印刷:")
     spec_sheets = ["1"]  # 共通製作仕様書(一般的な場)

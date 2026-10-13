@@ -18,6 +18,7 @@
 # (cad_data 配下のモジュールから直接 import しない)。
 #   - cad_data.baninf_tables : 設計データ(.baninf)→ 盤情報の表(DataFrame)・CSV
 #   - cad_data.frame_scale   : 図枠の検出・図枠寸法の取得・縮尺の書き戻し
+#   - cad_data.boxspec_material : 設計データの *.boxspec -> 製番の材料一覧 material.csv(分割後に追加)
 #   - cad_data.print_convert : 印刷対象の選別、5 枚ずつの分割、待機、DWG→DXF 変換、DWG コピー、図面使用中の判定
 from cad_data.baninf_tables import (  # noqa: F401
     assign_detect_area_foundation,
@@ -33,6 +34,7 @@ from cad_data.baninf_tables import (  # noqa: F401
     side_view_classifier,
     to_numeric_safe,
 )
+from cad_data.boxspec_material import export_material_csv  # noqa: F401  (設計データの *.boxspec -> material.csv。分割後に追加)
 from cad_data.frame_scale import (  # noqa: F401
     get_frame_size,
     specified_frame_detection,
