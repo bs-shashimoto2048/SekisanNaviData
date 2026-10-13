@@ -30,9 +30,9 @@
 | S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | **完了**(§8) |
 | S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | **完了**(§9) |
 | S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | **完了**(§10) |
-| S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
+| S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | **完了**(§11) |
 
-## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8、S5 は §9、S6 は §10)
+## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8、S5 は §9、S6 は §10、S7 は §11)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
@@ -42,6 +42,7 @@
 | 2026-10-13 | S4 | `estimate_code_processer.py`: `build_estcode_df`(純関数)・`_base_diagram_maps` を切り出し、`estcode_stack_plate` の重複定義を解消(2 つ目を `estcode_passage` へ改名)、未実装の列・関数を `UNIMPLEMENTED_ESTCODE_COLUMNS` と docstring で明記。`tests/test_estimate_code_rules.py`(17 件)を追加 | データ側 141 件・推論側 27 件 OK・`pip check` OK。旧モジュールとの差分比較(36 通り: DataFrame・dtype・CSV バイト列・後続集計・例外)が完全一致 | なし(§8) |
 | 2026-10-13 | S5 | `cad_data_process.py`(778 行)を `cad_data/baninf_tables.py`・`frame_scale.py`・`print_convert.py` に分割し、窓口(52 行)から公開名を再エクスポート。`tests/test_cad_data_split.py`(12 件)を追加 | データ側 153 件・推論側 27 件 OK・`pip check` OK。関数本体が分割前と AST で同一(24 関数 + 定数 1)、12 シナリオのログ・削除要求・生成物が S4 時点と一致 | なし(§9) |
 | 2026-10-13 | S6 | `pipeline/inference_client.py`(推論に関する `image_mod` への依存を集約)、`docs/inference_contract.md`(契約)、`tests/test_inference_contract.py`(11 件)を追加。`product_flow` の推論呼び出し・失敗ログを置き換え | データ側 164 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S5 時点と一致 | なし(§10) |
+| 2026-10-13 | S7 | デバッグ `print` 5 か所・`app.py` の未使用 import 6 つの削除、重複ログ 1 行・誤った出力先表示 1 行の修正、`docs/app.md`・`docs/estimate_code_processer.md` の機械的な節の更新。`tests/test_s7_cleanup.py`(10 件)を追加 | データ側 174 件・推論側 27 件 OK・`pip check` OK。12 シナリオの差分は意図した 3 種類のみ(ログ 1〜2 行、標準出力のデバッグ表示) | ログ文言と標準出力のみ(契約外。§11) |
 
 ## 6. S2 の実施結果(2026-10-13)
 `app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
@@ -172,6 +173,42 @@
 - `product_flow` が `image_mod` を直接使うのは、推論に関係しない画像の作成(`pdf_to_images`・`process_images_from_jpeg`)だけ。
 - 残課題(S6 の範囲外): 形式の崩れた行をスキップせず警告する案(出力への影響の検討が要る)、本番サーバーの管理者確認(`docs/acceptance_handoff.md` §5)、デバッグ `print`・未使用 import の整理(S7)。
 
-## 11. 未確認・入力待ち(改修では解消しない)
+## 11. S7 の実施結果(2026-10-13)
+計画書の S7(未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメントの再生成)を、参照と副作用を確認したうえで実施した。**出力契約(CSV/PDF/PNG)・SekisanNavi の読み込み契約・処理順・失敗/スキップ・後始末・推論契約・推論サーバーの起動/停止・IJCAD の `close y`・積算ロジックは変えていない。変わるのは、ログ 1〜2 行と、標準出力のデバッグ表示だけ。**
+
+### 削除・修正した項目と根拠
+| 項目 | 変更 | 根拠 |
+|---|---|---|
+| 標準出力のデバッグ `print`(`pipeline/product_flow.py`) | `print(f"{log_text = }")` を削除 | 推論 API の依頼ログの標準出力への重複表示。同じ内容は直後にロガー(`リクエスト内容:`)へ出ている。`{log_text = }` 形式のデバッグ表示 |
+| 標準出力のデバッグ `print`(`cad_data/frame_scale.py` の `get_frame_size`) | `DEBUG:` 付きの 2 行、`max_x = …`・`width = …` の 2 行、「対象オブジェクトが見つかりません」の 1 行を削除(戻り値は変更なし) | `DEBUG:` ラベル・`{x = }` 形式のデバッグ表示。戻り値・例外・ファイルへの副作用なし(テストで確認) |
+| 重複ログ | `図面解析用DF作成` の `対象ページ Total` の行が 2 回出ていたのを 1 回に | 完全に同じ行の重複 |
+| 誤った出力先表示 | `CSV作成: 座標計算用` の行が外形図 CSV のパスを出していたのを、実際の出力先 `product_df.csv` に | 同じ行が指す対象は `product_df.csv`(`cad_mod.export_csv(product_df, product_df_path)`)。外形図は直前の行で別に出している |
+| 未使用 import(`app.py`) | `cv2`・`pandas`・`re`・`time`・`datetime`/`timedelta`・`est_mod` を削除 | `app.py` 内・他ファイル・テストのどこからも `app.<名前>` として参照されない。`cv2`・`pandas` は `cad_data`・`pipeline` が引き続き import するため、読み込みの副作用も変わらない |
+
+### 残した「未使用」(誤判定して消さないための判断)
+- **`app.py` の `config_loader`・`design_mod`・`host_mod`・`image_mod`・`cad_mod`・`print_support`・`shutil`**: `app.py` 自身は使わないが、テストが `mock.patch.object(app.<名前>, …)` で差し替える**接点**(同じモジュールオブジェクトを指す)。削除するとテストが壊れる。コメントを付け、`tests/test_s7_cleanup.py` で「未使用 import は、この接点だけであり、各接点を差し替えるテストが実在する」ことを固定した。
+- **`cad_data_process.py` の再エクスポート**(S5): `# noqa: F401`。公開名そのもの。
+- **`estimate_code_processer.py` の `estcode_transformer` 内の `required_edit`**: 代入されるが使われない。`edit_df` の必須列(`BAN_MENNO`・`TRANS`)の検証が書きかけの可能性があり、**削除も検証の追加もしない**(積算ロジックに触れるため。確認事項として記録)。
+- **`0.py`・`1.py`・`test.py`・`app_20251204.py`・`tools/verify_real_model.py` の未使用 import / `print`**: 用途未確定ファイル・過去版・手動ツール(`docs/file_inventory.md`)。テストの対象外で、整理の効果より誤りのリスクが大きいため触れない。
+- 標準出力の情報表示(`切り抜き画像を保存しました`・`detected.csv を作成しました`・`Copied: …`・DWG→DXF 変換ソフトの標準出力・待機中のカウントダウン)は、デバッグ表示ではなく運用上の経過表示なので残した。
+
+### 自動生成ドキュメント
+- **生成手順はリポジトリに定義されていない**(生成スクリプト・手順書なし。`git grep` で確認)。そのため「定められた手順での再生成」はできず、**新しい生成器を作ってコミットすることもしていない**。
+- 既存の生成形式(基本情報・import 一覧・トップレベル変数・関数・クラス)を調べ、規則(非公開名は載せない、行数は `split("
+")` の件数)を既存の記載から読み取って、**機械的に導ける節だけ**を AST から更新した: `docs/app.md`(行数 436 → 210、import・関数一覧)、`docs/estimate_code_processer.md`(行数、変数 `ESTCODE_COLUMNS` などと関数 `build_estcode_df` の追加。S4 で手書きした「定数」節は概要に移した)。**手書きの概要は保持**し、構成の注記を足した。
+- 他の生成形式のドキュメント(`app_20251204.md`・`install_requirements.md`・`test.md`)は、行数・関数一覧が実体と一致していることを確認した(行数は `split("
+")` の規則どおり)。手書きの解説(`0.md`・`1.md`・`cad_data_process.md`)は更新していない。
+- リンク切れ 0 件。更新は 2 ファイルのみ。
+
+### 検証
+- 擬似環境の 12 シナリオを S6 時点と比較し、差分が**意図した 3 種類だけ**であることを機械的に確認した: (1) `対象ページ Total` の重複 1 行の減少、(2) `座標計算用` の行の出力先、(3) 標準出力のデバッグ表示の減少(`log_text = `・`max_x = `・`width = `・`DEBUG:`)。`rmtree` の呼び出し・生成物・印刷・変換・API・DWG 使用確認の呼び出しは**完全一致**。
+- `tests/test_s7_cleanup.py`(10 件): 重複ログが 1 回、座標計算用の行が `product_df.csv`、他の CSV の行は不変、依頼内容が引き続きロガーに出る、標準出力にデバッグ表示が出ない、`get_frame_size` が無出力で同じ値を返す(図枠なしは `(0, 0)`)、`app.py` に残る未使用 import が接点だけ。
+- テスト: データ側 174 件 OK(従来 164 件 + 10 件)、推論側 27 件 OK、`pip check` OK。既存の出力契約テスト・統合テスト・E2E は変更なしで通過。
+
+### 互換性への影響・未解決事項
+- ログのファイル(`logs/*.log`)の内容が変わるのは、重複 1 行の削除と `座標計算用` の行の出力先の 2 点。ログを機械処理している運用がある場合は、この 2 行に依存していないか確認してほしい(リポジトリ内には依存するコードなし)。標準出力は、デバッグ表示が減るだけ。
+- 未解決: `required_edit` の扱い(積算ロジックの確認が要る)。生成ドキュメントの生成手順が未定義(今後も手作業になる。必要なら生成スクリプトの整備を別件で検討)。形式の崩れた行のスキップ(S6)。
+
+## 12. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。

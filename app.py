@@ -18,26 +18,21 @@
 # Library:
 # ##############################################################################
 # Common:
-from datetime import datetime,timedelta
 import os
 from pathlib import Path
-import re
-import shutil    # ディレクトリごと削除するために使用
+import shutil    # テストが app.shutil.rmtree を差し替える(削除の実体は pipeline.product_flow)
 import sys
-import time
 import traceback # トレースバック出力に使用
 import warnings
-# Third Pparty:
-import cv2          # opencv-python
-import pandas as pd # pandas
 # Betsukawa_Packages: 社内共通モジュール
+# ※ config_loader・design_mod・host_mod・image_mod と下の cad_mod・print_support は、このファイル自身では使わないが、
+#    テストが mock.patch.object(app.<名前>, ...) で差し替える接点(同じモジュールオブジェクトを指す)なので削除しない。
 from bs_pkg import config_loader, design_mod, host_mod, image_mod, util_mod
 # Dedicated Module: 専用モジュール, スクリプト内の処理は全て外出しのモジュールで行う。
-import cad_data_process as cad_mod        # CAD/設計データ・画像解析用
-import estimate_code_processer as est_mod # 積算コード集計・算出用
+import cad_data_process as cad_mod        # CAD/設計データ・画像解析用(テストの差し替え点)
 from pipeline import product_flow     # 製番 1 件の処理(Step.1〜5)・結果記録・失敗時の後始末
 from pipeline import settings as settings_mod # 設定の読込・検証(サンプル設定の拒否、出力先、推論サーバー設定の検証)
-import print_support                      # 印刷スクリプト(WIRING.SCR)作成: 印刷位置を用紙中央に配置
+import print_support                      # 印刷スクリプト(WIRING.SCR)作成(テストの差し替え点)
 import inference_support                  # 推論サーバー(別プロセス・別venv)の起動・確認・停止(検証設定でのみ使用)
 
 # ##############################################################################

@@ -130,7 +130,6 @@ def get_frame_size(dxf_file: str) -> tuple[int, int]:
                 all_y.extend([float(start[1]), float(end[1])])
 
     if not all_x or not all_y:
-        print("DEBUG: 対象オブジェクトが見つかりません。")
         return 0, 0
 
     max_x = max(all_x)
@@ -138,12 +137,6 @@ def get_frame_size(dxf_file: str) -> tuple[int, int]:
 
     width = int(max_x)
     height = int(max_y)
-
-    print(f"{max_x = },{max_y = }")
-    print(f"{width = },{height = }")
-
-    print(f"DEBUG: min_x={min(all_x)}, max_x={max_x}, min_y={min(all_y)}, max_y={max_y}")
-    print(f"DEBUG: Frame Size(width,height) = {width}, {height}")
 
     return width, height
 

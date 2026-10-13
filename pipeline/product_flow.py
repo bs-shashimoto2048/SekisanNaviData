@@ -200,7 +200,6 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     # -> 解析用DF出力、その読込図面ファイル名リストを取得
     import_dwg_names, csv_c, csv_f, csv_o = cad_mod.export_ban_data(df, dir_product, f"{ctx.product}")
     logger.info(f" └> 対象ページ Total: {len(import_dwg_names)}, {import_dwg_names = }")
-    logger.info(f" └> 対象ページ Total: {len(import_dwg_names)}, {import_dwg_names = }")
     logger.info(f" └> CSV作成: 内器図 -> {config_loader.convert_win_path(csv_c)}")
     logger.info(f" └> CSV作成: 基礎図 -> {config_loader.convert_win_path(csv_f)}")
     logger.info(f" └> CSV作成: 外形図 -> {config_loader.convert_win_path(csv_o)}")
@@ -211,7 +210,7 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     ctx.product_df = cad_mod.merge_and_sort_csvs(csv_list, sort_by)
     ctx.product_df_path = os.path.join(dir_product, "product_df.csv")
     cad_mod.export_csv(ctx.product_df, ctx.product_df_path)
-    logger.info(f" └> CSV作成: 座標計算用 -> {config_loader.convert_win_path(csv_o)}")
+    logger.info(f" └> CSV作成: 座標計算用 -> {config_loader.convert_win_path(ctx.product_df_path)}")
     logger.info(f" └> DataFrame作成(解析座標復元用): product_df \n")
 
     # 共通製作仕様書印刷 -> あれば焼く_2025/11/28
@@ -427,7 +426,6 @@ def step4_detect_objects(ctx: ProductContext) -> Optional[ProductResult]:
         logger.warning(response.warning)
     formatted_log = inference_client.format_log(log_text)
     logger.info(f" └> リクエスト内容:\n{formatted_log}\n")
-    print(f"{log_text = }")
 
     # YOLO検出結果よりCAD座標へ変換したデータを作成
     # - 積算の判断で用いる座標はYOLOで得られた座標を元座標へ直して検出する
