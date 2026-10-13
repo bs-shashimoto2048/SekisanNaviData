@@ -1,0 +1,10 @@
+# Real YOLO backend (NOT installed in the verification venv; not exercised by the automated tests).
+# Pins copied from the provenance copy's requirements.txt (UTF-16 there). Install on the machine that has the GPU/model.
+-r requirements.txt
+sahi==0.11.15
+ultralytics==8.2.2
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+numpy==1.24.4
+opencv-python==4.7.0.72
+pillow==10.3.0

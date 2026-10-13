@@ -1,0 +1,14 @@
+# Dependencies for SekisanNaviData (from old venv freeze + imports). No torch/ultralytics/jupyter: inference goes through the API server.
+numpy==2.1.1
+pandas==2.2.3
+opencv-python==4.11.0.86
+ezdxf==1.4.3
+chardet==5.2.0
+pillow==11.1.0
+pillow_heif==0.22.0
+PyMuPDF==1.26.6
+requests==2.32.3
+PyYAML==6.0.2
+pywin32==308
+# bs_pkg (internal shared package) is NOT on PyPI/GitHub and is not part of this repository.
+# Obtain it from the internal package maintainer and install it separately: see docs/setup.md

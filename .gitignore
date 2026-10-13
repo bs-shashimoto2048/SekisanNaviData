@@ -1,0 +1,54 @@
+# 接続情報などの秘密値(追跡対象外)
+packages/bs_pkg/bs_pkg/config/*.local.yaml
+*.local.yaml
+.env
+.env.*
+
+# 仮想環境・キャッシュ・生成物
+.venv/
+inference_server/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+*.log
+*.tmp
+*.bak
+
+# 実行時の出力・検証用出力(実データ由来を含む)
+output/
+output_test/
+debug_images/
+inference_server/.infer_tmp/
+
+# 退避・旧版のバックアップ(旧運用の設定・社内パスを含む)
+_backup/
+
+# 実データ(図面・CAD・PDF・CSV・画像)とモデル。公開可否が未確認のものはコミットしない
+*.dwg
+*.dxf
+*.pdf
+*.csv
+*.jpeg
+*.jpg
+*.pt
+*.pth
+*.onnx
+*.ckpt
+result.png
+back.png
+docs/*.png
+
+# 社内共通パッケージ bs_pkg(社内コード)はリポジトリに含めない。ローカルに置いて pip install -e で使う(docs/setup.md)
+packages/bs_pkg/
+# bs_pkg のソース差分の記録(社内コードを含む)
+docs/bs_pkg_version_diff.md
+
+# 無関係な別ツールのコピー(ファイル名変更GUI。SekisanNaviData では使わない。Issue #1 で整理済み)
+file_renamer_gui.*
+*.spec
+
+# local-only text config (production host list etc.)
+*.local.txt

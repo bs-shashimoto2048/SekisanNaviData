@@ -1,0 +1,40 @@
+# *******************************************
+# メインプログラム設定ファイル
+# *******************************************
+# メイン処理使用データ
+data:
+  output: ./output_test  # TEST ONLY
+  storage: a_product                     # データ格納先
+  initials: A1                           # 処理対象製番頭文字:先頭2文字
+  box_types: ["OS", "IS", "OA", "IA"]    # 処理対象箱体型式
+
+# API設定ファイル参照先
+api:
+  dir_venv: ./output_test/api
+  yaml_file: server.yaml
+  use_proxy: false                       # 検証用: プロキシを使わない(本番 app.yaml には無く、省略時は従来どおり使用)
+
+# 座標算出時に参照する各データの名称・拡張子
+data_extension:
+  target_draw: .baninf         # 参照データ拡張子(他の処理で実質的にこれが対象になるので使用していない)
+  cubicle_size: .cbbox         # 盤寸法情報
+  original_draw: .png          # 解析前図面 <- .jpeg
+  detected_draw: _detected.txt # 検出座標
+  convert_bfr: .dwg            # 変換前CAD拡張子
+  convert_aft: .dxf            # 変換後CAD拡張子(使うてないンちゃう？)
+
+dwg_conversion:
+  converter: C:/Program Files/ODA/ODAFileConverter 26.10.0/ODAFileConverter.exe  # 検証用: ローカルの変換ソフト(本番共有上は不可)
+  cad_version: ACAD2018
+# 推論サーバー統合(検証用・Issue #52)。true にすると app.main が別venvの推論サーバーを起動し、ready 確認後に処理を開始する。
+# 本番 app.yaml にはこの項目はなく、省略=無効(従来動作)。詳細は docs/inference_server.md
+inference_server:
+  enabled: false
+  port: 18765                            # 検証専用の固定ポート(loopback)
+  backend: fake                          # fake: テスト用(モデル不要) / sahi: 実モデル(下の python と model_dir が必要。手順は docs/inference_server.md §7)
+  # 実モデルで使う場合は次を有効にする(いずれもローカルのパス。model_dir は読み取りのみ):
+  # python: <sahi/ultralytics/torch が入った推論用 venv>/Scripts/python.exe
+  # model_dir: <model.yaml と best.pt があるフォルダ>
+  fake_script: ./inference_server/fake_example.json
+  startup_timeout: 180                   # ready までの待ち時間[秒]
+  stop_timeout: 15
