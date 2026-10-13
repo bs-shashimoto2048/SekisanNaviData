@@ -35,7 +35,8 @@ from bs_pkg import config_loader, design_mod, host_mod, image_mod, util_mod
 # Dedicated Module: 専用モジュール, スクリプト内の処理は全て外出しのモジュールで行う。
 import cad_data_process as cad_mod        # CAD/設計データ・画像解析用
 import estimate_code_processer as est_mod # 積算コード集計・算出用
-from pipeline import product_flow # 製番 1 件の処理(Step.1〜5)・結果記録・失敗時の後始末
+from pipeline import product_flow     # 製番 1 件の処理(Step.1〜5)・結果記録・失敗時の後始末
+from pipeline import settings as settings_mod # 設定の読込・検証(サンプル設定の拒否、出力先、推論サーバー設定の検証)
 import print_support                      # 印刷スクリプト(WIRING.SCR)作成: 印刷位置を用紙中央に配置
 import inference_support                  # 推論サーバー(別プロセス・別venv)の起動・確認・停止(検証設定でのみ使用)
 
@@ -51,18 +52,11 @@ SCR_NAME = SCR_PATH.stem        # File-Name:Self Script
 # Maine Function:
 # ##############################################################################
 def default_config_path() -> str:
-    """設定ファイルの既定。社内の共有パス等を書いたローカル設定 app.local.yaml(Git管理外)があればそれを、無ければ app.yaml(サンプル)。"""
-    local = Path(MDL_DIR) / f"{SCR_NAME}.local.yaml"
-    return str(local) if local.is_file() else f"{MDL_DIR}/{SCR_NAME}.yaml"
+    """設定ファイルの既定。ローカル設定 app.local.yaml(Git管理外)があればそれを、無ければ app.yaml(サンプル)。実体は pipeline.settings。"""
+    return settings_mod.default_config_path(MDL_DIR, SCR_NAME)
 
-def _assert_not_sample_config(config_data:dict, path:str):
-    """サンプルのまま(プレースホルダ '<...>' が残っている)の設定では実行しない。"""
-    for section, key in (("data", "output"), ("api", "dir_venv"), ("dwg_conversion", "converter")):
-        value = str((config_data.get(section) or {}).get(key, ""))
-        if "<" in value:
-            raise RuntimeError(
-                f"{path} はサンプル設定です({section}.{key} が未設定)。app.local.yaml を作成して実際の値を設定してください"
-                f"(手順は docs/setup.md の「ローカル設定」)。")
+# サンプル設定の拒否は pipeline.settings(旧名のまま使えるように別名を残す)
+_assert_not_sample_config = settings_mod.assert_not_sample_config
 
 # 出力ルート配下限定の削除(旧名のまま使えるように別名を残す。実体は pipeline.product_flow)
 _is_under = product_flow.is_under
@@ -74,47 +68,28 @@ def main(config_path=None): # 社内図面解析処理
 
     # Initialize:Value
     # config_path 省略時は app.local.yaml(Git管理外のローカル設定)があればそれを、無ければ app.yaml(サンプル)を読む。
-    # 指定時はそのYAML(検証用 app_test.yaml 等)を読む
-    my_yaml_path:str = str(config_path) if config_path is not None else default_config_path()
-    config_data = config_loader.load_yaml(my_yaml_path)
-    if config_path is None:
-        _assert_not_sample_config(config_data, my_yaml_path)
+    # 指定時はそのYAML(検証用 app_test.yaml 等)を読む。読込・サンプル設定の拒否・出力先の決定は pipeline.settings
+    cfg = settings_mod.load_settings(config_path, default_path=default_config_path)
+    config_data = cfg.config_data
     # -> Set:作業ディレクトリ
-    data_dir:str = config_data["data"]["output"]
-    # 推論サーバー統合(検証用)。app.yaml には無く、省略時(無効)は従来動作のまま。
-    infer_cfg:dict = config_data.get("inference_server") or {}
-    infer_enabled:bool = bool(infer_cfg.get("enabled", False))
-    if infer_enabled:
-        data_dir = os.path.abspath(data_dir) # work_dir をサーバーと共有できる絶対パスにする
-    storage:str = config_data["data"]["storage"]
-    product_dir = os.path.join(data_dir,storage)
-    log_dir:str = os.path.join(product_dir,"logs")
-    output_dir:str = os.path.join(product_dir,"output")
+    data_dir:str = cfg.data_dir
+    product_dir = cfg.product_dir
+    log_dir:str = cfg.log_dir
+    output_dir:str = cfg.output_dir
 
     # 推論サーバー統合の設定を、出力フォルダ・ログの作成より前に検証する(本番共有・範囲外ならここで InferenceServerError。何も書かない)
-    manager = None
-    if infer_enabled:
-        settings = inference_support.InferenceServerSettings.from_config(infer_cfg)
-        api_cfg_path = os.path.abspath(os.path.join(config_data["api"]["dir_venv"], config_data["api"]["yaml_file"]))
-        manager = inference_support.InferenceServerManager(
-            settings, output_root=data_dir, config_out=api_cfg_path, log_dir=log_dir)
-        manager.validate()
-        # 検証モードでは CAD 変換ソフトも本番共有上のものを使わない(ローカルのパスを指定する)
-        try:
-            inference_support.safety.assert_not_production(
-                str(config_data["dwg_conversion"]["converter"]), "dwg_conversion.converter")
-        except inference_support.safety.SafetyError as e:
-            raise inference_support.InferenceServerError(str(e)) from e
+    # 検証モードでは CAD 変換ソフトも本番共有上のものを使わない。無効(既定)のときは (None, None) で従来動作のまま。
+    manager, settings = settings_mod.build_inference_manager(cfg)
 
     # -> Set:作業対象図面設定
-    target_initial:str = config_data["data"]["initials"]
-    box_types:list = tuple(config_data["data"]["box_types"])
+    target_initial:str = cfg.target_initial
+    box_types:list = cfg.box_types
 
     # -> Set:CAD変換設定
-    converter_path = config_data["dwg_conversion"]["converter"]        # 変換ソフトパス(共有サーバーへ配置)
-    converter_version = config_data["dwg_conversion"]["cad_version"]   # 出力CADバージョン
-    converter_extension = config_data["data_extension"]["convert_bfr"] # 変換前CAD拡張子
-    converted_extension = config_data["data_extension"]["convert_aft"] # 変換後CAD拡張子
+    converter_path = cfg.converter_path               # 変換ソフトパス(共有サーバーへ配置)
+    converter_version = cfg.converter_version         # 出力CADバージョン
+    converter_extension = cfg.converter_extension     # 変換前CAD拡張子
+    converted_extension = cfg.converted_extension     # 変換後CAD拡張子
 
     if not os.path.exists(output_dir): # 出力フォルダが存在しない場合は作成
         os.makedirs(output_dir)

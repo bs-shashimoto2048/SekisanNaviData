@@ -26,18 +26,19 @@
 | S0 | 出力契約をテストで固定(`tests/test_output_contract.py`)、現状を文書化 | なし(テスト・文書のみ) | **完了** |
 | S1 | ページ選別(Step.2 前半)を `pipeline/page_plan.py` の純関数へ切り出し、単体テスト | なし(同じ選び方・同じログ・同じ結果記録) | **完了** |
 | S2 | `main()` の製番処理を `process_product(ctx)` と Step.1〜5 の関数に分割。`ProductContext`(パス・設定・logger・DF)と `ProductResult` を導入し、後始末(`_safe_rmtree`)を 1 か所へ | なし(統合テスト・契約テストが不変であること) | **完了**(§7) |
-| S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | 未着手 |
+| S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | **完了**(§7) |
 | S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | 未着手 |
 | S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | 未着手 |
 | S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | 未着手 |
 | S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
 
-## 5. 変更記録(S2 は §6)
+## 5. 変更記録(S2 は §6、S3 は §7)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
 | 2026-10-13 | S1 | `pipeline/page_plan.py`、`tests/test_page_plan.py`(7 件)を追加。`app.py` の Step.2 の選別を置き換え | 同上(既存の統合テスト・契約テストは変更なしで通過) | なし。`PagePlan.status` が従来の分岐(推論対象なし=スキップ、図面なし=失敗)と同じ結果を返す |
 | 2026-10-13 | S2 | `pipeline/product_flow.py`、`tests/test_product_flow.py`(28 件)を追加。`app.main()` の製番ループを Step 関数へ分割、後始末・結果記録を `run_product` に集約 | データ側 109 件・推論側 27 件 OK・`pip check` OK。12 シナリオで分割前後のログ・削除要求・生成物が一致 | なし(§6) |
+| 2026-10-13 | S3 | `pipeline/settings.py`(`Settings`・`load_settings`・`build_inference_manager`)、`tests/test_settings.py`(15 件)を追加。`app.main()` の設定読込・サンプル設定の拒否・推論サーバー設定の検証を移動 | データ側 124 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S2 時点と一致。設定エラーの特性化テスト 4 件は S3 適用前のコードでも通過 | なし(§7) |
 
 ## 6. S2 の実施結果(2026-10-13)
 `app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
@@ -71,6 +72,31 @@
 - 出力ファイル・戻り値(`results`)・ログ・終了コード・SekisanNavi の読み込み契約: **変更なし**。
 - `app._safe_rmtree` / `app._is_under` は別名として残した(実体は `pipeline.product_flow`)。テストの差し替え点(`app.host_mod` など `app.<モジュール>` の属性)はそのまま有効。
 
-## 7. 未確認・入力待ち(改修では解消しない)
+## 7. S3 の実施結果(2026-10-13)
+`app.main()` 冒頭の「設定読込 → サンプル設定の拒否 → 出力先の決定 → 推論サーバー設定の検証」を `pipeline/settings.py` に集約した。`app.py` は 239 行 → 214 行。**YAML のキー、検証の順序、エラーの種類、出力ファイル・ログ・戻り値は変えていない。**
+
+### 構成
+| 名前 | 内容 |
+|---|---|
+| `Settings`(frozen データクラス) | 設定ファイルのパス、YAML そのまま(`config_data`)、`data_dir`・`storage`・`infer_cfg`・`infer_enabled`。`product_dir`・`log_dir`・`output_dir` は派生。`target_initial`・`box_types`・`converter_*`・`converted_extension` はプロパティ |
+| `load_settings(config_path, default_path)` | YAML を読む。`config_path` 省略時は `default_path()`(`app.local.yaml` があればそれ、無ければ `app.yaml`)を読み、**サンプルのまま(`<...>` が残っている)なら `RuntimeError`**。推論サーバー統合が有効なら出力ルートを絶対パスにする |
+| `build_inference_manager(cfg)` | 無効(既定)なら `(None, None)`。有効なら設定を検証して管理オブジェクトを作る(`validate()` → 本番共有上の CAD 変換ソフトの拒否。後者は `InferenceServerError` に包む)。**起動はしない**(起動・停止は従来どおり `main()`) |
+| `default_config_path` / `assert_not_sample_config` | 旧 `app.py` の関数の実体。`app.default_config_path()` と `app._assert_not_sample_config` は別名として残した(既存テストの差し替え点を維持) |
+
+### 順序を変えないための判断
+- 対象製番・箱体型式・CAD 変換の設定(`target_initial` ほか)は、読込時に先読みせず**プロパティで使う時点に読む**。従来は推論サーバー設定の検証の後で読んでいたため、設定が不足していて推論サーバー設定も不正なときに先に出るエラー(`InferenceServerError`)を変えないため(`tests/test_settings.py` で固定)。
+- 推論サーバー設定の検証は、従来どおり出力フォルダ・ログを作る前に呼ぶ(本番共有・範囲外なら何も書かずに失敗)。
+- Step が参照する `api`・`data_extension` は、従来どおり `config_data` を使う時点で読む(`ProductContext.config_data`)。
+
+### 検証
+- 擬似環境の 12 シナリオ(S2 の §6 と同じ)で、S3 適用前後のログ全文・`rmtree` の呼び出し・生成物・外部呼び出し・標準出力が完全一致。
+- `tests/test_settings.py` の `MainConfigBehaviorTest`(`app.main` 経由の 4 件: 対象製番の設定欠落 → `KeyError` で何も作らない / 出力先の欠落 / 推論サーバー設定の不正が設定欠落より先 / 本番共有上の変換ソフトの拒否)は、**S3 適用前のコードでも同じ結果で通る**ことを確認した。
+- テスト: データ側 124 件 OK(従来 109 件 + 15 件)、推論側 27 件 OK、`pip check` OK。
+
+### 互換性への影響
+- YAML のキー、`app.yaml`(サンプル)・`app_test.yaml`・`app.local.yaml` の書式: **変更なし**。出力契約・SekisanNavi の読み込み契約・推論サーバー連携・IJCAD の `close y`・後始末: **変更なし**。
+- 未対応(S3 の範囲外): `app_20251204.py`(旧版)の設定読込は対象外。設定値の型検証(例: `box_types` が空)の追加はしていない(挙動が変わるため)。
+
+## 8. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。

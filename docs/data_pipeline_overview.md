@@ -53,7 +53,7 @@
 - 本番の推論サーバー(`server.py`・モデル・`torch` の版)の正本は未確認(`docs/acceptance_handoff.md` §5)。
 
 ## 5. 読み取れた構造上の課題(改修の動機。挙動は未変更)
-1. ~~`main()` が設定・サーバー・ホスト照会・5 段階の処理・後始末・集計を 1 関数で持つ。~~ → **S2 で解消**: 製番 1 件の処理は `pipeline/product_flow.py` の Step 関数に分割済み(`main()` は設定・推論サーバー・製番ループ・集計が残る。設定の整理は S3)。
+1. ~~`main()` が設定・サーバー・ホスト照会・5 段階の処理・後始末・集計を 1 関数で持つ。~~ → **S2 で解消**: 製番 1 件の処理は `pipeline/product_flow.py` の Step 関数に分割済み(設定の読込・検証は S3 で `pipeline/settings.py` に集約。`main()` は推論サーバーの起動・停止、製番ループ、集計が残る)。
 2. ~~ステップ間のデータがローカル変数で受け渡され、後始末が各所に散在~~ → **S2 で解消**: `ProductContext` で受け渡し、結果の記録と後始末は `run_product` の 1 か所。
 3. ページ選別・印刷・縮尺算出などの純粋な処理が、外部処理(IJCAD・ODA・API)と同じ場所に書かれている。→ **S1 で選別を `pipeline/page_plan.py` に切り出した。**
 4. `estimate_code_processer.py`: `estcode_stack_plate` が 2 回定義(後の定義が前を上書き)、`estcode_box`・`estcode_door` などは本体が docstring のみ(未実装)で、積算コードは操作パネル・盤内トランス以外は集計されていない。積算ルールが関数内の分岐に埋まっている。
