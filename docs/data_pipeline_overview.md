@@ -4,7 +4,7 @@
 実図面・本番サーバー・SekisanNavi には接続せず、リポジトリ内のコード・テスト・ドキュメントだけで確認した。確認できていないことは「未確認」と書く。
 
 ## 1. 全体像
-`app.py` の `main(config_path)` が、**製番(例: `A1xxxxxx`)ごと**に次を順に行う(約 470 行の 1 関数)。
+`app.py` の `main(config_path)` が、**製番(例: `A1xxxxxx`)ごと**に次を順に行う。製番 1 件の処理は `pipeline/product_flow.py`(S2 で分割。構造は `docs/refactor_plan.md` §6)。
 
 | 段階 | 内容 | 主な呼び出し先 | 外部とのつながり |
 |---|---|---|---|
@@ -53,8 +53,8 @@
 - 本番の推論サーバー(`server.py`・モデル・`torch` の版)の正本は未確認(`docs/acceptance_handoff.md` §5)。
 
 ## 5. 読み取れた構造上の課題(改修の動機。挙動は未変更)
-1. `main()` が設定・サーバー・ホスト照会・5 段階の処理・後始末・集計を 1 関数で持つ。ステップ単位のテストが書きにくく、統合テストは全モックの全体実行だけ。
-2. ステップ間のデータ(`product_df`、`baninf_pages`、`dir_product`、`exit_outer` フラグ)が関数内のローカル変数で受け渡され、失敗時の後始末が各所に散在(`_safe_rmtree` が 5 か所)。
+1. ~~`main()` が設定・サーバー・ホスト照会・5 段階の処理・後始末・集計を 1 関数で持つ。~~ → **S2 で解消**: 製番 1 件の処理は `pipeline/product_flow.py` の Step 関数に分割済み(`main()` は設定・推論サーバー・製番ループ・集計が残る。設定の整理は S3)。
+2. ~~ステップ間のデータがローカル変数で受け渡され、後始末が各所に散在~~ → **S2 で解消**: `ProductContext` で受け渡し、結果の記録と後始末は `run_product` の 1 か所。
 3. ページ選別・印刷・縮尺算出などの純粋な処理が、外部処理(IJCAD・ODA・API)と同じ場所に書かれている。→ **S1 で選別を `pipeline/page_plan.py` に切り出した。**
 4. `estimate_code_processer.py`: `estcode_stack_plate` が 2 回定義(後の定義が前を上書き)、`estcode_box`・`estcode_door` などは本体が docstring のみ(未実装)で、積算コードは操作パネル・盤内トランス以外は集計されていない。積算ルールが関数内の分岐に埋まっている。
 5. `app.py` に使われていない import(`cv2`、`re`、`time`、`datetime`/`timedelta`、`pd`)、デバッグ出力 `print(f"{log_text = }")`、ログの誤り(座標計算用 DF の CSV 名に外形図のパスを出している、対象ページの行が重複)がある。

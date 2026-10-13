@@ -25,19 +25,52 @@
 |---|---|---|---|
 | S0 | 出力契約をテストで固定(`tests/test_output_contract.py`)、現状を文書化 | なし(テスト・文書のみ) | **完了** |
 | S1 | ページ選別(Step.2 前半)を `pipeline/page_plan.py` の純関数へ切り出し、単体テスト | なし(同じ選び方・同じログ・同じ結果記録) | **完了** |
-| S2 | `main()` の製番処理を `process_product(ctx)` と Step.1〜5 の関数に分割。`ProductContext`(パス・設定・logger・DF)と `ProductResult` を導入し、後始末(`_safe_rmtree`)を 1 か所へ | なし(統合テスト・契約テストが不変であること) | 未着手 |
+| S2 | `main()` の製番処理を `process_product(ctx)` と Step.1〜5 の関数に分割。`ProductContext`(パス・設定・logger・DF)と `ProductResult` を導入し、後始末(`_safe_rmtree`)を 1 か所へ | なし(統合テスト・契約テストが不変であること) | **完了**(§7) |
 | S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | 未着手 |
 | S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | 未着手 |
 | S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | 未着手 |
 | S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | 未着手 |
 | S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
 
-## 5. 変更記録
+## 5. 変更記録(S2 は §6)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
 | 2026-10-13 | S1 | `pipeline/page_plan.py`、`tests/test_page_plan.py`(7 件)を追加。`app.py` の Step.2 の選別を置き換え | 同上(既存の統合テスト・契約テストは変更なしで通過) | なし。`PagePlan.status` が従来の分岐(推論対象なし=スキップ、図面なし=失敗)と同じ結果を返す |
+| 2026-10-13 | S2 | `pipeline/product_flow.py`、`tests/test_product_flow.py`(28 件)を追加。`app.main()` の製番ループを Step 関数へ分割、後始末・結果記録を `run_product` に集約 | データ側 109 件・推論側 27 件 OK・`pip check` OK。12 シナリオで分割前後のログ・削除要求・生成物が一致 | なし(§6) |
 
-## 6. 未確認・入力待ち(改修では解消しない)
+## 6. S2 の実施結果(2026-10-13)
+`app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
+
+### 検証
+- 分割前(`d35e784`)と分割後で、擬似環境の 12 シナリオ(成功 / DXF 変換失敗 / 図面使用中 / 推論対象の図面なし / 推論対象なし(X のみ)/ X 始まり `.baninf` / 処理済み / API が `InferenceRequestError` / API が想定外の例外 / 図枠が取れない / 対象外の箱体 / ホスト情報の空欄)について、**ログ全文(時刻・行番号・トレースバックのフレームを除く)、`shutil.rmtree` の呼び出し(対象と `ignore_errors`)、生成ファイル一覧、印刷・変換・API・DWG 使用確認の呼び出し、標準出力が完全に一致**することを確認した(手元の比較用スクリプトで実施。リポジトリには含めない)。
+- テスト: データ側 109 件 OK(従来 81 件 + `tests/test_product_flow.py` 28 件)、推論側 27 件 OK、`pip check` OK。既存の統合テスト・契約テストは変更なしで通過。
+
+### 構造
+`run_product(ctx, results)` が 1 製番の入口で、結果の記録と後始末をここだけで行う。`process_product(ctx)` が Step を順に呼び、`ProductResult` を返した Step で終わる(`None` は続行)。
+
+| 関数 | 責務 | 終わり方(`ProductResult`) |
+|---|---|---|
+| `check_product` | 物件情報の取得、ホスト情報の空欄・対象製番・箱体型式・処理済みの判定(製番フォルダを作る前) | スキップ: ホスト情報なし / 処理対象外 / 処理済み(**後始末なし**。既存フォルダは削除しない) |
+| `step1_design_data` | 製番フォルダと `dwg/` の作成、設計サーバー探索、`.baninf` → 盤情報 CSV と `product_df`、共通製作仕様書の PDF | (例外のみ) |
+| `step2_inference_images` | 次の 3 つを順に実行 | |
+| ├ `_select_pages` | 印刷対象・推論対象の決定(`pipeline.page_plan`) | 失敗: 推論対象の図面なし / スキップ: 推論対象ページなし(いずれも**静かな削除**) |
+| ├ `_print_drawings` | 印刷対象を 5 枚ずつ PDF 化(IJCAD)。図面が使用中なら中止 | スキップ: 図面使用中(**静かな削除**。それまでに印刷済みの PDF も製番フォルダごと削除) |
+| └ `_make_inference_images` | 推論対象の DWG コピー → DXF 変換 → JPEG → 前処理 PNG | (例外のみ) |
+| `step3_frame_scale` | 図枠寸法と縮尺を `product_df` へ。**全ページを見てから**判定 | 失敗: 図枠サイズを取得できません(**静かな削除**) |
+| `step4_detect_objects` | 推論 API へ送信(検証設定では作業フォルダ共有を確認しタイムアウトを渡す)、`detected_df.csv` | (API 失敗などは例外) |
+| `step5_aggregate` | `estcode_df.csv`(操作パネル・盤内トランス) | 最後まで来れば完了 |
+
+### 失敗時の流れ(後始末は 2 種類・1 か所)
+1. **Step が結果を返す場合**: `cleanup=True` なら、`run_product` が出力ルート配下に限って `shutil.rmtree(製番フォルダ, ignore_errors=True)`(静かな削除)→ 結果を記録 → 次の製番へ。
+2. **例外が出た場合**(API 失敗・変換失敗・想定外のエラー・範囲外の削除要求を含む): `Process Failed for product …` とトレースバックをログ → `results["failed"][製番] = "<例外名>: <メッセージ先頭 200 文字>"` → `InferenceRequestError` なら推論 API の失敗内容をログ → 製番フォルダが存在すれば `safe_rmtree`(`ignore_errors` なし。失敗はログに出して続行)。
+3. 製番ループの外(ホスト照会の失敗など)の例外は、従来どおり `main()` の外側の `except` が `results["failed"]["(全体)"]` として記録し、処理中の製番フォルダを削除する。
+4. 削除は常に出力ルート配下の製番フォルダだけ(`safe_rmtree`)。推論サーバーの停止は `main()` の `finally` で、変更していない。
+
+### 互換性への影響
+- 出力ファイル・戻り値(`results`)・ログ・終了コード・SekisanNavi の読み込み契約: **変更なし**。
+- `app._safe_rmtree` / `app._is_under` は別名として残した(実体は `pipeline.product_flow`)。テストの差し替え点(`app.host_mod` など `app.<モジュール>` の属性)はそのまま有効。
+
+## 7. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。
