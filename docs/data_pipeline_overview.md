@@ -34,6 +34,7 @@
 | `product_df.csv` | 座標計算用 DF(上 3 つを結合・ソート)。20 列。Step.3 で `FRAME_*`・`SCALE_*` が確定。CP932 |
 | `detected_df.csv` | 検出結果(CAD 座標)。14 列。**CP932・BOM なし**。CP932 で表せない文字を含むクラス名は、文字化けや UTF-8 切替をせずエラーにする |
 | `estcode_df.csv` | 盤ごとの積算コード数量。28 列。CP932 |
+| `material.csv` | 設計フォルダの `*.boxspec` から作る材料一覧(ページ × 材料シンボル × 構成部)。7 列 `PAGE, SOURCE_FILE, SYMBOL_NAME, CABTYPE, COMPONENT_CODE, COMPONENT_NAME, MATERIAL_SPEC`。**CP932・BOM なし**。`.boxspec` が無い製番、または解析に失敗した製番では**作られない**(処理は続行)。詳細は下の「material.csv」 |
 | `{ページ}.pdf` | 印刷対象の全ページ(X/x 始まりを除く)。A3・用紙中央(`docs/print_spec.md`) |
 | `{ページ}.jpeg` / `.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
 | `dwg/{ページ}.dwg` | 推論対象ページの DWG コピー |
@@ -60,3 +61,16 @@
 5. ~~`app.py` の未使用 import・デバッグ `print`・ログの誤り~~ → **S7 で整理**(テストの差し替え点として残した import を除く。`docs/refactor_plan.md` §11)。
 6. ~~`docs/app.md` などの自動生成ドキュメントが古い~~ → **S7 で `docs/app.md`・`docs/estimate_code_processer.md` の機械的な節を実体に合わせた**。生成手順はリポジトリに無い(手作業)。
 7. ~~`cad_data_process.py` が約 780 行で、表データ処理・図枠・印刷/変換が同居~~ → **S5 で解消**: `cad_data/` の 3 モジュール(`baninf_tables`・`frame_scale`・`print_convert`)に分割し、`cad_data_process.py` は公開名を再エクスポートする窓口。呼び出し側は従来どおり `cad_mod.<関数名>` を使う(`docs/refactor_plan.md` §9)。
+
+## material.csv(材料一覧)
+
+設計フォルダ(`.baninf` と同じ場所)直下の `*.boxspec`(CP932。拡張子の大文字小文字は問わない)を Step.1 で読み、製番フォルダ直下に `material.csv` を出す。元の `.boxspec` は読み取り専用で、変更・移動・削除しない。実装は `cad_data/boxspec_material.py`(窓口は `cad_data_process.export_material_csv`)。
+
+- **ページ**: ファイル名(拡張子を除く)を `PAGE` とする(`301.boxspec` → `301`)。複数ファイルは製番単位の一覧にまとめ、各行に `PAGE` と `SOURCE_FILE` を残す。並びは数字のページは数値順、それ以外は後ろ。
+- **読み方**: 1 行は `|` 区切りの要素で、各要素は最初の `$` でキーと値に分ける。先頭要素は `シンボル名$<名前>`。値の記号・寸法・材質表記は加工しない。
+- **材料行**: `BSP-STEELA-*` のシンボルから 9 つの構成部(`STEEL-BASE` 基礎ベース / `STEEL-SIDE` 側板 / `STEEL-ROOF` 屋根・天井板 / `STEEL-PANEL` パネル(背面板) / `STEEL-DIVIDE` 仕切り板 / `STEEL-FRAME` 組枠 / `STEEL-BOTTOM` 底板 / `STEEL-INSIDEPANEL` 補助・内部パネル / `STEEL-DOOR` 扉板)を、1 シンボル × 9 行で出す。
+- **`未記載` と `無し`**: キーが行に無い、またはキーはあるが値が空 → `未記載`。明示値 `無し` はそのまま保持し、`未記載` と区別する。(確定仕様。空欄・キー無しのケースはテストで固定)
+- **未知の `STEEL-*` キー**: 捨てずに行として残し(`COMPONENT_NAME` は空)、ログに警告する。
+- **CABTYPE**: `BSP-CABTYPEA` の `CABTYPE` が 1 種類だけならそのファイルの全材料行に付ける。無ければ空。**複数の異なる値があって対応が決められないときは推測せず空にし、警告する**(確定仕様)。
+- **失敗時**: `.boxspec` が無いのは通常の欠損(情報ログ、`material.csv` なし)。1 ファイルでも読めない/解析できない(`$` の無い要素、同じキーの重複、CP932 でない等)ときは、**不完全な一覧を完全なものとして出さないため `material.csv` を作らず**、**警告ログ**を出して材料情報の作成だけを見送り、他の製番処理は続ける(部分的な `material.csv` は作らない)。
+- **書き出し**: 一時ファイル経由(`os.replace`)で、途中失敗でも半端な `material.csv` を残さない。製番フォルダは毎回新規に作られる(既存フォルダはスキップ)ため、古い `material.csv` は残らない。
