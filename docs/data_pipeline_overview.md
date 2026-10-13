@@ -56,6 +56,6 @@
 1. ~~`main()` が設定・サーバー・ホスト照会・5 段階の処理・後始末・集計を 1 関数で持つ。~~ → **S2 で解消**: 製番 1 件の処理は `pipeline/product_flow.py` の Step 関数に分割済み(設定の読込・検証は S3 で `pipeline/settings.py` に集約。`main()` は推論サーバーの起動・停止、製番ループ、集計が残る)。
 2. ~~ステップ間のデータがローカル変数で受け渡され、後始末が各所に散在~~ → **S2 で解消**: `ProductContext` で受け渡し、結果の記録と後始末は `run_product` の 1 か所。
 3. ページ選別・印刷・縮尺算出などの純粋な処理が、外部処理(IJCAD・ODA・API)と同じ場所に書かれている。→ **S1 で選別を `pipeline/page_plan.py` に切り出した。**
-4. `estimate_code_processer.py`: `estcode_stack_plate` が 2 回定義(後の定義が前を上書き)、`estcode_box`・`estcode_door` などは本体が docstring のみ(未実装)で、積算コードは操作パネル・盤内トランス以外は集計されていない。積算ルールが関数内の分岐に埋まっている。
+4. `estimate_code_processer.py`: ~~`estcode_stack_plate` が 2 回定義~~ → **S4 で解消**(2 つ目を `estcode_passage` へ改名)。集計用 DF の生成は純関数 `build_estcode_df` に分離済み。積算コードのうち集計されるのは操作パネル(`PANEL`)と盤内トランス(`TRANS`)のみで、他の列は常に初期値(`UNIMPLEMENTED_ESTCODE_COLUMNS` に一覧)。未実装コードの集計追加は別件。
 5. `app.py` に使われていない import(`cv2`、`re`、`time`、`datetime`/`timedelta`、`pd`)、デバッグ出力 `print(f"{log_text = }")`、ログの誤り(座標計算用 DF の CSV 名に外形図のパスを出している、対象ページの行が重複)がある。
 6. `docs/app.md` などの自動生成ドキュメントが古い(行数・関数一覧が実体と一致しない)。

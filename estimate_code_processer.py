@@ -186,41 +186,35 @@ def create_detected_csv(target_dir: str):
     print(f"detected.csv を作成しました: {out_path}")
     return df, out_path, detected_pages
 
-# ✔積算コード集計用DF及びCSVを作成
-def create_estcode_df_and_csv(box_type: str, target_df: pd.DataFrame, target_dir: str):
-    """
-    概要:
-        積算コード集計用DFおよびCSVを作成する。
+# 積算コード集計用 DF(estcode_df.csv)の列。順序も出力契約(tests/test_output_contract.py)。
+ESTCODE_COLUMNS = [
+    "MODEL", "BAN_MENNO", "BAN_NO", "BAN_MEISYOU",
+    "BAN_H", "BAN_W", "BAN_D", "BAN_CONNECT",
+    "PANEL", "TRANS", "IN_PANEL", "SHIELD",
+    "DOOR_FRONT", "DOOR_BACK", "DOOR_STACK",
+    "DOOR_SIDE", "DOOR_SMALL", "FAN_ROOF",
+    "FAN_DOOR", "MAIN_LINE", "WIRE_MESH",
+    "STACK_PLATE", "DRAWER_DEVICE", "VCT_STAND",
+    "BUS_DUCT", "PASSAGE", "INPUT_CU_COEFF",
+    "SORT_ORDER"
+]
 
-    Args:
-        box_type (str): 配電盤 箱体型式
-        target_df (pd.DataFrame): 座標計算用DF (product_df)
-        target_dir (str): 作成CSV保存先ディレクトリ
+# 未実装の積算コード集計。この列は estcode_df で常に初期値(0 / INPUT_CU_COEFF は 0.0)のまま出力される。
+# 実装済みは PANEL(estcode_panel)と TRANS(estcode_transformer)のみ。対応する関数(estcode_*)は本体が無い未実装で、
+# どこからも呼ばれていない(列と関数の対応は、列名と各関数の「対象品名」からの推定。None は対応する関数が無い列)。
+# 未実装コードの集計追加は別件(出力契約に影響するため SekisanNavi 側の確認が要る)。
+UNIMPLEMENTED_ESTCODE_COLUMNS = {
+    "IN_PANEL": None, "SHIELD": "estcode_Shield", "DOOR_FRONT": "estcode_door", "DOOR_BACK": "estcode_door",
+    "DOOR_STACK": "estcode_door", "DOOR_SIDE": "estcode_door", "DOOR_SMALL": "estcode_door",
+    "FAN_ROOF": None, "FAN_DOOR": None, "MAIN_LINE": None, "WIRE_MESH": None,
+    "STACK_PLATE": "estcode_stack_plate", "DRAWER_DEVICE": "estcode_drawer_dcevice", "VCT_STAND": None,
+    "BUS_DUCT": None, "PASSAGE": "estcode_passage", "INPUT_CU_COEFF": "estcode_input_cu",
+}
 
-    Returns:
-        (pd.DataFrame, str): (estcode_df, estcode_df_path)
-    """
-    # ensure target_dir exists
-    Path(target_dir).mkdir(parents=True, exist_ok=True)
 
-    # カラム定義（仕様どおり、未指定項目は型を壊さない初期値にする）
-    columns = [
-        "MODEL", "BAN_MENNO", "BAN_NO", "BAN_MEISYOU",
-        "BAN_H", "BAN_W", "BAN_D", "BAN_CONNECT",
-        "PANEL", "TRANS", "IN_PANEL", "SHIELD",
-        "DOOR_FRONT", "DOOR_BACK", "DOOR_STACK",
-        "DOOR_SIDE", "DOOR_SMALL", "FAN_ROOF",
-        "FAN_DOOR", "MAIN_LINE", "WIRE_MESH",
-        "STACK_PLATE", "DRAWER_DEVICE", "VCT_STAND",
-        "BUS_DUCT", "PASSAGE", "INPUT_CU_COEFF",
-        "SORT_ORDER"
-    ]
-
-    estcode_df = pd.DataFrame(columns=columns)
-
-    # BAN_MENNO のユニーク値（文字列扱いで）
-    uniq_ban = target_df["BAN_MENNO"].dropna().unique().tolist()
-
+# 基礎図の位置(KITEN_X)から、盤ごとの並び順(SORT_ORDER)と接続区分(BAN_CONNECT)を決める(純粋な処理)
+def _base_diagram_maps(target_df: pd.DataFrame):
+    """戻り値: (base_order_map, base_connect_map)。どちらも BAN_MENNO(文字列) -> 値。基礎図が無ければ空の dict 2 つ。"""
     # 全体の「基礎図」行を取得（ZUMEI が '基礎図' を含む行）
     base_all = target_df[target_df["ZUMEI"].astype(str).str.contains("基礎図", na=False)].copy()
 
@@ -266,6 +260,30 @@ def create_estcode_df_and_csv(box_type: str, target_df: pd.DataFrame, target_dir
             # override first/last
             base_connect_map[first_ban] = "箱･左右(L)"
             base_connect_map[last_ban] = "箱･左右(R)"
+
+    return base_order_map, base_connect_map
+
+
+# ✔積算コード集計用DFを作成(純粋な処理: ファイル・フォルダには触れない)
+def build_estcode_df(box_type: str, target_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    概要:
+        積算コード集計用DFを作る。盤(BAN_MENNO)ごとに 1 行。数量の列は初期値のままで、集計は estcode_panel などが行う。
+        ファイル・フォルダには触れない(保存は create_estcode_df_and_csv)。
+
+    Args:
+        box_type (str): 配電盤 箱体型式
+        target_df (pd.DataFrame): 座標計算用DF (product_df)
+
+    Returns:
+        pd.DataFrame: estcode_df(列は ESTCODE_COLUMNS、SORT_ORDER 昇順)
+    """
+    estcode_df = pd.DataFrame(columns=ESTCODE_COLUMNS)
+
+    # BAN_MENNO のユニーク値（文字列扱いで）
+    uniq_ban = target_df["BAN_MENNO"].dropna().unique().tolist()
+
+    base_order_map, base_connect_map = _base_diagram_maps(target_df)
 
     # --- 各 BAN_MENNO に対して行を作成 ---
     for ban in uniq_ban:
@@ -329,6 +347,28 @@ def create_estcode_df_and_csv(box_type: str, target_df: pd.DataFrame, target_dir
     # 最終ソート（SORT_ORDER 昇順）
     estcode_df = estcode_df.sort_values(by="SORT_ORDER", ascending=True).reset_index(drop=True)
 
+    return estcode_df
+
+
+# ✔積算コード集計用DF及びCSVを作成
+def create_estcode_df_and_csv(box_type: str, target_df: pd.DataFrame, target_dir: str):
+    """
+    概要:
+        積算コード集計用DFを作り(build_estcode_df)、CSV(estcode_df.csv, CP932)に保存する。
+
+    Args:
+        box_type (str): 配電盤 箱体型式
+        target_df (pd.DataFrame): 座標計算用DF (product_df)
+        target_dir (str): 作成CSV保存先ディレクトリ
+
+    Returns:
+        (pd.DataFrame, str): (estcode_df, estcode_df_path)
+    """
+    # ensure target_dir exists
+    Path(target_dir).mkdir(parents=True, exist_ok=True)
+
+    estcode_df = build_estcode_df(box_type, target_df)
+
     # CSV 保存（Windows で Excel 開くことを考え cp932 を採用）
     estcode_df_path = os.path.join(target_dir, "estcode_df.csv")
     estcode_df.to_csv(estcode_df_path, index=False, encoding="cp932")
@@ -341,6 +381,7 @@ def create_estcode_df_and_csv(box_type: str, target_df: pd.DataFrame, target_dir
 # 対象品名: 箱･単独 / 左右 / 中
 def estcode_box():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード: 箱体型式
     - 11001 ~ 11148 (OS)
     - 11501 ~ 11648 (IS)
@@ -658,6 +699,7 @@ def estcode_transformer(source_df: pd.DataFrame,
 # 対象品名: 扉
 def estcode_door():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:
     - 18302 (側面扉:1枚追加, 単独左右の時は2でカウント)
     - 18330 (側面扉:なし)
@@ -677,6 +719,7 @@ def estcode_door():
 # 対象品名: 盤間の仕切・遮蔽
 def estcode_Shield():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:
         18201 ~ 18214 (盤間の仕切・遮蔽)
     積算品名:
@@ -688,6 +731,7 @@ def estcode_Shield():
 # 対象品名: 附属品加算価格
 def estcode_add_accs_price():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:\n
          ~ 
     積算品名:\n
@@ -697,6 +741,7 @@ def estcode_add_accs_price():
 # 対象品名: A1入力主回路銅帯の内部機器の構成による入力係数
 def estcode_input_cu():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:\n
          ~ 
     積算品名:\n
@@ -706,6 +751,7 @@ def estcode_input_cu():
 # 対象品名: 内部機器配置図/側面図,段積みプレート
 def estcode_stack_plate():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:\n
         18308 (段積みプレート,2段)
         18309 (段積みプレート,3段)
@@ -716,15 +762,17 @@ def estcode_stack_plate():
 # 対象品名: 内部機器配置図/側面図,引出装置
 def estcode_drawer_dcevice():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:\n
         18310 (引出装置)
     積算品名:\n
         附属品加算価格,引出装置(箱体型式 IA/OA の VCB/VT/LA/ZPC のみ)
     """
 
-# 対象品名: 基礎図/正面図,通路
-def estcode_stack_plate():
+# 対象品名: 基礎図/正面図,通路(列 PASSAGE。以前は estcode_stack_plate と同名で重複定義されていた)
+def estcode_passage():
     """
+    【未実装】集計されない(本体なし・呼び出し元なし)。UNIMPLEMENTED_ESTCODE_COLUMNS を参照。
     積算コード:\n
         18321 (盤内通路,IA/OA)
         18322 (盤内通路,IS/OS)

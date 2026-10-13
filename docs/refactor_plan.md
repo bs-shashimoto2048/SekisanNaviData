@@ -27,18 +27,19 @@
 | S1 | ページ選別(Step.2 前半)を `pipeline/page_plan.py` の純関数へ切り出し、単体テスト | なし(同じ選び方・同じログ・同じ結果記録) | **完了** |
 | S2 | `main()` の製番処理を `process_product(ctx)` と Step.1〜5 の関数に分割。`ProductContext`(パス・設定・logger・DF)と `ProductResult` を導入し、後始末(`_safe_rmtree`)を 1 か所へ | なし(統合テスト・契約テストが不変であること) | **完了**(§7) |
 | S3 | 設定の読込・検証を `Settings`(データクラス)に集約。サンプル設定の拒否・推論サーバー設定の検証を移す | なし(YAML のキーは変えない) | **完了**(§7) |
-| S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | 未着手 |
+| S4 | `estimate_code_processer.py`: 積算コードの集計ルールを関数単位に整理(重複定義 `estcode_stack_plate` の解消、未実装スタブの扱いの明記)。`create_estcode_df_and_csv` の行生成を純関数化 | **`estcode_df.csv` が不変**であることをテストで保証。未実装コードの集計追加は別件 | **完了**(§8) |
 | S5 | `cad_data_process.py`(約 780 行)を役割別(baninf 読込、図枠・縮尺、印刷・変換)に分割。`import cad_data_process as cad_mod` の公開名は維持 | なし(公開関数名を維持) | 未着手 |
 | S6 | 推論サーバー統合の整理: リクエスト・応答の契約を文書とテストで固定し、`image_mod` への依存点を一か所に集約。本番サーバーの版・`torch` の確定(管理者情報)待ちの項目を分離 | なし。本番の版は入力待ち | 未着手 |
 | S7 | 整理: 未使用 import・デバッグ `print`・誤ったログの修正、自動生成ドキュメント(`docs/app.md` 等)の再生成 | ログ文言のみ変わりうる(契約外)。変更点を記録 | 未着手 |
 
-## 5. 変更記録(S2 は §6、S3 は §7)
+## 5. 変更記録(S2 は §6、S3 は §7、S4 は §8)
 | 日付 | 段階 | 変更 | テスト | 互換性への影響 |
 |---|---|---|---|---|
 | 2026-10-13 | S0 | `tests/test_output_contract.py`(5 件)を追加。`docs/data_pipeline_overview.md` | 全 81 件 OK(データ側)・推論側 27 件 OK・`pip check` OK | なし |
 | 2026-10-13 | S1 | `pipeline/page_plan.py`、`tests/test_page_plan.py`(7 件)を追加。`app.py` の Step.2 の選別を置き換え | 同上(既存の統合テスト・契約テストは変更なしで通過) | なし。`PagePlan.status` が従来の分岐(推論対象なし=スキップ、図面なし=失敗)と同じ結果を返す |
 | 2026-10-13 | S2 | `pipeline/product_flow.py`、`tests/test_product_flow.py`(28 件)を追加。`app.main()` の製番ループを Step 関数へ分割、後始末・結果記録を `run_product` に集約 | データ側 109 件・推論側 27 件 OK・`pip check` OK。12 シナリオで分割前後のログ・削除要求・生成物が一致 | なし(§6) |
 | 2026-10-13 | S3 | `pipeline/settings.py`(`Settings`・`load_settings`・`build_inference_manager`)、`tests/test_settings.py`(15 件)を追加。`app.main()` の設定読込・サンプル設定の拒否・推論サーバー設定の検証を移動 | データ側 124 件・推論側 27 件 OK・`pip check` OK。12 シナリオのログ・削除要求・生成物が S2 時点と一致。設定エラーの特性化テスト 4 件は S3 適用前のコードでも通過 | なし(§7) |
+| 2026-10-13 | S4 | `estimate_code_processer.py`: `build_estcode_df`(純関数)・`_base_diagram_maps` を切り出し、`estcode_stack_plate` の重複定義を解消(2 つ目を `estcode_passage` へ改名)、未実装の列・関数を `UNIMPLEMENTED_ESTCODE_COLUMNS` と docstring で明記。`tests/test_estimate_code_rules.py`(17 件)を追加 | データ側 141 件・推論側 27 件 OK・`pip check` OK。旧モジュールとの差分比較(36 通り: DataFrame・dtype・CSV バイト列・後続集計・例外)が完全一致 | なし(§8) |
 
 ## 6. S2 の実施結果(2026-10-13)
 `app.main()` の製番ループ本体(約 360 行)を `pipeline/product_flow.py` の Step 関数へ分割した。`app.py` は 561 行 → 239 行。処理順・ログ・戻り値・出力ファイル・失敗/スキップの扱い・後始末の対象とタイミングは変えていない。
@@ -97,6 +98,27 @@
 - YAML のキー、`app.yaml`(サンプル)・`app_test.yaml`・`app.local.yaml` の書式: **変更なし**。出力契約・SekisanNavi の読み込み契約・推論サーバー連携・IJCAD の `close y`・後始末: **変更なし**。
 - 未対応(S3 の範囲外): `app_20251204.py`(旧版)の設定読込は対象外。設定値の型検証(例: `box_types` が空)の追加はしていない(挙動が変わるため)。
 
-## 8. 未確認・入力待ち(改修では解消しない)
+## 8. S4 の実施結果(2026-10-13)
+`estimate_code_processer.py` の積算コード集計用 DF の生成を、入出力と分けた純関数にし、重複定義と未実装スタブを整理した。**`estcode_df.csv` の内容(値・列・列順・dtype・CP932・BOM なし)、`create_estcode_df_and_csv` / `estcode_panel` / `estcode_transformer` の呼び出し方と結果、ログ、処理順は変えていない。**
+
+### 変更内容
+| 項目 | 内容 |
+|---|---|
+| 行生成の純関数化 | `create_estcode_df_and_csv` を (1) `build_estcode_df(box_type, target_df)`(ファイル・フォルダに触れない純関数。盤ごとに 1 行)と (2) 保存だけの `create_estcode_df_and_csv`(フォルダ作成 → `build_estcode_df` → `estcode_df.csv` を CP932 で保存)に分けた。基礎図の位置から並び順と接続区分(箱･単独 / 左右(L)(R) / 中央)を決める部分は `_base_diagram_maps` に切り出した。DataFrame の作り方(空 DF + `.loc[len]=row`)は元のまま(dtype を変えないため) |
+| 列定義 | `ESTCODE_COLUMNS`(28 列、順序も契約)をモジュール定数にした。`tests/test_output_contract.py` の期待値と同一であることをテストで固定 |
+| 重複定義の解消 | `estcode_stack_plate` が 2 回定義(後の「基礎図/正面図,通路」が前の「段積みプレート」を上書き)。後の定義を `estcode_passage`(列 `PASSAGE` に対応)へ改名。どちらも本体が無く、どこからも呼ばれていないため、挙動は変わらない。モジュール内に関数の重複定義が無いことをテスト(AST)で固定 |
+| 未実装の明記 | 集計されない列を `UNIMPLEMENTED_ESTCODE_COLUMNS`(列 → 対応する未実装関数。対応が無ければ `None`)に一覧化し、未実装の関数 8 つの docstring に「【未実装】」を付けた。実装済みは `PANEL`(`estcode_panel`)と `TRANS`(`estcode_transformer`)のみ。未実装列は常に初期値(0 / `INPUT_CU_COEFF` は 0.0)で出力される。**列と関数の対応は、列名と各関数の「対象品名」からの推定** |
+
+### 検証
+- 分割前の `estimate_code_processer.py`(`a2ed98d`)と新モジュールを、12 種類の入力 × 3 つの箱体型式(36 通り)で突き合わせ、**`estcode_df` の DataFrame(dtype を含む)、`estcode_df.csv` のバイト列、続く `estcode_panel` → `estcode_transformer` の結果、例外の種類とメッセージが完全一致**することを確認した(入力: 基礎図が 1 枚 / 3 枚 / 無し、`KITEN_X` が NaN、`BAN_MENNO` の重複・文字列・NaN・小数、空の DF、必須列の欠落など。手元の比較スクリプトで実施、リポジトリには含めない)。
+- `tests/test_estimate_code_rules.py`(17 件): 列が出力契約と一致、`build_estcode_df` がファイル・フォルダ・`to_csv` に触れず入力を変更しない、基礎図の並び・接続区分・NaN・重複、必須列欠落で `KeyError`、保存(新規フォルダ作成・CP932・BOM なし)、純関数との一致、未実装列が集計後も初期値のまま、未実装関数の表示・`None` 戻り、重複定義なし。
+- テスト: データ側 141 件 OK(従来 124 件 + 17 件)、推論側 27 件 OK、`pip check` OK。既存の統合テスト・契約テストは変更なしで通過。
+
+### 互換性への影響・残課題
+- 出力契約・SekisanNavi の読み込み契約・処理順・ログ・失敗/スキップ・後始末・推論サーバー連携・IJCAD の `close y`: **変更なし**。呼び出し元(`pipeline/product_flow.py`、`app_20251204.py`)は変更不要。
+- 名前の変更は `estcode_stack_plate`(2 つ目)→ `estcode_passage` のみ。この名前を参照するコードは無い(`docs/estimate_code_processer.md` の関数一覧は更新済み)。
+- 残課題(S4 の範囲外): 未実装の積算コードの集計追加(出力に数量が入るため SekisanNavi 側の確認が要る)。`estcode_panel` と `estcode_transformer` の共通処理(`safe_int` など)の共通化は、挙動を変えないことの検証が要るため見送った。
+
+## 9. 未確認・入力待ち(改修では解消しない)
 - 実図面での検出・積算結果、SekisanNavi 実画面での受入、実図面での印刷位置、本番推論サーバーの正本・版(`docs/acceptance_handoff.md`)。
 - SekisanNavi の読み込みコード(参照対象外)。契約に触れる変更は、この確認なしに行わない。

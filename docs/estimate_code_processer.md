@@ -26,6 +26,9 @@
 ### `create_estcode_df_and_csv(box_type, target_df, target_dir)`
 - docstring: `あり`
 
+### `build_estcode_df(box_type, target_df)`
+- 積算コード集計用 DF を作る純関数(ファイル・フォルダには触れない。S4 で `create_estcode_df_and_csv` から分離)
+
 ### `estcode_box()`
 - docstring: `あり`
 
@@ -53,9 +56,13 @@
 ### `estcode_drawer_dcevice()`
 - docstring: `あり`
 
-### `estcode_stack_plate()`
+### `estcode_passage()`
 - docstring: `あり`
 
 
 ## クラス
 - なし
+
+## 定数(S4)
+- `ESTCODE_COLUMNS`: `estcode_df.csv` の列(順序も出力契約)
+- `UNIMPLEMENTED_ESTCODE_COLUMNS`: 集計されない列と、対応する未実装関数(推定。`None` は対応する関数なし)。`estcode_*` の未実装関数は docstring に「【未実装】」と記載
