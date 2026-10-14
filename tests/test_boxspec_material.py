@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -151,16 +152,26 @@ class BuildTest(BoxspecBase):
         write_boxspec(self.design, "5.BOXSPEC", [STEEL_ALL])
         self.assertEqual(len(bm.build_material_rows(self.design)), 9)
 
-    def test_no_boxspec_is_empty_not_error(self):
-        self.assertEqual(bm.build_material_rows(self.design), [])
-        self.assertEqual(bm.build_material_rows(self.design / "missing"), [])
+    def test_no_boxspec_is_a_failure_not_an_empty_success(self):
+        with self.assertLogs("cad_data.boxspec_material", level="WARNING"):
+            with self.assertRaises(bm.MaterialDataError):
+                bm.build_material_rows(self.design)
+        with self.assertRaises(bm.MaterialDataError):
+            bm.build_material_rows(self.design / "missing")
+
+    def test_boxspec_without_steel_symbol_is_a_failure(self):
+        write_boxspec(self.design, "1.boxspec", ["シンボル名$BSP-CABTYPEA|CABTYPE$ZZ1|"])
+        with self.assertRaises(bm.MaterialDataError):
+            bm.build_material_rows(self.design)
 
     def test_one_bad_file_makes_the_whole_list_unavailable(self):
         write_boxspec(self.design, "1.boxspec", [STEEL_ALL])
         write_boxspec(self.design, "2.boxspec", ["シンボル名$BSP-STEELA-H|oops|"])
         with self.assertLogs("cad_data.boxspec_material", level="WARNING") as cm:
-            self.assertIsNone(bm.build_material_rows(self.design))
-        self.assertEqual([r.levelname for r in cm.records], ["WARNING"])
+            with self.assertRaises(bm.MaterialDataError) as ctx:
+                bm.build_material_rows(self.design)
+        self.assertIn("2.boxspec", str(ctx.exception))
+        self.assertEqual([r.levelname for r in cm.records], ["WARNING"])   # 警告ログ(部分的な一覧は出さない)
 
 
 class ExportTest(BoxspecBase):
@@ -177,16 +188,17 @@ class ExportTest(BoxspecBase):
         self.assertEqual(len(read_rows(path)), 9)
         self.assertEqual(read_rows(path)[0]["COMPONENT_NAME"], "基礎ベース")
 
-    def test_no_boxspec_creates_no_file(self):
-        with self.assertLogs("cad_data.boxspec_material", level="INFO") as cm:
-            self.assertIsNone(bm.export_material_csv(self.design, self.out))
-        self.assertEqual([r.levelname for r in cm.records], ["INFO"])
+    def test_no_boxspec_creates_no_file_and_fails(self):
+        with self.assertLogs("cad_data.boxspec_material", level="WARNING"):
+            with self.assertRaises(bm.MaterialDataError):
+                bm.export_material_csv(self.design, self.out)
         self.assertFalse((self.out / "material.csv").exists())
 
-    def test_parse_failure_creates_no_file_and_does_not_raise(self):
+    def test_parse_failure_creates_no_file_and_fails(self):
         write_boxspec(self.design, "1.boxspec", ["シンボル名$BSP-STEELA-H|oops|"])
         with self.assertLogs("cad_data.boxspec_material", level="WARNING"):
-            self.assertIsNone(bm.export_material_csv(self.design, self.out))
+            with self.assertRaises(bm.MaterialDataError):
+                bm.export_material_csv(self.design, self.out)
         self.assertEqual(list(self.out.iterdir()), [])
 
     def test_write_failure_leaves_no_partial_file_or_temp(self):
@@ -199,7 +211,8 @@ class ExportTest(BoxspecBase):
         os.replace = boom
         try:
             with self.assertLogs("cad_data.boxspec_material", level="ERROR"):
-                self.assertIsNone(bm.export_material_csv(self.design, self.out))
+                with self.assertRaises(bm.MaterialDataError):
+                    bm.export_material_csv(self.design, self.out)
         finally:
             os.replace = real_replace
         self.assertEqual(list(self.out.iterdir()), [])                # material.csv も一時ファイルも残さない
@@ -216,21 +229,28 @@ class ExportTest(BoxspecBase):
         lg = logging.getLogger("boxspec_test_logger")
         lg.addHandler(logging.StreamHandler(stream))
         lg.setLevel(logging.INFO)
-        bm.export_material_csv(self.design, self.out, log=lg)
-        self.assertIn("material.csv は作成しません", stream.getvalue())
+        with self.assertRaises(bm.MaterialDataError):
+            bm.export_material_csv(self.design, self.out, log=lg)
+        self.assertIn("*.boxspec がありません", stream.getvalue())
 
 
 class PipelineIntegrationTest(MainIntegrationBase):
-    """main() の擬似環境(外部呼び出しはモック・ガード)で、製番フォルダに material.csv が出ること/出なくても続行すること。"""
+    """main() の擬似環境(外部呼び出しはモック・ガード)で、material.csv が出ること/作れないときは製番を失敗として記録すること。
+    設計データの既定(ページ番号 .db 付き)は MainIntegrationBase。.boxspec は boxspec_lines で差し替える。"""
     boxspec_lines = None
-
-    def _make_design_data(self):
-        super()._make_design_data()
-        if self.boxspec_lines is not None:
-            write_boxspec(self.design_product, "301.boxspec", self.boxspec_lines)
 
     def log_text(self):
         return next((self.product_out.parent.parent / "logs").glob("*.log")).read_text(encoding="utf-8")
+
+    def assert_failed_at_step1(self, reason_part):
+        self.assertEqual(self.results["completed"], [])
+        self.assertIn(PRODUCT, self.results["failed"])
+        self.assertIn(reason_part, self.results["failed"][PRODUCT])
+        self.assertEqual(self.print_script_calls, [])        # 後続の印刷・推論には進まない
+        self.assertEqual(self.convert_calls, [])
+        self.assertEqual(self.api_calls, [])
+        self.assertEqual([Path(c.args[0]).resolve() for c in self.rmtree.call_args_list], [self.product_out])   # 製番フォルダの後始末を要求
+        self.assertIn("を失敗とします", self.log_text())
 
 
 class WithBoxspecTest(PipelineIntegrationTest):
@@ -242,6 +262,7 @@ class WithBoxspecTest(PipelineIntegrationTest):
         self.assertEqual(len(rows), 9)
         self.assertEqual({r["PAGE"] for r in rows}, {"301"})
         self.assertIn("CSV作成: 材料", self.log_text())
+        self.assertEqual(self.results["failed"], {})
         self.assertTrue((self.product_out / "estcode_df.csv").exists())   # 既存の出力は従来どおり
 
     def test_original_boxspec_is_untouched(self):
@@ -251,21 +272,43 @@ class WithBoxspecTest(PipelineIntegrationTest):
 
 
 class WithoutBoxspecTest(PipelineIntegrationTest):
-    def test_run_continues_and_no_material_csv(self):
+    boxspec_lines = None
+
+    def test_product_fails_and_is_recorded_without_material_csv(self):
         self.run_main()
+        self.assert_failed_at_step1("material.csv を作成できません")
+        self.assertIn("*.boxspec がありません", self.results["failed"][PRODUCT])
         self.assertFalse((self.product_out / "material.csv").exists())
-        self.assertIn("material.csv は作成しませんでした", self.log_text())
-        self.assertTrue((self.product_out / "estcode_df.csv").exists())
+
+    def test_rerun_succeeds_after_the_boxspec_is_added(self):
+        self.run_main()
+        self.assertIn(PRODUCT, self.results["failed"])
+        # 参照元(設計データ)を整えて再実行する。後始末は rmtree モックで実削除されないので、出力側の製番フォルダを手で消してから流す
+        shutil.rmtree(self.product_out, ignore_errors=True)
+        write_boxspec(self.design_product, "301.boxspec", [STEEL_ALL])
+        self.run_main()
+        self.assertEqual(self.results["failed"], {})
+        self.assertEqual(self.results["completed"], [PRODUCT])
+        self.assertEqual(len(read_rows(self.product_out / "material.csv")), 9)
 
 
 class BrokenBoxspecTest(PipelineIntegrationTest):
     boxspec_lines = ["シンボル名$BSP-STEELA-H|oops|"]
 
-    def test_parse_error_does_not_stop_the_product(self):
+    def test_parse_error_fails_the_product_with_the_reason(self):
         self.run_main()
+        self.assert_failed_at_step1("boxspec の解析に失敗")
         self.assertFalse((self.product_out / "material.csv").exists())
-        self.assertIn("boxspec の解析に失敗", self.log_text())
-        self.assertTrue((self.product_out / "estcode_df.csv").exists())
+
+
+class NoPageDbTest(PipelineIntegrationTest):
+    boxspec_lines = [STEEL_ALL]
+    with_page_db = False
+
+    def test_missing_page_db_fails_the_product_before_material(self):
+        self.run_main()
+        self.assert_failed_at_step1("design.csv を作成できません")
+        self.assertNotIn("CSV作成: 材料", self.log_text())    # design.csv の失敗で止まり、後続には進まない
 
 
 if __name__ == "__main__":

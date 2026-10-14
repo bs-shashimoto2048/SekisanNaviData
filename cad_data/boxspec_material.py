@@ -11,6 +11,8 @@
 #   キーはあるが値が空の場合も、記載が無いので「未記載」にする(「無し」とは別。実データに多い)。
 # - 未知の STEEL-* キーは捨てずに行として残し(COMPONENT_NAME は空)、ログに記録する。
 # - 不完全な一覧を完全な一覧として出さない: いずれかのファイルが読めない/解析できないときは material.csv を出さずログに残す。
+# - material.csv が作れない(.boxspec が無い・解析失敗・材料行が無い・書き出し失敗)ときは MaterialDataError を送出する。
+#   呼び出し側(Step.1)が製番の失敗として記録する。material.csv が無い状態を成功扱いで通過させない(参照元を整えて再実行する)。
 # - 出力は一時ファイル経由(os.replace)で、途中失敗で半端な material.csv を残さない。CP932・BOMなし。
 import csv
 import logging
@@ -50,6 +52,10 @@ CABTYPE_KEY = "CABTYPE"
 
 class BoxspecError(Exception):
     """1 つの .boxspec を読めない/解析できない。"""
+
+
+class MaterialDataError(Exception):
+    """製番の material.csv を作れない。メッセージは製番の失敗理由(表示・記録用)。"""
 
 
 def find_boxspec_files(design_dir) -> List[Path]:
@@ -152,20 +158,26 @@ def _row(page, source, symbol, cabtype, code, name, spec) -> dict:
             "COMPONENT_CODE": code, "COMPONENT_NAME": name, "MATERIAL_SPEC": spec}
 
 
-def build_material_rows(design_dir, log=None) -> Optional[List[dict]]:
-    """設計フォルダの全 .boxspec をまとめた行。.boxspec が無ければ [](通常の欠損)。
-    1 つでも読めない/解析できないファイルがあれば None(不完全な一覧を出さないため。理由はログ)。"""
+def build_material_rows(design_dir, log=None) -> List[dict]:
+    """設計フォルダの全 .boxspec をまとめた行。.boxspec が無い・1 つでも読めない/解析できない・材料行が無いときは MaterialDataError
+    (不完全な一覧を出さないため。理由はログにも残す)。"""
     log = log or logger
     files = find_boxspec_files(design_dir)
     if not files:
-        return []
+        reason = "設計フォルダに *.boxspec がありません(材料情報を作れません)"
+        log.warning(f"boxspec: {reason}")
+        raise MaterialDataError(reason)
     rows: List[dict] = []
     for f in files:
         try:
             rows.extend(parse_boxspec(f, log))
         except BoxspecError as e:
-            log.warning(f"boxspec の解析に失敗したため material.csv を作成しません(部分的な一覧は出さず、他の処理は続行します): {e}")
-            return None
+            log.warning(f"boxspec の解析に失敗したため material.csv を作成しません(部分的な一覧は出しません): {e}")
+            raise MaterialDataError(f"boxspec の解析に失敗しました: {e}") from e
+    if not rows:
+        reason = "*.boxspec に材料シンボル(BSP-STEELA-*)がなく、材料行が 1 件もありません"
+        log.warning(f"boxspec: {reason}")
+        raise MaterialDataError(reason)
     return rows
 
 
@@ -188,18 +200,14 @@ def write_material_csv(rows: List[dict], product_dir) -> str:
     return dest
 
 
-def export_material_csv(design_dir, product_dir, log=None) -> Optional[str]:
-    """設計フォルダの .boxspec から material.csv を作る。作ったパスを返す(.boxspec 無し・失敗時は None)。
-    製番の既存処理は止めない(例外は握ってログに残す)。製番フォルダは毎回新規に作られるため、古い material.csv は残らない。"""
+def export_material_csv(design_dir, product_dir, log=None) -> str:
+    """設計フォルダの .boxspec から material.csv を作り、作ったパスを返す。
+    作れないときは MaterialDataError(.boxspec 無し・解析失敗・材料行無し・書き出し失敗)。部分的な material.csv は残さない。
+    製番フォルダは毎回新規に作られるため、古い material.csv は残らない。"""
     log = log or logger
+    rows = build_material_rows(design_dir, log)
     try:
-        rows = build_material_rows(design_dir, log)
-        if rows is None:
-            return None
-        if not rows:
-            log.info("boxspec が見つからない(または材料行が無い)ため material.csv は作成しません")
-            return None
         return write_material_csv(rows, product_dir)
-    except Exception as e:  # noqa: BLE001 - 材料情報の失敗で製番全体を止めない
-        log.error(f"material.csv の作成に失敗しました(製番の処理は続行します): {type(e).__name__}: {e}")
-        return None
+    except Exception as e:  # noqa: BLE001 - 書き出し失敗も製番の失敗として扱う
+        log.error(f"material.csv の書き出しに失敗しました: {type(e).__name__}: {e}")
+        raise MaterialDataError(f"material.csv の書き出しに失敗しました: {type(e).__name__}") from e

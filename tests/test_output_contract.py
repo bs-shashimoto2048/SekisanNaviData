@@ -2,6 +2,8 @@
 # SekisanNavi が読み込む CSV/PDF/PNG の仕様は、根拠なく変えない。改修でここが失敗したら、
 # 意図した契約変更かどうかを docs/data_pipeline_overview.md の「出力契約」と合わせて確認すること。
 # 外部アクセスは test_main_integration と同じガード・モックで 0 件(擬似の設計データ・一時ディレクトリのみ)。
+import csv
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -31,6 +33,14 @@ EXPECTED_COLUMNS = {
                        "VCT_STAND", "BUS_DUCT", "PASSAGE", "INPUT_CU_COEFF", "SORT_ORDER"],
 }
 
+# 見出しをそのまま固定する CSV(design.csv は「blank」「年」「月」「日」が重複するため、pandas ではなく csv で読む)
+RAW_HEADERS = {
+    "design.csv": ["blank", "整理番号", "製番", "ページ番号", "blank", "図名", "図面尺度１", "図面尺度２",
+                   "承認設計", "年", "月", "日", "承認照査", "年", "月", "日",
+                   "製作設計", "年", "月", "日", "製作照査", "年", "月", "日"],
+    "material.csv": ["PAGE", "SOURCE_FILE", "SYMBOL_NAME", "CABTYPE", "COMPONENT_CODE", "COMPONENT_NAME", "MATERIAL_SPEC"],
+}
+
 
 class OutputContractTest(MainIntegrationBase):
     def setUp(self):
@@ -39,7 +49,7 @@ class OutputContractTest(MainIntegrationBase):
         self.out = self.product_out
 
     def test_file_set_of_a_successful_product(self):
-        expected = set(EXPECTED_COLUMNS) | {"dwg"}
+        expected = set(EXPECTED_COLUMNS) | set(RAW_HEADERS) | {"dwg"}
         for p in PAGES:
             expected |= {f"{p}.pdf", f"{p}.jpeg", f"{p}.png", f"{p}.dxf", f"{p}_detected.txt"}
         for p in PDF_ONLY_PAGES:
@@ -52,6 +62,18 @@ class OutputContractTest(MainIntegrationBase):
         for name, columns in EXPECTED_COLUMNS.items():
             df = pd.read_csv(self.out / name, encoding="cp932")
             self.assertEqual(list(df.columns), columns, name)
+
+    def test_design_and_material_csv_headers_and_encoding(self):
+        for name, header in RAW_HEADERS.items():
+            raw = (self.out / name).read_bytes()
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), f"{name}: BOM あり")
+            rows = list(csv.reader(io.StringIO(raw.decode("cp932"), newline="")))
+            self.assertEqual(rows[0], header, name)
+            self.assertGreater(len(rows), 1, name)
+            self.assertTrue(all(len(r) == len(header) for r in rows), name)
+        # design.csv は設計製番フォルダの .db(.baninf のあるページ分)と 1 対 1
+        self.assertEqual(len(list(csv.reader(io.StringIO((self.out / "design.csv").read_bytes().decode("cp932"), newline="")))) - 1,
+                         len(PAGES))
 
     def test_csv_are_cp932_without_bom(self):
         # SekisanNavi は CP932 で読む。BOM なし。UTF-8 としては読めない日本語を含むファイルがあること自体が契約。
