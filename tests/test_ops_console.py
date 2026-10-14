@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -51,12 +52,12 @@ class SettingsTest(NoRealSubprocess):
     def test_save_and_reload_round_trip_in_a_local_yaml_only(self):
         store = SettingsStore(self.state)
         root = str(self.tmp / "out")
-        saved = store.save({"output_root": root, "schedule_enabled": True, "schedule_time": "08:30"})
-        self.assertEqual(saved, OpsSettings(root, True, "08:30"))
+        saved = store.save({"output_root": root, "schedule_enabled": True, "schedule_time": "08:30", "schedule_interval_days": 3})
+        self.assertEqual(saved, OpsSettings(root, True, "08:30", 3))
         self.assertEqual(SettingsStore(self.state).load(), saved)                 # 別インスタンス(再起動相当)でも同じ
         self.assertEqual([p.name for p in self.state.iterdir()], ["ops.local.yaml"])   # 保存先はローカル設定だけ(一時ファイルも残さない)
         self.assertEqual(yaml.safe_load((self.state / "ops.local.yaml").read_text(encoding="utf-8")),
-                         {"output_root": root, "schedule_enabled": True, "schedule_time": "08:30"})
+                         {"output_root": root, "schedule_enabled": True, "schedule_time": "08:30", "schedule_interval_days": 3})
 
     def test_tracked_app_yaml_is_never_touched(self):
         before = hashlib.sha256((ROOT / "app.yaml").read_bytes()).hexdigest()
@@ -72,6 +73,13 @@ class SettingsTest(NoRealSubprocess):
             {"output_root": str(self.tmp), "schedule_time": "8:00"},          # 形式が違う
             {"output_root": str(self.tmp), "schedule_time": "08:60"},
             {"output_root": str(self.tmp), "schedule_enabled": "yes", "schedule_time": "08:00"},   # 真偽値でない
+            {"output_root": "\\x", "schedule_time": "08:00"},                    # ドライブ名なしの "\x"
+            {"output_root": "C:x", "schedule_time": "08:00"},                    # ドライブ相対
+            {"output_root": str(self.tmp) + "\\..\\other", "schedule_time": "08:00"},   # ".." を含む
+            {"schedule_time": "08:00", "schedule_interval_days": 0},             # 間隔が範囲外
+            {"schedule_time": "08:00", "schedule_interval_days": 31},
+            {"schedule_time": "08:00", "schedule_interval_days": "2"},           # 整数でない
+            {"schedule_time": "08:00", "schedule_interval_days": True},
         ]
         for data in bad:
             with self.assertRaises(SettingsError, msg=str(data)):
@@ -84,6 +92,13 @@ class SettingsTest(NoRealSubprocess):
         (self.state / "ops.local.yaml").write_text("a: [unclosed", encoding="utf-8")
         with self.assertRaises(SettingsError):
             SettingsStore(self.state).load()
+
+    def test_default_interval_is_every_other_day_and_unc_roots_are_accepted(self):
+        self.assertEqual(OpsSettings().schedule_interval_days, 2)                     # 従来の「1 日置き」
+        self.assertEqual(SettingsStore(self.state).save({"schedule_time": "08:00"}).schedule_interval_days, 2)
+        self.assertEqual(SettingsStore(self.state).save({"output_root": "\\\\srv\\share\\out", "schedule_time": "08:00"}).output_root,
+                         "\\\\srv\\share\\out")
+        self.assertEqual(SettingsStore(self.state).save({"schedule_time": "08:00", "schedule_interval_days": 1}).schedule_interval_days, 1)
 
     def test_blank_output_root_means_use_the_app_setting(self):
         self.assertEqual(SettingsStore(self.state).save({"output_root": "  ", "schedule_time": "07:05"}).output_root, "")
@@ -98,6 +113,10 @@ class HistoryTest(NoRealSubprocess):
             self.assertNotIn(leak, out)
         self.assertIn("<パス>", out)
         self.assertEqual(len(sanitize_reason("あ" * 1000)), history_mod.MAX_REASON)
+        spaced = sanitize_reason(r"読めません: C:\Program Files\Some Company\data dir\file.db(CP932)")   # フォルダ名に空白があっても全体を伏せる
+        for leak in ("Program", "Some", "Company", "data dir", "file.db"):
+            self.assertNotIn(leak, spaced)
+        self.assertIn("読めません", spaced)
         self.assertNotIn("\n", sanitize_reason("a\nb\r\nc"))
 
     def test_start_then_finish_is_one_row_with_the_final_status(self):
@@ -226,10 +245,11 @@ class SchedulerTest(NoRealSubprocess):
 
     def test_register_creates_a_daily_task_that_runs_the_normal_process_then_sets_enabled(self):
         sch, calls = self.make()
-        sch.register("08:30", True)
+        sch.register("08:30", 2, True)
         create, change = calls
         self.assertEqual(create[:2], ["schtasks", "/Create"])
         self.assertEqual(create[create.index("/SC") + 1], "DAILY")
+        self.assertEqual(create[create.index("/MO") + 1], "2")                 # 1 日置き(従来の運用間隔)
         self.assertEqual(create[create.index("/ST") + 1], "08:30")
         self.assertIn("/F", create)
         tr = create[create.index("/TR") + 1]
@@ -240,10 +260,12 @@ class SchedulerTest(NoRealSubprocess):
 
     def test_register_disabled_and_update_use_the_same_create(self):
         sch, calls = self.make()
-        sch.register("07:00", False)
+        sch.register("07:00", 1, False)
         self.assertEqual(calls[1][-1], "/DISABLE")
-        sch.register("09:15", True)                                        # 更新 = /F で上書き
+        self.assertEqual(calls[0][calls[0].index("/MO") + 1], "1")             # 毎日にも設定できる
+        sch.register("09:15", 3, True)                                     # 更新 = /F で上書き
         self.assertEqual(calls[2][calls[2].index("/ST") + 1], "09:15")
+        self.assertEqual(calls[2][calls[2].index("/MO") + 1], "3")
 
     def test_delete_and_failure_messages(self):
         sch, calls = self.make()
@@ -251,18 +273,34 @@ class SchedulerTest(NoRealSubprocess):
         self.assertEqual(calls[0][:2], ["schtasks", "/Delete"])
         bad, _ = self.make(returncode=1, stderr="アクセスが拒否されました。".encode("cp932"))
         with self.assertRaises(scheduler_mod.SchedulerError) as ctx:
-            bad.register("08:00", True)
+            bad.register("08:00", 2, True)
         self.assertIn("登録・更新に失敗", str(ctx.exception))
         self.assertNotIn("C:/", str(ctx.exception))
 
     def test_status_parses_the_xml_and_is_read_only(self):
         xml = ('<?xml version="1.0" encoding="UTF-16"?><Task><Triggers><CalendarTrigger><StartBoundary>2026-10-14T08:30:00'
-               '</StartBoundary></CalendarTrigger></Triggers><Settings><Enabled>false</Enabled></Settings></Task>')
+               '</StartBoundary><ScheduleByDay><DaysInterval>2</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>'
+               '<Settings><Enabled>false</Enabled></Settings></Task>')
         sch, calls = self.make(stdout=xml.encode("utf-16"))
-        self.assertEqual(sch.status(), {"registered": True, "enabled": False, "time": "08:30"})
+        self.assertEqual(sch.status(), {"registered": True, "enabled": False, "time": "08:30", "interval_days": 2})
         self.assertEqual([c[1] for c in calls], ["/Query"])
         missing, _ = self.make(returncode=1)
-        self.assertEqual(missing.status(), {"registered": False, "enabled": None, "time": None})
+        self.assertEqual(missing.status(), {"registered": False, "enabled": None, "time": None, "interval_days": None})
+
+    def test_too_long_action_is_refused_before_calling_schtasks(self):
+        calls = []
+        long_sch = scheduler_mod.TaskScheduler("C:/" + "d" * 300 + "/python.exe", "C:/repo/ops_console.py",
+                                               runner=lambda a: calls.append(a) or SimpleNamespace(returncode=0, stdout=b"", stderr=b""))
+        with self.assertRaises(scheduler_mod.SchedulerError) as ctx:
+            long_sch.register("08:00", 2, True)
+        self.assertIn("長すぎ", str(ctx.exception))
+        self.assertEqual(calls, [])
+
+    def test_task_action_quotes_paths_with_spaces_and_the_config_argument(self):
+        sch = scheduler_mod.TaskScheduler(r"C:\Program Files\Py\python.exe", r"D:\my repo\ops_console.py", extra_args=("--config", '"D:\\my repo\\app.local.yaml"'))
+        action = sch.action()
+        self.assertTrue(action.startswith('"C:\\Program Files\\Py\\python.exe" "D:\\my repo\\ops_console.py" run-scheduled'))
+        self.assertIn('--config "D:\\my repo\\app.local.yaml"', action)
 
     def test_default_runner_is_the_only_real_call_and_tests_never_use_it(self):
         sch = scheduler_mod.TaskScheduler("p", "s")
@@ -272,10 +310,10 @@ class SchedulerTest(NoRealSubprocess):
 
 # ------------------------------------------------------------------ 実行管理(指定製番・二重起動・失敗記録)
 class RunnerTest(NoRealSubprocess):
-    def make(self, main_func, alive=lambda pid: True):
+    def make(self, main_func):
         store = SettingsStore(self.state)
         hist = History(self.state)
-        return RunManager(self.state, store, hist, main_func, config_path="cfg.yaml", alive=alive), hist
+        return RunManager(self.state, store, hist, main_func, config_path="cfg.yaml"), hist
 
     def test_manual_run_calls_main_with_that_one_product_and_records_completed(self):
         calls = []
@@ -356,22 +394,61 @@ class RunnerTest(NoRealSubprocess):
         mgr.start_manual("A1TEST0002")[1].join(5)                          # 終われば次を開始できる
         self.assertEqual(len(hist.runs()), 2)
 
-    def test_lock_is_shared_across_processes_via_the_lock_file(self):
-        mine, theirs = RunLock(self.state, alive=lambda pid: True), RunLock(self.state, alive=lambda pid: True)
+    def test_lock_excludes_a_second_holder_and_is_released_on_release(self):
+        mine, theirs = RunLock(self.state), RunLock(self.state)         # 別インスタンス(=別ハンドル)でも OS のロックで競合する
         mine.acquire("scheduled")
+        self.assertTrue(theirs.is_held())
         with self.assertRaises(Busy):
-            theirs.acquire("manual")                                       # 別プロセス(別インスタンス)でも拒否
+            theirs.acquire("manual")
+        with self.assertRaises(Busy):
+            mine.acquire("again")                                          # 同じ持ち主の再取得も二重起動として拒否
         mine.release()
+        self.assertFalse(theirs.is_held())
         theirs.acquire("manual")
         theirs.release()
 
-    def test_stale_lock_of_a_dead_process_is_taken_over(self):
-        (self.state / runner_mod.LOCK_FILE).write_text("999999 manual\n", encoding="utf-8")
-        lock = RunLock(self.state, alive=lambda pid: False)
+    def test_lock_is_shared_with_a_real_other_process_and_freed_when_it_dies(self):
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]);\n"
+                "from ops.runner import RunLock\n"
+                "l = RunLock(sys.argv[2]); l.acquire('child'); print('locked', flush=True); time.sleep(60)")
+        proc = subprocess.Popen([sys.executable, "-c", code, str(ROOT), str(self.state)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "locked")
+            mine = RunLock(self.state)
+            self.assertTrue(mine.is_held())
+            with self.assertRaises(Busy):
+                mine.acquire("scheduled")                                  # タスクスケジューラ側(別プロセス)が実行中なら画面からは開始できない
+        finally:
+            proc.kill()                                                    # 異常終了を模擬(ロックの解放処理は走らない)
+            proc.wait(10)
+        mine = RunLock(self.state)
+        for _ in range(60):                                                # OS がロックを解放するまで、ごく短い遅れがありうる(最大 3 秒待つ)
+            if not mine.is_held():
+                break
+            time.sleep(0.05)
+        self.assertFalse(mine.is_held())                                   # 持ち主が死ねば、ロックファイルが残っていても解放される(古いロックにならない)
+        mine.acquire("manual")
+        mine.release()
+
+    def test_leftover_lock_file_without_a_holder_does_not_block(self):
+        (self.state / runner_mod.LOCK_FILE).write_text("999999 manual\n", encoding="utf-8")     # 前の版・異常終了の残りファイル
+        lock = RunLock(self.state)
         self.assertFalse(lock.is_held())
         lock.acquire("manual")
-        self.assertTrue((self.state / runner_mod.LOCK_FILE).exists())
         lock.release()
+
+    def test_status_polling_does_not_make_a_real_start_fail(self):
+        lock = RunLock(self.state)
+        stop = threading.Event()
+        poller = threading.Thread(target=lambda: [RunLock(self.state).is_held() for _ in iter(stop.is_set, True)], daemon=True)
+        poller.start()
+        try:
+            for _ in range(20):
+                lock.acquire("manual")                                     # 状態確認が一瞬ロックを取っても、再試行で取得できる
+                lock.release()
+        finally:
+            stop.set()
+            poller.join(5)
 
     def test_scheduled_run_calls_the_normal_process_without_products(self):
         calls = []
@@ -448,9 +525,11 @@ class ServerTest(NoRealSubprocess):
         for title in ("1. 運用設定", "2. 動作チェック", "3. 定期実行", "4. 製番を指定して実行", "5. 実行履歴"):
             self.assertIn(title, html)
         self.assertLess(html.index("1. 運用設定"), html.index("5. 実行履歴"))
-        self.assertIn("grid-template-columns: minmax(640px, 40%) 1fr", html)         # 左 1〜4 / 右 5
+        self.assertIn("grid-template-columns: minmax(760px, 44%) 1fr", html)         # 左 1〜4 / 右 5
         self.assertIn("font-size: 22px", html)                                       # 以前の案(約 11px)の 2 倍
         self.assertIn("height: 48px", html)
+        self.assertIn("ログオン中のみ動作します(ログオフ中は動きません)", html)           # 制約が画面で分かる
+        self.assertIn('id="interval"', html)
 
     def test_mutating_requests_need_the_header_and_a_loopback_host(self):
         code, _ = self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_time": "08:00"}, headers={"Content-Type": "application/json"})
@@ -463,8 +542,9 @@ class ServerTest(NoRealSubprocess):
 
     def test_settings_save_reload_and_validation_errors(self):
         root = str(self.tmp / "out")
-        code, body = self.jcall("PUT", "/api/settings", {"output_root": root, "schedule_enabled": True, "schedule_time": "06:45"})
-        self.assertEqual((code, body["settings"]["schedule_time"]), (200, "06:45"))
+        code, body = self.jcall("PUT", "/api/settings", {"output_root": root, "schedule_enabled": True, "schedule_time": "06:45",
+                                                         "schedule_interval_days": 2})
+        self.assertEqual((code, body["settings"]["schedule_time"], body["settings"]["schedule_interval_days"]), (200, "06:45", 2))
         code, body = self.jcall("POST", "/api/settings/reload", {})
         self.assertEqual((code, body["settings"]["output_root"]), (200, root))
         code, body = self.jcall("PUT", "/api/settings", {"output_root": "rel", "schedule_time": "06:45"})
@@ -506,7 +586,7 @@ class ServerTest(NoRealSubprocess):
         self.assertEqual(self.main_calls, [])
 
     def test_schedule_register_and_unregister_only_via_explicit_calls_with_the_mock(self):
-        self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_enabled": True, "schedule_time": "05:10"})
+        self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_enabled": True, "schedule_time": "05:10", "schedule_interval_days": 2})
         self.jcall("GET", "/api/state?schedule=1", headers={})                     # 表示・照会では登録・解除しない
         self.assertEqual({c[1] for c in self.sched_calls}, {"/Query"})
         self.sched_calls.clear()
@@ -514,6 +594,7 @@ class ServerTest(NoRealSubprocess):
         self.assertEqual(code, 200)
         self.assertEqual([c[1] for c in self.sched_calls[:2]], ["/Create", "/Change"])
         self.assertEqual(self.sched_calls[0][self.sched_calls[0].index("/ST") + 1], "05:10")
+        self.assertEqual(self.sched_calls[0][self.sched_calls[0].index("/MO") + 1], "2")
         self.sched_calls.clear()
         code, _ = self.jcall("DELETE", "/api/schedule")
         self.assertEqual(code, 200)
@@ -537,6 +618,30 @@ class EntryPointTest(NoRealSubprocess):
         self.assertEqual(ctx.runs.run_scheduled(), "失敗")                      # 失敗があれば失敗(終了コード 1 になる)
         self.assertEqual(ctx.history.runs()[0]["kind"], "定期")
         ctx.scheduler.assert_not_called()                                         # 起動入口の組み立てだけでタスク操作はしない
+
+    def test_commands_pin_the_working_directory_to_the_repository(self):
+        import importlib, os
+        oc = importlib.import_module("ops_console")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        ctx = SimpleNamespace(runs=SimpleNamespace(run_scheduled=lambda: "完了"))
+        os.chdir(self.tmp)
+        with mock.patch.object(oc, "build_context", return_value=ctx):
+            self.assertEqual(oc.cmd_run_scheduled(SimpleNamespace(config=None)), 0)    # タスクの既定の作業フォルダ(System32)でも、リポジトリ基準になる
+        self.assertEqual(Path(os.getcwd()).resolve(), oc.BASE_DIR.resolve())
+
+    def test_serve_does_not_fail_a_running_record_while_another_process_holds_the_lock(self):
+        import importlib
+        oc = importlib.import_module("ops_console")
+        for held, expected in ((True, 0), (False, 1)):
+            hist = History(self.state / f"h{held}") if (self.state / f"h{held}").mkdir() is None else None
+            hist.start("定期", ALL_PRODUCTS)                                          # 「実行中」のまま残っている記録
+            ctx = SimpleNamespace(runs=SimpleNamespace(lock=SimpleNamespace(is_held=lambda h=held: h)), history=hist)
+            fake_server = SimpleNamespace(serve_forever=mock.Mock(side_effect=KeyboardInterrupt), server_close=mock.Mock())
+            with mock.patch.object(oc, "build_context", return_value=ctx), \
+                    mock.patch("ops.server.make_server", return_value=fake_server), mock.patch("builtins.print"):
+                oc.cmd_serve(SimpleNamespace(config=None, port=0))
+            self.assertEqual(sum(1 for r in hist.runs() if r["status"] == "失敗"), expected, f"held={held}")
 
     def test_serve_refuses_a_non_loopback_bind_and_cli_has_the_two_subcommands(self):
         import importlib

@@ -3,6 +3,7 @@
 #   python ops_console.py run-scheduled    定期実行(タスクスケジューラが呼ぶ)。通常処理 app.main() を 1 回実行して履歴に残す
 # 設定は ops.local.yaml、履歴は ops_history.local.jsonl(どちらも Git 管理外)。app.yaml は読み書きしない。
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -28,8 +29,10 @@ def build_context(state_dir=BASE_DIR, config_path=None, main_func=None, schedule
 
 def cmd_serve(args) -> int:
     from ops.server import make_server
+    os.chdir(BASE_DIR)                          # 相対パスの設定を、どこから起動しても同じ場所基準で読む
     ctx = build_context(config_path=args.config)
-    ctx.history.mark_orphans_failed()          # 前回、終わりが書かれずに止まった「実行中」を失敗にする
+    if not ctx.runs.lock.is_held():            # 別プロセス(定期実行など)が実行中なら、その「実行中」の記録は失敗にしない
+        ctx.history.mark_orphans_failed()      # 前回、終わりが書かれずに止まった「実行中」を失敗にする
     server = make_server(ctx, port=args.port)
     print(f"運用画面: http://127.0.0.1:{args.port}/  (Ctrl+C で終了)")
     try:
@@ -42,6 +45,7 @@ def cmd_serve(args) -> int:
 
 
 def cmd_run_scheduled(args) -> int:
+    os.chdir(BASE_DIR)                          # タスクスケジューラの既定の作業フォルダは System32 のため、リポジトリに固定する
     ctx = build_context(config_path=args.config)
     status = ctx.runs.run_scheduled()
     return 1 if status == "失敗" else 0

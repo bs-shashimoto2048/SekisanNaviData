@@ -14,32 +14,36 @@
   body { background: var(--bg); color: var(--ink); font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI", sans-serif; font-size: 22px; line-height: 1.35; display: flex; flex-direction: column; }
   header { padding: 8px 20px; font-size: 28px; font-weight: 700; border-bottom: 2px solid var(--line); background: var(--panel); display: flex; justify-content: space-between; align-items: baseline; }
   header .state { font-size: 22px; font-weight: 600; }
-  main { flex: 1; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(640px, 40%) 1fr; gap: 12px; padding: 12px; }
-  .left { display: grid; grid-template-rows: auto auto auto auto; gap: 8px; align-content: start; min-height: 0; overflow-y: auto; }
+  main { flex: 1; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(760px, 44%) 1fr; gap: 12px; padding: 12px; }
+  .left { display: flex; flex-direction: column; gap: 8px; min-height: 0; min-width: 0; overflow-y: auto; }
+  .left section { flex: none; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px 10px; min-height: 0; }
   section h2 { margin: 0 0 6px; font-size: 24px; }
-  .right { display: flex; flex-direction: column; min-height: 0; }
-  .right section { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .right { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .right section { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .row { display: flex; align-items: center; gap: 10px; margin: 5px 0; flex-wrap: wrap; }
   label { color: var(--sub); min-width: 7.2em; }
   input[type=text], input[type=time] { font: inherit; height: 48px; padding: 4px 10px; border: 2px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); flex: 1; min-width: 0; }
-  input[type=time] { flex: 0 0 9em; }
+  input[type=time] { flex: 0 0 7.6em; padding: 4px 6px; }
+  input[type=number] { font: inherit; height: 48px; width: 4.2em; padding: 4px 8px; border: 2px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
   input[type=checkbox] { width: 28px; height: 28px; }
   button { font: inherit; font-weight: 600; height: 48px; padding: 0 18px; border: 2px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
   button.secondary { background: transparent; color: var(--accent); }
   button:disabled { opacity: .45; cursor: not-allowed; }
-  .msg { min-height: 1.35em; color: var(--sub); }
+  .msg { color: var(--sub); }
+  .msg:empty { display: none; }
   .msg.ng { color: var(--ng); } .msg.ok { color: var(--ok); }
   ul.checks { list-style: none; margin: 2px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; column-gap: 14px; }
   ul.checks li { padding: 1px 0; }
   .ok { color: var(--ok); } .ng { color: var(--ng); } .skip { color: var(--warn); }
   .tablewrap { flex: 1; min-height: 0; overflow: auto; }
-  table { width: 100%; border-collapse: collapse; }
+  table { width: 100%; min-width: 34em; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { position: sticky; top: 0; background: var(--panel); color: var(--sub); }
-  td.reason { word-break: break-all; }
+  td.reason { min-width: 12em; overflow-wrap: anywhere; }
   tr.running td { font-weight: 700; }
   .badge { font-weight: 700; }
+  @media (max-width: 1500px) { main { grid-template-columns: minmax(660px, 42%) 1fr; } }
 </style>
 </head>
 <body>
@@ -51,8 +55,8 @@
   <div class="left">
     <section id="s1">
       <h2>1. 運用設定</h2>
-      <div class="row"><label for="outroot">出力先</label><input type="text" id="outroot" placeholder="空なら設定ファイルの出力先"></div>
-      <div class="row"><button id="save">保存</button><button id="reload" class="secondary">再読込</button><span class="msg" id="msg1"></span></div>
+      <div class="row"><label for="outroot">出力先</label><input type="text" id="outroot" placeholder="空なら設定ファイルの出力先"><button id="save">保存</button><button id="reload" class="secondary">再読込</button></div>
+      <div class="msg" id="msg1"></div>
     </section>
     <section id="s2">
       <h2>2. 動作チェック</h2>
@@ -61,9 +65,10 @@
     </section>
     <section id="s3">
       <h2>3. 定期実行(タスクスケジューラ)</h2>
-      <div class="row"><input type="checkbox" id="enabled"><label for="enabled" style="min-width:0">有効</label><label for="time" style="min-width:0;margin-left:14px">開始時刻</label><input type="time" id="time" value="08:00"></div>
+      <div class="row"><input type="checkbox" id="enabled"><label for="enabled" style="min-width:0">有効</label><label for="time" style="min-width:0;margin-left:10px">開始時刻</label><input type="time" id="time" value="08:00"><label for="interval" style="min-width:0;margin-left:10px">間隔</label><input type="number" id="interval" min="1" max="30" value="2"><span style="color:var(--sub)">日ごと</span></div>
       <div class="row"><button id="register">タスクを登録・更新</button><button id="unregister" class="secondary">解除</button></div>
       <div class="msg" id="msg3"></div>
+      <div class="msg" style="font-size:18px">※ ログオン中のみ動作します(ログオフ中は動きません)。間隔 2 = 1 日置き、1 = 毎日。</div>
     </section>
     <section id="s4">
       <h2>4. 製番を指定して実行</h2>
@@ -77,7 +82,7 @@
       <h2>5. 実行履歴</h2>
       <div class="tablewrap">
         <table>
-          <thead><tr><th style="width:11em">日時</th><th style="width:4.5em">種別</th><th style="width:11em">製番</th><th style="width:5.5em">状態</th><th>理由</th></tr></thead>
+          <thead><tr><th style="width:9.5em">日時</th><th style="width:4.2em">種別</th><th style="width:8.5em">製番</th><th style="width:5.2em">状態</th><th>理由</th></tr></thead>
           <tbody id="history"></tbody>
         </table>
       </div>
@@ -101,13 +106,20 @@ function applySettings(s) {
   $("outroot").value = s.output_root || "";
   $("enabled").checked = !!s.schedule_enabled;
   $("time").value = s.schedule_time || "08:00";
+  $("interval").value = s.schedule_interval_days || 2;
 }
-function formSettings() { return { output_root: $("outroot").value, schedule_enabled: $("enabled").checked, schedule_time: $("time").value }; }
+function formSettings() { return { output_root: $("outroot").value, schedule_enabled: $("enabled").checked, schedule_time: $("time").value, schedule_interval_days: parseInt($("interval").value, 10) }; }
 function showSchedule(sc) {
   if (!sc) return;
   if (sc.registered === null) say("msg3", "登録状態を確認できませんでした。", "ng");
   else if (!sc.registered) say("msg3", "タスクは未登録です。");
-  else say("msg3", "登録済み(" + (sc.enabled === false ? "無効" : "有効") + (sc.time ? "・毎日 " + sc.time : "") + ")", "ok");
+  else {
+    const every = sc.interval_days ? (sc.interval_days === 1 ? "毎日" : sc.interval_days + " 日ごと") : "";
+    const form = formSettings();
+    const differs = (sc.time && sc.time !== form.schedule_time) || (sc.interval_days && sc.interval_days !== form.schedule_interval_days);
+    say("msg3", "登録済み(" + (sc.enabled === false ? "無効" : "有効") + (every ? "・" + every : "") + (sc.time ? " " + sc.time : "") + ")"
+        + (differs ? " ← 入力と異なります。「登録・更新」で反映" : ""), differs ? "ng" : "ok");
+  }
 }
 async function refreshState(withSchedule) {
   try {

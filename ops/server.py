@@ -54,14 +54,25 @@ def make_handler(ctx: AppContext):
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
             return host in ("127.0.0.1", "localhost")
 
+        def _slurp(self):
+            """リクエスト本文を最初に読み切る(拒否の応答を返す前に読まないと、送信側が接続の中断を受け取ることがある)。"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            self._too_big = n > MAX_BODY
+            self._raw = b"" if self._too_big or n <= 0 else self.rfile.read(n)
+            if self._too_big:
+                self.close_connection = True      # 大きすぎる本文は読まずに、応答後に接続を閉じる
+
         def _body(self) -> dict:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_BODY:
+            if getattr(self, "_too_big", False):
                 raise SettingsError("送信内容が大きすぎます。")
-            if n == 0:
+            raw = getattr(self, "_raw", b"")
+            if not raw:
                 return {}
             try:
-                data = json.loads(self.rfile.read(n).decode("utf-8"))
+                data = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 raise SettingsError("送信内容の形式が正しくありません。")
             if not isinstance(data, dict):
@@ -92,6 +103,7 @@ def make_handler(ctx: AppContext):
                 self._error(404, "見つかりません。")
 
         def do_PUT(self):
+            self._slurp()
             if not self._guard(True):
                 return
             if self.path.split("?", 1)[0] != "/api/settings":
@@ -99,6 +111,7 @@ def make_handler(ctx: AppContext):
             self._handle(lambda: {"ok": True, "settings": ctx.store.save(self._body()).as_dict()})
 
         def do_POST(self):
+            self._slurp()
             if not self._guard(True):
                 return
             path = self.path.split("?", 1)[0]
@@ -113,6 +126,7 @@ def make_handler(ctx: AppContext):
             self._handle(routes[path])
 
         def do_DELETE(self):
+            self._slurp()
             if not self._guard(True):
                 return
             if self.path.split("?", 1)[0] != "/api/schedule":
@@ -143,7 +157,7 @@ def make_handler(ctx: AppContext):
                 try:
                     out["schedule"] = ctx.scheduler.status()
                 except Exception:  # noqa: BLE001 - 照会に失敗しても画面は出す
-                    out["schedule"] = {"registered": None, "enabled": None, "time": None}
+                    out["schedule"] = {"registered": None, "enabled": None, "time": None, "interval_days": None}
             return out
 
         def _do_checks(self):
@@ -157,7 +171,7 @@ def make_handler(ctx: AppContext):
 
         def _do_register(self):
             s = ctx.store.load()
-            ctx.scheduler.register(s.schedule_time, s.schedule_enabled)
+            ctx.scheduler.register(s.schedule_time, s.schedule_interval_days, s.schedule_enabled)
             return {"ok": True, "schedule": ctx.scheduler.status()}
 
         def _do_unregister(self):

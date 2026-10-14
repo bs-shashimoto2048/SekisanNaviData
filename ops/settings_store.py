@@ -22,6 +22,7 @@ class OpsSettings:
     output_root: str = ""             # 出力先ルート(app の設定 data.output の代わりに使う。空なら app の設定どおり)
     schedule_enabled: bool = False    # 定期実行(タスクスケジューラ)の有効/無効
     schedule_time: str = "08:00"      # 定期実行の開始時刻(HH:MM、24 時間表記)
+    schedule_interval_days: int = 2   # 定期実行の間隔(日)。2 = 1 日置き(従来の運用)。1 = 毎日
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -35,8 +36,11 @@ def validate_output_root(value) -> str:
         raise SettingsError("出力先にサンプルの記号(< >)が残っています。実際のフォルダを指定してください。")
     if "\n" in text or "\r" in text or "\x00" in text:
         raise SettingsError("出力先に使えない文字が含まれています。")
-    if not os.path.isabs(text):
-        raise SettingsError("出力先は絶対パスで指定してください。")
+    drive, rest = os.path.splitdrive(text)
+    if not drive or not rest.startswith(("\\", "/")):      # "C:\x" と "\\server\share\x" だけ。"x"・"\x"・"C:x" は相対/ドライブ省略なので不可
+        raise SettingsError("出力先は絶対パス(ドライブ名つき、または \\\\サーバー\\共有名)で指定してください。")
+    if ".." in re.split(r"[\\/]+", text):
+        raise SettingsError("出力先に「..」を含めないでください。")
     return text
 
 
@@ -45,6 +49,15 @@ def validate_time(value) -> str:
     if not TIME_PATTERN.match(text):
         raise SettingsError("開始時刻は 24 時間表記の HH:MM(例: 08:30)で指定してください。")
     return text
+
+
+MAX_INTERVAL_DAYS = 30
+
+
+def validate_interval(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value <= MAX_INTERVAL_DAYS):
+        raise SettingsError(f"実行間隔は 1〜{MAX_INTERVAL_DAYS} 日の整数で指定してください(1 = 毎日、2 = 1 日置き)。")
+    return value
 
 
 def validate_product_no(value) -> str:
@@ -63,7 +76,8 @@ def validate(data: dict) -> OpsSettings:
         raise SettingsError("定期実行の有効/無効は真偽値で指定してください。")
     return OpsSettings(output_root=validate_output_root(data.get("output_root", "")),
                        schedule_enabled=enabled,
-                       schedule_time=validate_time(data.get("schedule_time", "08:00")))
+                       schedule_time=validate_time(data.get("schedule_time", "08:00")),
+                       schedule_interval_days=validate_interval(data.get("schedule_interval_days", OpsSettings.schedule_interval_days)))
 
 
 class SettingsStore:

@@ -15,7 +15,8 @@ RUNNING, COMPLETED, FAILED = "実行中", "完了", "失敗"
 KIND_MANUAL, KIND_SCHEDULED = "手動", "定期"
 MAX_REASON = 200
 
-_WIN_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>|,;]*")           # C:\… / \\server\share\…
+# C:\… / \\server\share\…。フォルダ名に空白があっても(区切りの \ / で終わる部分は空白込みで)全体を伏せる
+_WIN_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)(?:[^\\/\"'<>|\r\n:]*[\\/])*[^\s\"'<>|,;]*")
 _POSIX_PATH = re.compile(r"(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]*")              # /a/b/c
 _SECRET = re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*\S+")
 

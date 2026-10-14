@@ -4,6 +4,7 @@
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -19,80 +20,95 @@ class Busy(RuntimeError):
     """実行中のため開始できない(二重起動の防止)。"""
 
 
-def pid_alive(pid: int) -> bool:
-    """プロセスが生きているか。Windows では os.kill(pid, 0) が終了処理になるため使わない。"""
-    if pid <= 0:
-        return False
+def _try_lock(fd: int) -> bool:
+    """ファイルの先頭 1 バイトに、排他ロックを非ブロッキングで試みる。取れれば True。OS のロックなので、持ち主のプロセスが
+    終了(異常終了を含む)すれば自動で解放される(古いロック・PID の使い回しの問題が起きない)。別のハンドル(同じプロセス内を含む)とも競合する。"""
+    os.lseek(fd, 0, os.SEEK_SET)
     if sys.platform == "win32":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        h = kernel32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return False
+        import msvcrt
         try:
-            code = ctypes.c_ulong()
-            return bool(kernel32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(h)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
     try:
-        os.kill(pid, 0)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
     except OSError:
         return False
-    return True
+
+
+def _unlock(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if sys.platform == "win32":
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class RunLock:
-    """プロセスをまたぐ排他(UI と、タスクスケジューラから起動された定期実行の二重起動を防ぐ)。ロックファイルに PID を書く。"""
+    """プロセスをまたぐ排他(画面からの実行どうし、および画面とタスクスケジューラからの定期実行の二重起動を防ぐ)。
+    ロックファイル(中身は使わない)を OS のファイルロックで排他する。取得できなければ Busy。"""
 
-    def __init__(self, state_dir, alive: Callable[[int], bool] = pid_alive):
+    RETRIES = 5          # 状態の確認(is_held)が一瞬ロックを取る間と重なっても、すぐ Busy にしないための再試行
+    RETRY_WAIT = 0.05
+
+    def __init__(self, state_dir):
         self.path = Path(state_dir) / LOCK_FILE
-        self.alive = alive
+        self._fd: Optional[int] = None
 
-    def _holder(self) -> Optional[int]:
-        try:
-            return int(self.path.read_text(encoding="utf-8").strip().split()[0])
-        except (OSError, ValueError, IndexError):
-            return None
+    def _open(self) -> int:
+        return os.open(str(self.path), os.O_RDWR | os.O_CREAT)
 
     def is_held(self) -> bool:
-        if not self.path.exists():
-            return False
-        pid = self._holder()
-        return pid is not None and self.alive(pid)
+        """誰か(このプロセス・別プロセス)がロックを持っているか。確認のために一瞬ロックを取って、すぐ放す。"""
+        if self._fd is not None:
+            return True
+        fd = self._open()
+        try:
+            if _try_lock(fd):
+                _unlock(fd)
+                return False
+            return True
+        finally:
+            os.close(fd)
 
     def acquire(self, tag: str = "") -> None:
-        for _ in range(2):
-            try:
-                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                pid = self._holder()
-                if pid is not None and self.alive(pid):
-                    raise Busy("実行中です。完了してから開始してください。")
-                try:                       # 持ち主のプロセスがもういない(異常終了の残り)ロックは取り除いて取り直す
-                    self.path.unlink()
-                except OSError:
-                    pass
-                continue
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{os.getpid()} {tag}\n")
-            return
+        if self._fd is not None:
+            raise Busy("実行中です。完了してから開始してください。")
+        for i in range(self.RETRIES):
+            fd = self._open()
+            if _try_lock(fd):
+                self._fd = fd
+                return
+            os.close(fd)
+            if i + 1 < self.RETRIES:
+                time.sleep(self.RETRY_WAIT)
         raise Busy("実行中です。完了してから開始してください。")
 
     def release(self) -> None:
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                _unlock(fd)
+            finally:
+                os.close(fd)
 
 
 class RunManager:
     def __init__(self, state_dir, store: SettingsStore, history: History, main_func: Callable,
-                 config_path: Optional[str] = None, alive: Callable[[int], bool] = pid_alive):
+                 config_path: Optional[str] = None):
         self.store = store
         self.history = history
         self.main_func = main_func            # app.main と同じ呼び出し形: (config_path=, products=, output_root=) -> results
         self.config_path = config_path
-        self.lock = RunLock(state_dir, alive)
+        self.lock = RunLock(state_dir)
         self.current: Optional[dict] = None   # 実行中の {id, kind, product}(このプロセスで開始したもの)
 
     # ---- 状態 ----

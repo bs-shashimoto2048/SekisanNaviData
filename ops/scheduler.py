@@ -4,12 +4,13 @@
 #
 # 登録するタスクは「既存の通常処理を指定時刻に起動する」だけ:
 #   <python> <ops_console.py> run-scheduled   -> app.main() をそのまま実行(製番検索・処理済み判定・実行間隔は変えない)
-# 毎日、指定時刻に 1 回起動する。製番の指定はしない。
+# N 日ごと(1 = 毎日、2 = 1 日置き)の指定時刻に 1 回起動する。製番の指定はしない。
 import re
 import subprocess
 from typing import Callable, Optional
 
 DEFAULT_TASK_NAME = "SekisanNaviData_Ops"
+MAX_ACTION_LENGTH = 261          # schtasks /TR の上限
 
 
 class SchedulerError(RuntimeError):
@@ -45,8 +46,9 @@ class TaskScheduler:
         parts = [f'"{self.python_exe}"', f'"{self.script_path}"', "run-scheduled", *self.extra_args]
         return " ".join(parts)
 
-    def create_args(self, hhmm: str) -> list:
-        return ["schtasks", "/Create", "/TN", self.task_name, "/TR", self.action(), "/SC", "DAILY", "/ST", hhmm, "/F"]
+    def create_args(self, hhmm: str, interval_days: int = 1) -> list:
+        return ["schtasks", "/Create", "/TN", self.task_name, "/TR", self.action(), "/SC", "DAILY", "/MO", str(int(interval_days)),
+                "/ST", hhmm, "/F"]
 
     def change_args(self, enabled: bool) -> list:
         return ["schtasks", "/Change", "/TN", self.task_name, "/ENABLE" if enabled else "/DISABLE"]
@@ -65,9 +67,12 @@ class TaskScheduler:
             raise SchedulerError(f"タスクの{what}に失敗しました(終了コード {res.returncode}){': ' + detail if detail else ''}")
         return res
 
-    def register(self, hhmm: str, enabled: bool):
-        """タスクを登録(既にあれば更新)し、有効/無効を反映する。"""
-        self._run(self.create_args(hhmm), "登録・更新")
+    def register(self, hhmm: str, interval_days: int, enabled: bool):
+        """タスクを登録(既にあれば更新)し、有効/無効を反映する。interval_days 日ごと(1 = 毎日、2 = 1 日置き)に、指定時刻に起動する。"""
+        if len(self.action()) > MAX_ACTION_LENGTH:
+            raise SchedulerError(f"起動コマンドが長すぎて登録できません({len(self.action())} 文字。上限 {MAX_ACTION_LENGTH} 文字)。"
+                                 "短いフォルダにプロジェクトを置いてください。")
+        self._run(self.create_args(hhmm, interval_days), "登録・更新")
         self._run(self.change_args(enabled), "有効/無効の設定")
 
     def delete(self):
@@ -77,7 +82,7 @@ class TaskScheduler:
         """登録状態の照会(読み取りのみ)。{registered, enabled, time}。"""
         res = self.runner(self.query_args())
         if res.returncode != 0:
-            return {"registered": False, "enabled": None, "time": None}
+            return {"registered": False, "enabled": None, "time": None, "interval_days": None}
         xml = _decode(res.stdout)
         enabled = None
         m = re.search(r"<Enabled>\s*(true|false)\s*</Enabled>", xml, re.I)
@@ -87,4 +92,8 @@ class TaskScheduler:
         m = re.search(r"<StartBoundary>[^T<]*T(\d\d:\d\d)", xml)
         if m:
             t = m.group(1)
-        return {"registered": True, "enabled": enabled, "time": t}
+        days: Optional[int] = None
+        m = re.search(r"<DaysInterval>\s*(\d+)\s*</DaysInterval>", xml)
+        if m:
+            days = int(m.group(1))
+        return {"registered": True, "enabled": enabled, "time": t, "interval_days": days}
