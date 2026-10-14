@@ -96,6 +96,57 @@ class FormatTest(DbBase):
         self.assertEqual(raw.count(b"\r\n"), 2)
 
 
+class LineCountTest(DbBase):
+    def row(self):
+        return read_raw(dp.export_design_csv(self.design, self.out))[1]
+
+    def test_short_db_is_padded_with_blanks_in_its_line_positions(self):
+        lines = ["", "S001", PRODUCT, "mb01", "", "図名", "1", "2"]               # 8 行だけの .db(数字以外のファイル名)
+        write_page_db(self.design, "mb01.db", lines)
+        row = self.row()
+        self.assertEqual(len(row), 24)
+        self.assertEqual(row[:8], lines)                                       # 存在する行は同じ列に入る
+        self.assertEqual(row[8:], [""] * 16)                                   # 残りは空欄
+
+    def test_23_lines_leave_only_the_last_column_blank(self):
+        write_page_db(self.design, "1.db", page_db_lines("1")[:23])
+        row = self.row()
+        self.assertEqual(row[:23], page_db_lines("1")[:23])
+        self.assertEqual(row[23], "")
+
+    def test_empty_file_and_single_line_are_not_failures(self):
+        (self.design / "a.db").write_bytes(b"")
+        write_page_db(self.design, "b.db", ["only first"])
+        rows = read_raw(dp.export_design_csv(self.design, self.out))[1:]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(len(r) == 24 for r in rows))
+        self.assertEqual(rows[0], [""] * 24)                                   # a.db(ページ値なし。ファイル名順で先)
+        self.assertEqual(rows[1], ["only first"] + [""] * 23)
+
+    def test_more_than_24_lines_use_only_the_first_24(self):
+        lines = page_db_lines("2") + ["extra25", "extra26", "extra27"]
+        write_page_db(self.design, "2.db", lines)
+        row = self.row()
+        self.assertEqual(row, page_db_lines("2"))
+        self.assertNotIn(b"extra25", (self.out / "design.csv").read_bytes())
+
+    def test_blank_lines_keep_their_line_numbers(self):
+        lines = page_db_lines("3")
+        lines[5] = ""                                                           # 6 行目(図名)が空行
+        lines[9] = ""
+        write_page_db(self.design, "3.db", lines)
+        row = self.row()
+        self.assertEqual(row, lines)                                            # 詰めずに、その列が空欄
+        self.assertEqual(row[6], "1")                                           # 7 行目は 7 列目のまま
+
+    def test_blank_lines_in_the_middle_of_a_short_file_are_kept(self):
+        write_page_db(self.design, "4.db", ["", "", "", "4", "", "", "x"])      # 7 行(途中に空行)
+        row = self.row()
+        self.assertEqual(row[3], "4")
+        self.assertEqual(row[6], "x")
+        self.assertEqual(row[7:], [""] * 17)
+
+
 class OrderTest(DbBase):
     ORDER = ["0", "1", "2", "3", "01", "02", "03", "9", "10", "301", "10A", "9A"]
 
@@ -126,10 +177,25 @@ class OrderTest(DbBase):
             self.db(f"{page}.db")
         self.assertEqual(len(self.pages()), 5)
 
-    def test_extension_case_is_ignored_and_non_page_dbs_are_not_read(self):
+    def test_extension_case_is_ignored(self):
         self.db("1.DB")
-        write_page_db(self.design, "Thumbs.db", ["not a page db"])      # ページ番号ではない .db は読まない(失敗にもしない)
-        self.assertEqual(self.pages(), ["1"])
+        self.db("2.Db")
+        self.assertEqual(self.pages(), ["1", "2"])
+
+    def test_non_digit_file_names_are_included_and_ordered_by_page_value(self):
+        for name, page in [("mb01.db", "mb01"), ("#km.db", "#km"), ("x1.db", "x1"), ("5.db", "5"), ("0.db", "0")]:
+            self.db(name, page=page)
+        # 優先(0) → 数字(5) → その他は文字列順(#km, mb01, x1)
+        self.assertEqual(self.pages(), ["0", "5", "#km", "mb01", "x1"])
+
+    def test_missing_or_empty_page_value_goes_last_ordered_by_file_name(self):
+        self.db("b.db", page="")                                         # 4 行目が空
+        write_page_db(self.design, "a.db", ["x", "y"])                   # 4 行目が無い(2 行しかない)
+        self.db("1.db")
+        self.db("z.db", page="zz")
+        rows = read_raw(dp.export_design_csv(self.design, self.out))[1:]
+        self.assertEqual([r[3] for r in rows], ["1", "zz", "", ""])
+        self.assertEqual([r[0] for r in rows[2:]], ["x", ""])             # 末尾 2 件は a.db(1 行目 "x")→ b.db(1 行目 空)の順
 
 
 class FailureTest(DbBase):
@@ -141,23 +207,21 @@ class FailureTest(DbBase):
         return str(ctx.exception)
 
     def test_no_db_fails(self):
-        self.assertIn("ページ番号の .db がありません", self.assert_fails_without_output())
+        self.assertIn(".db がありません", self.assert_fails_without_output())
+
+    def test_only_non_db_files_fails(self):
+        (self.design / "301.boxspec").write_bytes(b"x")
+        (self.design / "1.dwg").write_bytes(b"x")
+        self.assertIn(".db がありません", self.assert_fails_without_output())
 
     def test_missing_folder_fails(self):
         with self.assertLogs("cad_data.design_page_db", level="WARNING"):
             with self.assertRaises(dp.DesignDataError):
                 dp.export_design_csv(self.design / "missing", self.out)
 
-    def test_short_db_fails_and_no_partial_output_even_if_other_dbs_are_good(self):
-        self.db("1.db")
-        write_page_db(self.design, "2.db", page_db_lines("2")[:23])      # 23 行(必要行が欠けている)
-        reason = self.assert_fails_without_output()
-        self.assertIn("2.db", reason)
-        self.assertIn("行が足りません", reason)
-
     def test_non_cp932_db_fails(self):
         self.db("1.db")
-        (self.design / "2.db").write_bytes(b"\x81" * 30)                 # 不正な CP932(2 バイト文字が完結しない)
+        (self.design / "2.db").write_bytes(b"ab\x81\x20cd")                    # 不正な CP932(先頭バイトの後ろが 2 バイト目として不正)
         self.assertIn("2.db", self.assert_fails_without_output())
 
     def test_value_not_encodable_in_cp932_fails_without_partial_output(self):
