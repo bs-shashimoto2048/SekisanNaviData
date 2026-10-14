@@ -118,3 +118,12 @@ def build_inference_manager(cfg: Settings) -> Tuple[Any, Any]:
     except inference_support.safety.SafetyError as e:
         raise inference_support.InferenceServerError(str(e)) from e
     return manager, server_settings
+
+
+def with_output_root(cfg: Settings, output_root: str) -> Settings:
+    """出力ルート(data.output)だけを差し替えた設定を返す(運用画面の指定実行用)。ほかの設定・検証の順序は変えない。"""
+    import dataclasses
+    root = str(output_root)
+    if cfg.infer_enabled:
+        root = os.path.abspath(root)  # 読込時と同じく、推論サーバーと work_dir を共有できる絶対パスにする
+    return dataclasses.replace(cfg, data_dir=root)

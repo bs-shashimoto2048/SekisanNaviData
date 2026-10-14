@@ -57,7 +57,10 @@ _assert_not_sample_config = settings_mod.assert_not_sample_config
 _is_under = product_flow.is_under
 _safe_rmtree = product_flow.safe_rmtree
 
-def main(config_path=None): # 社内図面解析処理
+def main(config_path=None, products=None, output_root=None): # 社内図面解析処理
+    """products: 処理する製番のリスト(運用画面の指定実行用)。省略(None)なら従来どおり、ホストの出図済み製番から処理済みを除いた全件。
+    指定時はホストの製番一覧取得を省き、指定した製番だけを同じ製番処理(run_product)に通す(処理済み判定・対象判定は製番処理の中でそのまま行う)。
+    output_root: 出力ルート(設定の data.output)の上書き。省略なら設定どおり。"""
     # 設定初期化
     warnings.simplefilter("ignore", FutureWarning) # 警告出力なし
 
@@ -65,6 +68,8 @@ def main(config_path=None): # 社内図面解析処理
     # config_path 省略時は app.local.yaml(Git管理外のローカル設定)があればそれを、無ければ app.yaml(サンプル)を読む。
     # 指定時はそのYAML(検証用 app_test.yaml 等)を読む。読込・サンプル設定の拒否・出力先の決定は pipeline.settings
     cfg = settings_mod.load_settings(config_path, default_path=default_config_path)
+    if output_root is not None:
+        cfg = settings_mod.with_output_root(cfg, output_root)
     config_data = cfg.config_data
     # -> Set:作業ディレクトリ
     data_dir:str = cfg.data_dir
@@ -138,19 +143,24 @@ def main(config_path=None): # 社内図面解析処理
             raise
 
     try:
-        logger.info(f"{'-'*80}")
-        logger.info(f"ホストより当月(～当日)出図完了製番(3番)リスト取得:")
-        logger.info(f"{'-'*80}\n")
+        if products is None:
+            logger.info(f"{'-'*80}")
+            logger.info(f"ホストより当月(～当日)出図完了製番(3番)リスト取得:")
+            logger.info(f"{'-'*80}\n")
 
-        # 出図済み製番リスト作成
-        logger.info("3番出図完了製番リスト作成:")
-        n3_list = host_mod.create_n3_design_list(target_initial)
-        logger.info(f" └> Total: {len(n3_list)}, {n3_list = }\n")
+            # 出図済み製番リスト作成
+            logger.info("3番出図完了製番リスト作成:")
+            n3_list = host_mod.create_n3_design_list(target_initial)
+            logger.info(f" └> Total: {len(n3_list)}, {n3_list = }\n")
 
-        # 処理済み製番を除外
-        logger.info("製番(3番出図済み)リスト作成:処理済み製番削除")
-        product_list = host_mod.get_missing_folders(output_dir, n3_list)
-        logger.info(f" └> Total: {len(product_list)}, {product_list = }\n")
+            # 処理済み製番を除外
+            logger.info("製番(3番出図済み)リスト作成:処理済み製番削除")
+            product_list = host_mod.get_missing_folders(output_dir, n3_list)
+            logger.info(f" └> Total: {len(product_list)}, {product_list = }\n")
+
+        else:
+            product_list = list(products)
+            logger.info(f"指定された製番を処理します: Total: {len(product_list)}, {product_list = }\n")
 
         # >>>>>>>>>>>>>>>>>> DEBUG <<<<<<<<<<<<<<<<<<
         # >    テストは以下で対象製番を指定すること    <

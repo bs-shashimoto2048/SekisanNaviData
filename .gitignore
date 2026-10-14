@@ -52,3 +52,7 @@ file_renamer_gui.*
 
 # local-only text config (production host list etc.)
 *.local.txt
+
+# 運用画面(ops_console.py)のローカル設定・履歴・実行ロック(実行環境ごとの値。コミットしない)
+ops_history.local.jsonl
+ops_run.local.lock
