@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>運用設定・実行管理</title>
+<style>
+  :root { --bg:#f3f5f8; --panel:#ffffff; --line:#cdd5df; --ink:#16202c; --sub:#5a6877; --accent:#1c5fd4; --ok:#177a3c; --ng:#b3261e; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12171d; --panel:#1b222b; --line:#344050; --ink:#e8edf3; --sub:#9fb0c1; --accent:#6aa3ff; --ok:#5dd18a; --ng:#ff8b83; --warn:#e3b341; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI", sans-serif; font-size: 22px; line-height: 1.35; display: flex; flex-direction: column; }
+  header { padding: 8px 20px; font-size: 28px; font-weight: 700; border-bottom: 2px solid var(--line); background: var(--panel); display: flex; justify-content: space-between; align-items: baseline; }
+  header .state { font-size: 22px; font-weight: 600; }
+  main { flex: 1; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(760px, 44%) 1fr; gap: 12px; padding: 12px; }
+  .left { display: flex; flex-direction: column; gap: 8px; min-height: 0; min-width: 0; overflow-y: auto; }
+  .left section { flex: none; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px 10px; min-height: 0; }
+  section h2 { margin: 0 0 6px; font-size: 24px; }
+  .right { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .right section { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 5px 0; flex-wrap: wrap; }
+  label { color: var(--sub); min-width: 7.2em; }
+  input[type=text], input[type=time] { font: inherit; height: 48px; padding: 4px 10px; border: 2px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); flex: 1; min-width: 0; }
+  input[type=time] { flex: 0 0 7.6em; padding: 4px 6px; }
+  input[type=number] { font: inherit; height: 48px; width: 4.2em; padding: 4px 8px; border: 2px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+  input[type=checkbox] { width: 28px; height: 28px; }
+  button { font: inherit; font-weight: 600; height: 48px; padding: 0 18px; border: 2px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .msg { color: var(--sub); }
+  .msg:empty { display: none; }
+  .msg.ng { color: var(--ng); } .msg.ok { color: var(--ok); }
+  ul.checks { list-style: none; margin: 2px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; column-gap: 14px; }
+  ul.checks li { padding: 1px 0; }
+  .ok { color: var(--ok); } .ng { color: var(--ng); } .skip { color: var(--warn); }
+  .tablewrap { flex: 1; min-height: 0; overflow: auto; }
+  table { width: 100%; min-width: 34em; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--panel); color: var(--sub); }
+  td.reason { min-width: 12em; overflow-wrap: anywhere; }
+  tr.running td { font-weight: 700; }
+  .badge { font-weight: 700; }
+  @media (max-width: 1500px) { main { grid-template-columns: minmax(660px, 42%) 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <span>運用設定・実行管理</span>
+  <span class="state" id="runstate">状態を確認中…</span>
+</header>
+<main>
+  <div class="left">
+    <section id="s1">
+      <h2>1. 運用設定</h2>
+      <div class="row"><label for="outroot">出力先</label><input type="text" id="outroot" placeholder="空なら設定ファイルの出力先"><button id="save">保存</button><button id="reload" class="secondary">再読込</button></div>
+      <div class="msg" id="msg1"></div>
+    </section>
+    <section id="s2">
+      <h2>2. 動作チェック</h2>
+      <div class="row"><button id="check">動作チェックを実行</button><span class="msg" id="msg2"></span></div>
+      <ul class="checks" id="checks"></ul>
+    </section>
+    <section id="s3">
+      <h2>3. 定期実行(タスクスケジューラ)</h2>
+      <div class="row"><input type="checkbox" id="enabled"><label for="enabled" style="min-width:0">有効</label><label for="time" style="min-width:0;margin-left:10px">開始時刻</label><input type="time" id="time" value="08:00"><label for="interval" style="min-width:0;margin-left:10px">間隔</label><input type="number" id="interval" min="1" max="30" value="2"><span style="color:var(--sub)">日ごと</span></div>
+      <div class="row"><button id="register">タスクを登録・更新</button><button id="unregister" class="secondary">解除</button></div>
+      <div class="msg" id="msg3"></div>
+      <div class="msg" style="font-size:18px">※ ログオン中のみ動作します(ログオフ中は動きません)。間隔 2 = 1 日置き、1 = 毎日。</div>
+    </section>
+    <section id="s4">
+      <h2>4. 製番を指定して実行</h2>
+      <div class="row"><label for="product">製番</label><input type="text" id="product" placeholder="例: A1AB1234" autocomplete="off"></div>
+      <div class="row"><label for="runroot">出力先</label><input type="text" id="runroot" placeholder="空なら 1. の出力先"></div>
+      <div class="row"><button id="run">この製番を1回実行</button><span class="msg" id="msg4"></span></div>
+    </section>
+  </div>
+  <div class="right">
+    <section id="s5">
+      <h2>5. 実行履歴</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th style="width:9.5em">日時</th><th style="width:4.2em">種別</th><th style="width:8.5em">製番</th><th style="width:5.2em">状態</th><th>理由</th></tr></thead>
+          <tbody id="history"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const H = { "Content-Type": "application/json", "X-Ops-Request": "1" };
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: method === "GET" ? {} : H, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await res.json().catch(() => ({ ok: false, error: "応答を読み取れませんでした。" }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || ("エラー " + res.status));
+  return data;
+}
+function say(id, text, cls) { const e = $(id); e.textContent = text || ""; e.className = "msg" + (cls ? " " + cls : ""); }
+const statusClass = { "完了": "ok", "失敗": "ng", "実行中": "skip", "スキップ": "skip" };
+
+function applySettings(s) {
+  if (!s) return;
+  $("outroot").value = s.output_root || "";
+  $("enabled").checked = !!s.schedule_enabled;
+  $("time").value = s.schedule_time || "08:00";
+  $("interval").value = s.schedule_interval_days || 2;
+}
+function formSettings() { return { output_root: $("outroot").value, schedule_enabled: $("enabled").checked, schedule_time: $("time").value, schedule_interval_days: parseInt($("interval").value, 10) }; }
+function showSchedule(sc) {
+  if (!sc) return;
+  if (sc.registered === null) say("msg3", "登録状態を確認できませんでした。", "ng");
+  else if (!sc.registered) say("msg3", "タスクは未登録です。");
+  else {
+    const every = sc.interval_days ? (sc.interval_days === 1 ? "毎日" : sc.interval_days + " 日ごと") : "";
+    const form = formSettings();
+    const differs = (sc.time && sc.time !== form.schedule_time) || (sc.interval_days && sc.interval_days !== form.schedule_interval_days);
+    say("msg3", "登録済み(" + (sc.enabled === false ? "無効" : "有効") + (every ? "・" + every : "") + (sc.time ? " " + sc.time : "") + ")"
+        + (differs ? " ← 入力と異なります。「登録・更新」で反映" : ""), differs ? "ng" : "ok");
+  }
+}
+async function refreshState(withSchedule) {
+  try {
+    const st = await api("GET", "/api/state" + (withSchedule ? "?schedule=1" : ""));
+    const running = st.status && st.status.running;
+    $("runstate").textContent = running ? "実行中" + (st.status.current ? "(" + st.status.current.product + ")" : "") : "待機中";
+    $("runstate").className = "state " + (running ? "skip" : "ok");
+    $("run").disabled = !!running;
+    if (st.settings_error) say("msg1", st.settings_error, "ng");
+    if (withSchedule) { applySettings(st.settings); showSchedule(st.schedule); }
+  } catch (e) { $("runstate").textContent = "接続できません"; $("runstate").className = "state ng"; }
+}
+async function refreshHistory() {
+  try {
+    const { runs } = await api("GET", "/api/history");
+    const body = $("history"); body.textContent = "";
+    for (const r of runs) {
+      const tr = document.createElement("tr"); if (r.status === "実行中") tr.className = "running";
+      for (const [v, cls] of [[r.started, ""], [r.kind, ""], [r.product, ""], [r.status, "badge " + (statusClass[r.status] || "")], [r.reason, "reason"]]) {
+        const td = document.createElement("td"); td.textContent = v || ""; if (cls) td.className = cls; tr.appendChild(td);
+      }
+      body.appendChild(tr);
+    }
+  } catch (e) { /* 次回の更新で再試行 */ }
+}
+$("save").onclick = async () => { try { const r = await api("PUT", "/api/settings", formSettings()); applySettings(r.settings); say("msg1", "保存しました。", "ok"); } catch (e) { say("msg1", e.message, "ng"); } };
+$("reload").onclick = async () => { try { const r = await api("POST", "/api/settings/reload", {}); applySettings(r.settings); say("msg1", "再読込しました。", "ok"); } catch (e) { say("msg1", e.message, "ng"); } };
+$("check").onclick = async () => {
+  say("msg2", "確認中…"); $("check").disabled = true;
+  try {
+    const r = await api("POST", "/api/checks", {}); const ul = $("checks"); ul.textContent = "";
+    for (const c of r.results) { const li = document.createElement("li"); li.className = c.status; li.textContent = (c.status === "ok" ? "✓ " : c.status === "ng" ? "✗ " : "– ") + c.name + ": " + c.detail; ul.appendChild(li); }
+    say("msg2", r.results.every(c => c.status !== "ng") ? "問題は見つかりませんでした。" : "要確認の項目があります。", r.results.every(c => c.status !== "ng") ? "ok" : "ng");
+  } catch (e) { say("msg2", e.message, "ng"); } finally { $("check").disabled = false; }
+};
+$("register").onclick = async () => {
+  try { await api("PUT", "/api/settings", formSettings()); const r = await api("POST", "/api/schedule/register", {}); showSchedule(r.schedule); say("msg1", "保存しました。", "ok"); }
+  catch (e) { say("msg3", e.message, "ng"); }
+};
+$("unregister").onclick = async () => { try { const r = await api("DELETE", "/api/schedule"); showSchedule(r.schedule); } catch (e) { say("msg3", e.message, "ng"); } };
+$("run").onclick = async () => {
+  say("msg4", "");
+  try { await api("POST", "/api/run", { product: $("product").value, output_root: $("runroot").value }); say("msg4", "開始しました。", "ok"); refreshState(false); refreshHistory(); }
+  catch (e) { say("msg4", e.message, "ng"); }
+};
+refreshState(true); refreshHistory();
+setInterval(() => { refreshState(false); refreshHistory(); }, 3000);
+</script>
+</body>
+</html>

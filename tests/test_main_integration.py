@@ -204,7 +204,7 @@ class MainIntegrationBase(unittest.TestCase):
             f"INF: 推論完了 -> '{dir_product}\\{p}_detected.txt'" for p in page_list)
 
     # ---------------------------------------------------------------- run
-    def run_main(self, *, in_use=False, convert_error=None):
+    def run_main(self, *, in_use=False, convert_error=None, **main_kwargs):
         self.print_script_calls, self.convert_calls, self.api_calls, self.in_use_calls = [], [], [], []
         self.host_calls = []
         real_open = builtins.open
@@ -270,7 +270,7 @@ class MainIntegrationBase(unittest.TestCase):
             st.enter_context(mock.patch.object(app.shutil, "rmtree", self.rmtree))
             st.enter_context(contextlib.redirect_stdout(self.stdout))
             st.enter_context(contextlib.redirect_stderr(self.stderr))  # Logger の StreamHandler は stderr
-            self.results = app.main(config_path=self.config_path)   # {completed, failed, skipped}
+            self.results = app.main(config_path=self.config_path, **main_kwargs)   # {completed, failed, skipped}
 
     # ---------------------------------------------------------------- common checks
     def assert_no_external_calls(self):

@@ -60,6 +60,7 @@ inference_server\.venv\Scripts\python.exe -m unittest discover -s inference_serv
 | 本番のデータ作成設定(共有パス・変換ソフトのパス) | `app.local.yaml` | `app.yaml`(サンプル)を `app.local.yaml` にコピーし、`<SHARE_ROOT>` と `<CONVERTER_DIR>` を実際の値に置き換える。`app.py` は `app.local.yaml` があればそれを、無ければ `app.yaml` を読む。**サンプルのまま(`<...>` が残ったまま)では起動時にエラー**になる |
 | 旧版(`app_20251204.py`)の設定 | `app_20251204.local.yaml` | 同上 |
 | 推論サーバーの安全判定が「本番共有」とみなすホスト | `inference_server/production_hosts.local.txt`(1 行 1 ホスト、`#` 以降はコメント)または環境変数 `SEKISAN_PRODUCTION_HOSTS`(カンマ区切り) | 未設定のときは安全側に倒して、UNC パスはすべて本番扱いで拒否する(UNC の出力ルートは既定でも拒否) |
+| 運用画面(`ops_console.py`)の設定・履歴・実行ロック | `ops.local.yaml`・`ops_history.local.jsonl`・`ops_run.local.lock` | 運用画面が自動で作る(手で作る必要はない)。詳細は [ops_console.md](ops_console.md) |
 | 作業用スクリプト `0.py` / `1.py` / `create_template.py` の入出力先 | 環境変数 `SEKISAN_DESIGN_PRODUCT_DIR`(設計製番フォルダ)、`SEKISAN_OUTPUT_DIR`、`SEKISAN_TARGET_IMAGE`、`SEKISAN_TEMPLATE_DIR` | 未設定ならプレースホルダ(`<...>`)のまま。実際の値は各自の環境で設定する |
 
 - 検証設定 `app_test.yaml` は、共有を指さないローカルのパスだけを持つ(そのままで使える)。
