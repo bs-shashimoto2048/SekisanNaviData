@@ -182,6 +182,43 @@ class OrderTest(DbBase):
         self.db("2.Db")
         self.assertEqual(self.pages(), ["1", "2"])
 
+    def test_thumbs_db_is_not_read_regardless_of_case(self):
+        for name in ("Thumbs.db", ):
+            self.db(name, page="99")                                    # 有効そうな 24 行でも、Thumbs.db は対象にしない
+        self.db("1.db")
+        self.assertEqual(self.pages(), ["1"])
+        self.assertNotIn("99", [r[3] for r in read_raw(self.out / "design.csv")[1:]])
+        self.assertEqual(sorted(p.name.lower() for p in dp.find_page_db_files(self.design)), ["1.db"])
+
+    def test_thumbs_db_exclusion_is_case_insensitive_on_the_whole_name(self):
+        for name in ("THUMBS.DB", "tHuMbS.dB"):
+            (self.design / name).write_bytes(b"\x00binary thumbnail cache\x81\x20")      # 読まれれば CP932 エラーで失敗する中身
+            self.assertEqual(dp.find_page_db_files(self.design), [])
+            (self.design / name).unlink()
+
+    def test_only_thumbs_db_means_no_db_and_fails(self):
+        (self.design / "Thumbs.db").write_bytes(b"cache")
+        with self.assertLogs("cad_data.design_page_db", level="WARNING"):
+            with self.assertRaises(dp.DesignDataError) as ctx:
+                dp.export_design_csv(self.design, self.out)
+        self.assertIn(".db がありません", str(ctx.exception))
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_only_the_exact_name_thumbs_db_is_excluded(self):
+        for name, page in [("Thumbs2.db", "t2"), ("my_thumbs.db", "t3"), ("thumbs.db.db", "t4")]:
+            self.db(name, page=page)                                    # 名前が似ているだけのものは対象
+        self.assertEqual(self.pages(), ["t2", "t3", "t4"])
+
+    def test_thumbs_db_is_skipped_while_non_digit_and_short_dbs_are_still_included(self):
+        write_page_db(self.design, "Thumbs.db", page_db_lines("99"))
+        self.db("mb01.db", page="mb01")                                 # 数字以外の有効な .db
+        write_page_db(self.design, "tr.db", ["", "S001", PRODUCT, "tr", "", "図名", "1", "2"])   # 8 行の .db
+        self.db("2.db")
+        rows = read_raw(dp.export_design_csv(self.design, self.out))[1:]
+        self.assertEqual([r[3] for r in rows], ["2", "mb01", "tr"])
+        self.assertEqual(rows[2][8:], [""] * 16)                        # 8 行の .db は残りの列が空欄で入る
+        self.assertTrue(all(len(r) == 24 for r in rows))
+
     def test_non_digit_file_names_are_included_and_ordered_by_page_value(self):
         for name, page in [("mb01.db", "mb01"), ("#km.db", "#km"), ("x1.db", "x1"), ("5.db", "5"), ("0.db", "0")]:
             self.db(name, page=page)

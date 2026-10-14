@@ -3,6 +3,7 @@
 # 仕様(確定分):
 # - 対象は設計製番フォルダ直下の `*.db`(拡張子の大文字小文字は問わない)すべて。ファイル名が数字だけかどうかでは除外しない
 #   (英字混じり・記号始まり・行数の少ない .db も対象)。元ファイルは読むだけ。
+#   例外は Windows の画像キャッシュ `Thumbs.db` だけ(ファイル名が大文字小文字を問わず一致するものを除外。ページ情報ではない)。
 # - .db は CP932 のテキストで、1 行 = 1 つの値。1〜24 行目を、次の列順で横に展開し、1 ファイルにつき 1 行を出す。
 #   値は意味を変える加工をしない(空白・全角・記号はそのまま)。取り除くのは改行だけ。
 # - 行数の扱い: 24 行に満たなくても失敗にしない。存在する行をその行番号の列に入れ、残りの列は空欄にして 24 列にそろえる。
@@ -32,6 +33,7 @@ DESIGN_COLUMNS: List[str] = [
 LINE_COUNT = len(DESIGN_COLUMNS)   # 24
 PAGE_COLUMN_INDEX = 3              # 4 列目(.db の 4 行目)= ページ番号
 PAGE_PRIORITY = ["0", "1", "2", "3", "01", "02", "03"]
+EXCLUDED_DB_NAME = "thumbs.db"     # Windows の画像キャッシュ(ページ情報ではない)。小文字で比較する
 
 
 class DesignDataError(Exception):
@@ -39,11 +41,14 @@ class DesignDataError(Exception):
 
 
 def find_page_db_files(design_dir) -> List[Path]:
-    """設計製番フォルダ直下の *.db(大文字小文字を問わない)を名前順に返す。フォルダが無ければ空。"""
+    """設計製番フォルダ直下の *.db(大文字小文字を問わない)を名前順に返す。フォルダが無ければ空。
+    Windows の画像キャッシュ `Thumbs.db`(ファイル名が大文字小文字を問わず一致するもの)だけは、ページ情報ではないので除く。"""
     folder = Path(design_dir)
     if not folder.is_dir():
         return []
-    return sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".db"), key=lambda q: q.name)
+    return sorted((p for p in folder.iterdir()
+                   if p.is_file() and p.suffix.lower() == ".db" and p.name.lower() != EXCLUDED_DB_NAME),
+                  key=lambda q: q.name)
 
 
 def read_page_db(path) -> List[str]:
