@@ -70,6 +70,21 @@ _DETECTIONS = [
 ]
 
 
+# 設計データの design.csv(ページ番号 .db)/ material.csv(.boxspec)の擬似入力。値はすべて架空。
+# どちらも無いと製番は失敗になるため、統合テストの既定の設計データには必ず含める。
+def page_db_lines(page, serial=SERIAL, product=PRODUCT):
+    """ページ番号 .db の 24 行(1 行 = 1 値)。行位置は design.csv の列順(2=整理番号, 3=製番, 4=ページ番号, ...)。"""
+    return ["", serial, product, str(page), "", f"図名{page}", "1", "2", "設計者A", "26", "10", "01", "照査者B", "26", "10", "02",
+            "製作者C", "26", "10", "03", "照査者D", "26", "10", "04"]
+
+
+def write_page_db(folder, name, lines):
+    Path(folder, name).write_bytes(("\r\n".join(lines) + "\r\n").encode("cp932"))
+
+
+DEFAULT_BOXSPEC = ["シンボル名$BSP-CABTYPEA|CABTYPE$ZZ1|", "シンボル名$BSP-STEELA-H|STEEL-BASE$無し|STEEL-SIDE$TEST-S 1.0|"]
+
+
 class ExternalCallError(AssertionError):
     pass
 
@@ -88,6 +103,8 @@ def _sha(path: Path) -> str:
 
 class MainIntegrationBase(unittest.TestCase):
     """一時ディレクトリ上に擬似の設計サーバー/出力先/設定を用意し、外部処理をモックして main() を実行する"""
+    boxspec_lines = DEFAULT_BOXSPEC   # None なら .boxspec を置かない(= material.csv を作れず製番は失敗)
+    with_page_db = True               # False ならページ番号 .db を置かない(= design.csv を作れず製番は失敗)
 
     def setUp(self):
         td = tempfile.TemporaryDirectory(prefix="sekisan_it_")
@@ -126,6 +143,11 @@ class MainIntegrationBase(unittest.TestCase):
             (self.design_product / f"{page}.dwg").write_bytes(b"dummy-dwg-" + page.encode())
         for page in PDF_ONLY_PAGES + EXCLUDED_PAGES:  # .baninf の無い図面(拡張子の大文字小文字は問わない)
             (self.design_product / f"{page}.DWG").write_bytes(b"dummy-dwg-" + page.encode())
+        if self.with_page_db:
+            for page in _BANINF:
+                write_page_db(self.design_product, f"{page}.db", page_db_lines(page))
+        if self.boxspec_lines is not None:
+            write_page_db(self.design_product, "301.boxspec", self.boxspec_lines)   # CP932・CRLF で書く(内容は .boxspec の行)
 
     def _make_config(self) -> Path:
         cfg = yaml.safe_load((ROOT / "app_test.yaml").read_text(encoding="utf-8"))
@@ -248,7 +270,7 @@ class MainIntegrationBase(unittest.TestCase):
             st.enter_context(mock.patch.object(app.shutil, "rmtree", self.rmtree))
             st.enter_context(contextlib.redirect_stdout(self.stdout))
             st.enter_context(contextlib.redirect_stderr(self.stderr))  # Logger の StreamHandler は stderr
-            app.main(config_path=self.config_path)
+            self.results = app.main(config_path=self.config_path)   # {completed, failed, skipped}
 
     # ---------------------------------------------------------------- common checks
     def assert_no_external_calls(self):

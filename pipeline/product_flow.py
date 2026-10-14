@@ -213,13 +213,23 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info(f" └> CSV作成: 座標計算用 -> {config_loader.convert_win_path(ctx.product_df_path)}")
     logger.info(f" └> DataFrame作成(解析座標復元用): product_df \n")
 
-    # 材料一覧: 設計フォルダの *.boxspec -> material.csv(失敗しても製番の処理は続行。boxspec が無いのは通常の欠損)
+    # design.csv(ページ番号 .db)と material.csv(*.boxspec)。どちらかが作れなければ製番を失敗として記録する
+    # (部分的な CSV は作らない。参照元を整えて再実行する。後続の印刷・推論には進まない)
+    logger.info("設計情報(ページ番号 .db -> design.csv):")
+    try:
+        design_path = cad_mod.export_design_csv(ctx.dir_design_product, dir_product, log=logger)
+    except cad_mod.DesignDataError as e:
+        logger.error(f"design.csv を作成できないため、製番 {ctx.product} を失敗とします: {e}\n")
+        return ProductResult(FAILED, f"design.csv を作成できません: {e}", cleanup=True)
+    logger.info(f" └> CSV作成: 設計 -> {config_loader.convert_win_path(design_path)}\n")
+
     logger.info("材料情報(boxspec -> material.csv):")
-    material_path = cad_mod.export_material_csv(ctx.dir_design_product, dir_product, log=logger)
-    if material_path:
-        logger.info(f" └> CSV作成: 材料 -> {config_loader.convert_win_path(material_path)}\n")
-    else:
-        logger.info(" └> material.csv は作成しませんでした\n")
+    try:
+        material_path = cad_mod.export_material_csv(ctx.dir_design_product, dir_product, log=logger)
+    except cad_mod.MaterialDataError as e:
+        logger.error(f"material.csv を作成できないため、製番 {ctx.product} を失敗とします: {e}\n")
+        return ProductResult(FAILED, f"material.csv を作成できません: {e}", cleanup=True)
+    logger.info(f" └> CSV作成: 材料 -> {config_loader.convert_win_path(material_path)}\n")
 
     # 共通製作仕様書印刷 -> あれば焼く_2025/11/28
     logger.info(f"共通製作仕様書 印刷:")
