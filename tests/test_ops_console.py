@@ -190,6 +190,37 @@ class ChecksTest(NoRealSubprocess):
         res = checks.run_checks("x", OpsSettings(), load_config=boom)
         self.assertEqual([r["status"] for r in res], ["ng"])
 
+    def _host_check_with_mocks(self, query, init=None):
+        events = []
+        with mock.patch("ops.com.co_initialize", side_effect=init or (lambda: events.append("init"))), \
+                mock.patch("ops.com.co_uninitialize", side_effect=lambda: events.append("uninit")), \
+                mock.patch("bs_pkg.host_mod.create_n3_design_list", side_effect=lambda ini: events.append("query") or query(ini)):
+            try:
+                result = checks.default_host_check("A1")
+            except Exception as e:  # noqa: BLE001
+                result = e
+        return events, result
+
+    def test_default_host_check_initializes_com_then_queries_then_uninitializes(self):
+        events, result = self._host_check_with_mocks(lambda ini: ["A1X", "A1Y"])     # 実 DB・実 COM には触れない
+        self.assertEqual(events, ["init", "query", "uninit"])
+        self.assertEqual(result[0], True)
+        self.assertIn("2 件", result[1])
+
+    def test_default_host_check_uninitializes_com_even_when_the_query_fails(self):
+        def boom(ini):
+            raise RuntimeError("照会失敗")
+        events, result = self._host_check_with_mocks(boom)
+        self.assertEqual(events, ["init", "query", "uninit"])
+        self.assertIsInstance(result, RuntimeError)
+
+    def test_default_host_check_does_not_query_or_uninitialize_when_com_init_fails(self):
+        def bad():
+            raise OSError("init 失敗")
+        events, result = self._host_check_with_mocks(lambda ini: [], init=bad)
+        self.assertEqual(events, [])                                                 # 照会せず、初期化していないので終了もしない
+        self.assertIsInstance(result, OSError)
+
     def test_output_root_uses_the_ops_setting_over_the_app_setting_and_is_not_created(self):
         mine = self.tmp / "mine"
         res = self.run_it(self.config(), OpsSettings(output_root=str(mine)))
@@ -310,10 +341,41 @@ class SchedulerTest(NoRealSubprocess):
 
 # ------------------------------------------------------------------ 実行管理(指定製番・二重起動・失敗記録)
 class RunnerTest(NoRealSubprocess):
-    def make(self, main_func):
+    def make(self, main_func, **com):
         store = SettingsStore(self.state)
         hist = History(self.state)
-        return RunManager(self.state, store, hist, main_func, config_path="cfg.yaml"), hist
+        return RunManager(self.state, store, hist, main_func, config_path="cfg.yaml", **com), hist
+
+    def test_com_is_initialized_in_the_worker_thread_around_main_and_always_uninitialized(self):
+        import threading
+        events = []
+        tid = lambda: threading.current_thread().ident  # noqa: E731
+
+        def fake_main(**kw):
+            events.append(("main", tid()))
+            raise RuntimeError("途中で失敗")
+        mgr, hist = self.make(fake_main, com_init=lambda: events.append(("init", tid())),
+                              com_uninit=lambda: events.append(("uninit", tid())))
+        mgr.start_manual("A1TEST0001")[1].join(5)
+        self.assertEqual([e[0] for e in events], ["init", "main", "uninit"])    # main の前に初期化、失敗しても終了する
+        self.assertEqual(len({e[1] for e in events}), 1)                       # 3 つとも同じ worker スレッド
+        self.assertNotEqual(events[0][1], threading.current_thread().ident)
+        self.assertEqual(hist.runs()[0]["status"], "失敗")
+
+    def test_com_init_failure_does_not_run_main_and_is_recorded_as_failed(self):
+        ran, un = [], []
+
+        def bad_init():
+            raise OSError(r"C:\secret\x")
+        mgr, hist = self.make(lambda **kw: ran.append(1) or {}, com_init=bad_init, com_uninit=lambda: un.append(1))
+        mgr.start_manual("A1TEST0001")[1].join(5)
+        self.assertEqual(ran, [])
+        self.assertEqual(un, [])                                               # 初期化していないので終了もしない
+        run = hist.runs()[0]
+        self.assertEqual(run["status"], "失敗")
+        self.assertIn("COM を初期化できない", run["reason"])
+        self.assertNotIn("secret", run["reason"])
+        self.assertFalse(mgr.status()["running"])
 
     def test_manual_run_calls_main_with_that_one_product_and_records_completed(self):
         calls = []
@@ -462,6 +524,38 @@ class RunnerTest(NoRealSubprocess):
         mgr, hist = self.make(lambda **kw: {"completed": ["A1X"], "failed": {"A1Y": "RuntimeError: material.csv を作成できません"}, "skipped": {}})
         self.assertEqual(mgr.run_scheduled(), FAILED)
         self.assertIn("失敗 1 件", hist.runs()[0]["reason"])
+
+    def test_scheduled_run_initializes_com_around_main_only(self):
+        events = []                                                          # app.main はモック。実タスク・DB・COM は使わない
+        mgr, hist = self.make(lambda **kw: events.append("main") or {"completed": ["A1X"], "failed": {}, "skipped": {}},
+                              com_init=lambda: events.append("init"), com_uninit=lambda: events.append("uninit"))
+        self.assertEqual(mgr.run_scheduled(), COMPLETED)
+        self.assertEqual(events, ["init", "main", "uninit"])
+        self.assertFalse(mgr.status()["running"])
+
+    def test_scheduled_run_with_com_init_failure_is_failed_and_releases_the_lock(self):
+        ran = []
+
+        def bad():
+            raise OSError("init 失敗")
+        mgr, hist = self.make(lambda **kw: ran.append(1) or {}, com_init=bad, com_uninit=lambda: ran.append("un"))
+        self.assertEqual(mgr.run_scheduled(), FAILED)
+        self.assertEqual(ran, [])
+        self.assertIn("COM を初期化できない", hist.runs()[0]["reason"])
+        self.assertFalse(mgr.status()["running"])
+
+    def test_com_uninit_failure_does_not_change_the_recorded_result(self):
+        def bad_un():
+            raise OSError("uninit 失敗")
+        mgr, hist = self.make(lambda **kw: {"completed": ["A1TEST0001"], "failed": {}, "skipped": {}},
+                              com_init=lambda: None, com_uninit=bad_un)
+        mgr.start_manual("A1TEST0001")[1].join(5)
+        self.assertEqual(hist.runs()[0]["status"], "完了")                   # 終了処理の失敗で完了を失敗にしない
+        self.assertFalse(mgr.status()["running"])
+        mgr2, hist2 = self.make(lambda **kw: (_ for _ in ()).throw(RuntimeError("main 失敗")), com_init=lambda: None, com_uninit=bad_un)
+        mgr2.start_manual("A1TEST0001")[1].join(5)
+        self.assertEqual(hist2.runs()[0]["status"], "失敗")
+        self.assertIn("main 失敗", hist2.runs()[0]["reason"])                # 元の失敗理由が終了処理の失敗で上書きされない
 
     def test_scheduled_run_while_busy_does_not_start_and_is_recorded(self):
         calls = []
