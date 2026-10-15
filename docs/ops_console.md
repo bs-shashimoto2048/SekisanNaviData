@@ -39,6 +39,9 @@
 - 状態は `app.main` の結果をそのまま反映する: 完了 → **完了**、失敗 → **失敗**(理由つき)、処理済み・対象外 → **スキップ**(完了とは扱わない)、例外 → **失敗**。
 - **二重起動の防止**: ロックファイルへの OS のファイルロック(排他)で、画面からの実行どうし、および画面とタスクスケジューラからの定期実行の間で排他する。実行中の開始は拒否される(画面では 409 の旨を表示、ボタンも無効)。ロックは持ち主のプロセスが終了(異常終了を含む)すれば OS が解放するため、古いロックは残らず、PID の使い回しも問題にならない。状態確認が一瞬ロックを取る間と重なっても、取得は短く再試行する。
 - 画面を開き直したとき、終わりが書かれず「実行中」のまま残った履歴は「失敗(処理が途中で終了)」にする。
+- **COM の初期化・終了**: ホスト DB(`host_mod`)は COM(ADODB)を使う。メインスレッド以外では COM が未初期化で、`ADODB.Connection` の生成が `0x800401F0` で失敗し、`host_mod` は例外を握りつぶして「ホスト情報を取得できません」(スキップ)にしてしまう。そのため、**製番の実行(`ops-run` の worker スレッド。定期実行も同じ処理)** と **動作チェックのホスト照会(HTTP の要求スレッド)** は、呼ぶ前に同じスレッド内で `CoInitialize`、終わったら必ず `CoUninitialize` を呼ぶ(`ops/com.py`)。
+  - 初期化に失敗したときは `app.main` を実行せず、履歴に「失敗(COM を初期化できないため実行しませんでした)」を残す(終了処理は呼ばない)。
+  - 終了処理(`CoUninitialize`)が例外になっても、握って無視する。すでに決まった実行結果(完了・失敗・スキップと理由)は変えない。
 
 ## 定期実行(Windows タスクスケジューラ)
 
@@ -58,4 +61,4 @@
 
 ## 構成
 
-`ops/settings_store.py`(設定)・`ops/history.py`(履歴)・`ops/checks.py`(動作チェック)・`ops/runner.py`(実行・ロック)・`ops/scheduler.py`(schtasks)・`ops/server.py`(HTTP)・`ops/static/index.html`(画面)。テストは `tests/test_ops_console.py`。
+`ops/settings_store.py`(設定)・`ops/history.py`(履歴)・`ops/checks.py`(動作チェック)・`ops/runner.py`(実行・ロック)・`ops/com.py`(COM の初期化・終了)・`ops/scheduler.py`(schtasks)・`ops/server.py`(HTTP)・`ops/static/index.html`(画面)。テストは `tests/test_ops_console.py`。

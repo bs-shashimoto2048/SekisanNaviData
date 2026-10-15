@@ -77,7 +77,12 @@ def default_design_check() -> Tuple[bool, str]:
 def default_host_check(initials: str) -> Tuple[bool, str]:
     """ホスト DB: 読み取り専用の照会(出図済み製番の一覧取得)だけ。件数のみ返す。"""
     from bs_pkg import host_mod
-    items = host_mod.create_n3_design_list(initials)
+    from ops import com as com_mod
+    com_mod.co_initialize()          # HTTP の要求スレッドは COM 未初期化のため、同じスレッド内で前後する
+    try:
+        items = host_mod.create_n3_design_list(initials)
+    finally:
+        com_mod.co_uninitialize()
     return (True, f"読み取り照会に成功しました(出図済み製番 {len(items)} 件)")
 
 

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+from ops import com as com_mod
 from ops.history import COMPLETED, FAILED, KIND_MANUAL, KIND_SCHEDULED, RUNNING, History, sanitize_reason
 from ops.settings_store import SettingsError, SettingsStore, validate_product_no
 
@@ -103,7 +104,10 @@ class RunLock:
 
 class RunManager:
     def __init__(self, state_dir, store: SettingsStore, history: History, main_func: Callable,
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 com_init: Callable = com_mod.co_initialize, com_uninit: Callable = com_mod.co_uninitialize):
+        self.com_init = com_init              # app.main(ホスト DB は COM)を呼ぶスレッドで、呼ぶ前に初期化する
+        self.com_uninit = com_uninit
         self.store = store
         self.history = history
         self.main_func = main_func            # app.main と同じ呼び出し形: (config_path=, products=, output_root=) -> results
@@ -127,10 +131,21 @@ class RunManager:
     def _execute(self, run_id: str, products, output_root, product_label: str):
         """app.main を呼び、結果を履歴の状態にする。ここで例外を握って失敗として記録する。"""
         try:
+            self.com_init()
+        except Exception as e:  # noqa: BLE001 - 初期化できないときは app.main を実行しない
+            status = FAILED
+            self.history.finish(run_id, status, f"COM を初期化できないため実行しませんでした({type(e).__name__})")
+            return status
+        try:
             res = self._call_main(products, output_root)
             status, reason = self._summarize(res, product_label)
         except Exception as e:  # noqa: BLE001 - どんな失敗も「完了」にしない
             status, reason = FAILED, f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                self.com_uninit()      # 初期化したのと同じスレッドで必ず終了する
+            except Exception:  # noqa: BLE001 - 終了処理の失敗で結果の記録を失わない
+                pass
         self.history.finish(run_id, status, reason)
         return status
 
