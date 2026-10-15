@@ -23,16 +23,16 @@
 | `server.yaml` | `--config-out`(出力ルート配下)に書く。**正常停止時に、自分の `instance_id` のものだけ削除する**。強制終了では残る(古い接続先になり得る) | `main()` |
 | サーバー実体 | werkzeug の開発用サーバー(`make_server(..., threaded=True)`)。認証なし。ログは標準出力のみ(ファイル出力・ローテーションなし) | `server.py` |
 | 推論の並行性 | モデル推論は直列化(ロック)。同一(work_dir, page)は排他 | `ServerState` |
-| `/health` の現行応答 | 200(準備完了)/ 503(読み込み中)/ 500(準備失敗)。リダイレクトなし。**本文に `output_root`(パス)と `pid` を含む** | `health()` |
+| `/health` の現行応答 | 200(準備完了)/ 503(読み込み中)/ 500(準備失敗)。リダイレクトなし。本文は `instance_id`・`backend`・`mode`・`status`・`ready`。失敗時の `error` は例外型名だけ(内部パス・pid・例外メッセージなし) | `health()` |
 | `/predict` | フォーム `work_dir`・`page_nmb`・`extension`。**画像は送らず、サーバーが `work_dir` のファイルを読み、`{page}_detected.txt/.png` を `work_dir` へ書く**。`work_dir` は絶対パスで、サーバー OS の `os.path.isabs` / `realpath` で判定 | `safety.validate_work_dir`、契約 §2・§4 |
 | 本番モードの事前確認 | `app.main` が `GET /health` を 1 度だけ(`requests`、リダイレクト追跡なし、プロキシは `api.use_proxy` と `server.yaml` の `proxy`、既定 5 秒)。200 以外は製番処理を始めず失敗 | `pipeline/api_preflight.py` |
-| 運用画面の動作チェック | `GET /health` を **`urllib` で、プロキシなし固定・リダイレクト追跡あり**、3 秒。200 のとき OK | `ops/checks.py` |
+| 運用画面の動作チェック | 本番モードでは `api_preflight.unavailable_reason` と同じ判定を使う(`requests`、設定に基づくプロキシ、リダイレクト追跡なし、既定 5 秒)。HTTP 200 以外は NG。統合モードは SKIP | `ops/checks.py`、`pipeline/api_preflight.py` |
 | 検証設定 | `app_test.yaml`: `api.use_proxy: false`、出力はローカルの `./output_test`、`server.yaml` の置き場もその配下 | `app_test.yaml` |
 | 実モデル | `requirements-real.txt` は torch 2.6.0+cu124 固定だが、動作確認済みは 2.5.1+cu124 のみ(`docs/inference_server.md` §9)。合成画像での起動→推論→停止は確認済み。**実図面での結果は未検証** | `docs/inference_server.md` §7・§9 |
 
 ### 2.1 結論(検証用サーバーを本番サーバーとしてそのまま扱わない理由)
 1. loopback 限定・出力ルート固定で、別 PC から使えない(GPU サーバーでは使えない)。
-2. 開発用サーバー・認証なし・ログ運用なし・`/health` が内部パスを返す。
+2. 開発用サーバー・認証なし・ログ運用なし。`/health` の内部情報は I-3 で除去済みだが、本番公開時の認証・アクセス制御は別途必要。
 3. `work_dir` が「サーバーとクライアントで同じパス」を前提にしている(§7)。
 4. `mode: test` として `server.yaml` を書くなど、検証専用の前提が随所にある。
 
