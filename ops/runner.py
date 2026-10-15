@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from ops import com as com_mod
-from ops.history import COMPLETED, FAILED, KIND_MANUAL, KIND_SCHEDULED, RUNNING, History, sanitize_reason
+from ops.history import COMPLETED, FAILED, KIND_MANUAL, KIND_SCHEDULED, KIND_SCHEDULED_CHECK, RUNNING, History, sanitize_reason
 from ops.settings_store import SettingsError, SettingsStore, validate_product_no
 
 LOCK_FILE = "ops_run.local.lock"
 SKIPPED = "スキップ"
 ALL_PRODUCTS = "(通常処理)"
+DRY_RUN_LABEL = "(検証のみ)"
+DRY_RUN_OK_REASON = "検証のみ(dry-run): 起動・ロック・COM・設定の読込を確認しました。製番処理は実行していません"
 
 
 class Busy(RuntimeError):
@@ -200,6 +202,39 @@ class RunManager:
             run_id = self.history.start(KIND_SCHEDULED, ALL_PRODUCTS)
             self.current = {"id": run_id, "kind": KIND_SCHEDULED, "product": ALL_PRODUCTS}
             return self._execute(run_id, None, root, ALL_PRODUCTS)
+        finally:
+            self.current = None
+            self.lock.release()
+
+    def run_scheduled_dry_run(self) -> str:
+        """run-scheduled --dry-run(タスクの起動経路の検証用)。ロック取得・COM の初期化と終了・ローカル設定の読込・履歴の記録だけを行い、
+        main_func(app.main)は呼ばない。履歴は種別「定期(検証)」。製番・出力先・設定値は記録しない。結果の状態を返す。"""
+        try:
+            self.lock.acquire("scheduled-dry-run")
+        except Busy:
+            rid = self.history.start(KIND_SCHEDULED_CHECK, DRY_RUN_LABEL)
+            self.history.finish(rid, SKIPPED, "実行中のため開始しませんでした(二重起動の防止)")
+            return SKIPPED
+        try:
+            run_id = self.history.start(KIND_SCHEDULED_CHECK, DRY_RUN_LABEL)
+            self.current = {"id": run_id, "kind": KIND_SCHEDULED_CHECK, "product": DRY_RUN_LABEL}
+            try:
+                self.com_init()
+            except Exception as e:  # noqa: BLE001
+                self.history.finish(run_id, FAILED, f"COM を初期化できませんでした({type(e).__name__})")
+                return FAILED
+            try:
+                self.store.load()                       # 読めることだけ確認する(値は使わない・記録しない)
+                status, reason = COMPLETED, DRY_RUN_OK_REASON
+            except Exception as e:  # noqa: BLE001
+                status, reason = FAILED, f"ローカル設定を読み込めませんでした({type(e).__name__})"
+            finally:
+                try:
+                    self.com_uninit()
+                except Exception:  # noqa: BLE001 - 終了処理の失敗で結果の記録を失わない
+                    pass
+            self.history.finish(run_id, status, reason)
+            return status
         finally:
             self.current = None
             self.lock.release()

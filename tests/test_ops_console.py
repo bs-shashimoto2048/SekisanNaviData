@@ -590,6 +590,94 @@ class RunnerTest(NoRealSubprocess):
         self.assertEqual(hist2.runs()[0]["status"], "失敗")
         self.assertIn("main 失敗", hist2.runs()[0]["reason"])                # 元の失敗理由が終了処理の失敗で上書きされない
 
+    def _dry_run_mgr(self, events, load_error=None, init=None, uninit=None):
+        main = mock.Mock(name="app.main")                                    # 呼ばれたら失敗にする
+        mgr, hist = self.make(main, com_init=init or (lambda: events.append("init")),
+                              com_uninit=uninit or (lambda: events.append("uninit")))
+        if load_error is not None:
+            mgr.store.load = mock.Mock(side_effect=load_error)
+        else:
+            real = mgr.store.load
+            mgr.store.load = mock.Mock(side_effect=lambda: events.append("load") or real())
+        return mgr, hist, main
+
+    def test_dry_run_checks_lock_com_settings_history_without_calling_main(self):
+        events = []
+        mgr, hist, main = self._dry_run_mgr(events)
+        self.assertEqual(mgr.run_scheduled_dry_run(), COMPLETED)
+        main.assert_not_called()                                              # app.main は呼ばない
+        self.assertEqual(events, ["init", "load", "uninit"])                  # COM の初期化 → 設定の読込 → 終了
+        self.assertFalse(mgr.status()["running"])                             # ロックを解放
+        runs = hist.runs()
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual((run["kind"], run["product"], run["status"]), ("定期(検証)", "(検証のみ)", "完了"))
+        self.assertNotEqual(run["kind"], "定期")                                # 通常の定期処理と区別できる
+        self.assertIn("製番処理は実行していません", run["reason"])
+
+    def test_dry_run_records_no_paths_settings_or_products(self):
+        events = []
+        mgr, hist, _ = self._dry_run_mgr(events)
+        mgr.store.save({"output_root": str(self.tmp / "secret-out"), "schedule_time": "08:00"})
+        mgr.run_scheduled_dry_run()
+        text = hist.path.read_text(encoding="utf-8")
+        self.assertNotIn("secret-out", text)                                  # 出力先・設定値は記録しない
+        self.assertNotIn("08:00", text)
+        self.assertNotIn(str(self.tmp), text)
+
+    def test_dry_run_while_busy_is_skipped_without_com_settings_or_main(self):
+        events = []
+        mgr, hist, main = self._dry_run_mgr(events)
+        mgr.lock.acquire("manual")
+        self.assertEqual(mgr.run_scheduled_dry_run(), SKIPPED)
+        self.assertEqual(events, [])
+        main.assert_not_called()
+        run = hist.runs()[0]
+        self.assertEqual((run["kind"], run["status"]), ("定期(検証)", SKIPPED))
+        self.assertIn("二重起動", run["reason"])
+        self.assertTrue(mgr.status()["running"])                              # 他の持ち主のロックは解放しない
+        mgr.lock.release()
+
+    def test_dry_run_com_init_failure_is_failed_and_releases_the_lock(self):
+        events = []
+
+        def bad():
+            raise OSError(r"C:\secret\x")
+        mgr, hist, main = self._dry_run_mgr(events, init=bad)
+        self.assertEqual(mgr.run_scheduled_dry_run(), FAILED)
+        self.assertEqual(events, [])                                          # 初期化していないので終了もしない
+        main.assert_not_called()
+        run = hist.runs()[0]
+        self.assertIn("COM を初期化できません", run["reason"])
+        self.assertNotIn("secret", run["reason"])
+        self.assertFalse(mgr.status()["running"])
+
+    def test_dry_run_settings_error_is_failed_but_still_uninitializes_com_and_releases_the_lock(self):
+        events = []
+        mgr, hist, main = self._dry_run_mgr(events, load_error=SettingsError(r"C:\secret\ops.local.yaml が壊れています"))
+        self.assertEqual(mgr.run_scheduled_dry_run(), FAILED)
+        self.assertEqual(events, ["init", "uninit"])
+        main.assert_not_called()
+        run = hist.runs()[0]
+        self.assertIn("ローカル設定を読み込めませんでした(SettingsError)", run["reason"])
+        self.assertNotIn("secret", run["reason"])                             # 例外メッセージ(パス)は出さない
+        self.assertFalse(mgr.status()["running"])
+
+    def test_dry_run_com_uninit_failure_does_not_change_the_result(self):
+        def bad_un():
+            raise OSError("uninit 失敗")
+        mgr, hist, main = self._dry_run_mgr([], uninit=bad_un)
+        self.assertEqual(mgr.run_scheduled_dry_run(), COMPLETED)
+        main.assert_not_called()
+        self.assertFalse(mgr.status()["running"])
+
+    def test_normal_scheduled_run_is_unchanged_by_the_dry_run_option(self):
+        calls = []
+        mgr, hist = self.make(lambda **kw: calls.append(kw) or {"completed": ["A1X"], "failed": {}, "skipped": {}})
+        self.assertEqual(mgr.run_scheduled(), COMPLETED)
+        self.assertEqual(calls, [{"config_path": "cfg.yaml"}])
+        self.assertEqual(hist.runs()[0]["kind"], "定期")                        # 通常は従来の種別のまま
+
     def test_scheduled_run_while_busy_does_not_start_and_is_recorded(self):
         calls = []
         mgr, hist = self.make(lambda **kw: calls.append(kw) or {})
@@ -745,6 +833,35 @@ class EntryPointTest(NoRealSubprocess):
         self.assertEqual(ctx.runs.run_scheduled(), "失敗")                      # 失敗があれば失敗(終了コード 1 になる)
         self.assertEqual(ctx.history.runs()[0]["kind"], "定期")
         ctx.scheduler.assert_not_called()                                         # 起動入口の組み立てだけでタスク操作はしない
+
+    def test_run_scheduled_dry_run_option_uses_dry_run_and_never_the_normal_process(self):
+        import importlib
+        oc = importlib.import_module("ops_console")
+        captured = {}
+        runs = SimpleNamespace(run_scheduled=mock.Mock(name="run_scheduled"), run_scheduled_dry_run=mock.Mock(return_value="完了"))
+
+        def fake_build(**kw):
+            captured.update(kw)
+            return SimpleNamespace(runs=runs)
+        import os
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.object(oc, "build_context", side_effect=fake_build):
+            self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 0)
+            runs.run_scheduled_dry_run.return_value = "失敗"
+            self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 1)        # 失敗は終了コード 1
+        runs.run_scheduled.assert_not_called()
+        with self.assertRaises(AssertionError):                                  # 渡された main_func は呼べない(万一でも app.main に届かない)
+            captured["main_func"]()
+        with mock.patch.object(oc, "build_context", side_effect=fake_build):
+            runs.run_scheduled.return_value = "完了"
+            self.assertEqual(oc.main(["run-scheduled"]), 0)                      # --dry-run なしは従来の通常処理
+        runs.run_scheduled.assert_called_once()
+
+    def test_scheduled_task_command_is_unchanged_and_has_no_dry_run(self):
+        ts = scheduler_mod.TaskScheduler("py.exe", "ops_console.py")
+        self.assertEqual(ts.action(), '"py.exe" "ops_console.py" run-scheduled')   # 既存タスクのコマンドは変えない
+        self.assertNotIn("dry-run", " ".join(ts.create_args("08:00", 2)))
 
     def test_commands_pin_the_working_directory_to_the_repository(self):
         import importlib, os

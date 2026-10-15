@@ -13,6 +13,7 @@ HISTORY_FILE = "ops_history.local.jsonl"
 
 RUNNING, COMPLETED, FAILED = "実行中", "完了", "失敗"
 KIND_MANUAL, KIND_SCHEDULED = "手動", "定期"
+KIND_SCHEDULED_CHECK = "定期(検証)"      # run-scheduled --dry-run。製番処理は行わない(通常の「定期」と区別する)
 MAX_REASON = 200
 
 # C:\… / \\server\share\…。フォルダ名に空白があっても(区切りの \ / で終わる部分は空白込みで)全体を伏せる

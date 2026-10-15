@@ -1,6 +1,7 @@
 # 運用設定・実行管理画面の起動入口。
 #   python ops_console.py serve            ローカル画面を 127.0.0.1 で起動する(既定ポート 8765)
 #   python ops_console.py run-scheduled    定期実行(タスクスケジューラが呼ぶ)。通常処理 app.main() を 1 回実行して履歴に残す
+#   python ops_console.py run-scheduled --dry-run   検証用。app.main は呼ばず、ロック・COM・設定の読込と履歴(種別「定期(検証)」)だけ
 # 設定は ops.local.yaml、履歴は ops_history.local.jsonl(どちらも Git 管理外)。app.yaml は読み書きしない。
 import argparse
 import os
@@ -46,8 +47,14 @@ def cmd_serve(args) -> int:
 
 def cmd_run_scheduled(args) -> int:
     os.chdir(BASE_DIR)                          # タスクスケジューラの既定の作業フォルダは System32 のため、リポジトリに固定する
-    ctx = build_context(config_path=args.config)
-    status = ctx.runs.run_scheduled()
+    if getattr(args, "dry_run", False):         # 検証用: app.main は呼ばない(万一呼ばれても失敗するよう、呼べない関数を渡す)
+        def _never(**_kw):
+            raise AssertionError("--dry-run では app.main を呼びません")
+        ctx = build_context(config_path=args.config, main_func=_never)
+        status = ctx.runs.run_scheduled_dry_run()
+    else:
+        ctx = build_context(config_path=args.config)
+        status = ctx.runs.run_scheduled()
     return 1 if status == "失敗" else 0
 
 
@@ -60,6 +67,8 @@ def main(argv=None) -> int:
     s.set_defaults(fn=cmd_serve)
     r = sub.add_parser("run-scheduled", help="定期実行(通常処理を 1 回)")
     r.add_argument("--config", default=None)
+    r.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="検証用: ロック・COM・ローカル設定の読込と履歴の記録だけ行い、製番処理(app.main)は実行しない")
     r.set_defaults(fn=cmd_run_scheduled)
     args = ap.parse_args(argv)
     return args.fn(args)
