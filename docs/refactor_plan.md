@@ -71,6 +71,7 @@
 2. **例外が出た場合**(API 失敗・変換失敗・想定外のエラー・範囲外の削除要求を含む): `Process Failed for product …` とトレースバックをログ → `results["failed"][製番] = "<例外名>: <メッセージ先頭 200 文字>"` → `InferenceRequestError` なら推論 API の失敗内容をログ → 製番フォルダが存在すれば `safe_rmtree`(`ignore_errors` なし。失敗はログに出して続行)。
 3. 製番ループの外(ホスト照会の失敗など)の例外は、従来どおり `main()` の外側の `except` が `results["failed"]["(全体)"]` として記録し、処理中の製番フォルダを削除する。
 4. 削除は常に出力ルート配下の製番フォルダだけ(`safe_rmtree`)。推論サーバーの停止は `main()` の `finally` で、変更していない。
+5. **`SystemExit` が出た場合**(`bs_pkg.design_mod` の印刷で、図面が存在しないときの `sys.exit()` 等。`Exception` ではないため 2. では捕まらない): `run_product` が `Process Aborted (SystemExit)` をログ → `results["failed"][製番] = "処理が途中で終了しました(SystemExit)"`(終了コード・メッセージは記録しない固定文言)→ 製番フォルダが存在すれば 2. と同じ `cleanup_after_exception`(出力ルート配下に限る。範囲外・削除失敗はログに出して続行)→ **`SystemExit` を再送出**(`app.py` の CLI は従来どおりその場で終了する。`main()` の `finally` は実行される)。後始末をしないと、部分出力のフォルダが残り、次回「処理済み」と見なされて再処理されなくなる。
 
 ### 互換性への影響
 - 出力ファイル・戻り値(`results`)・ログ・終了コード・SekisanNavi の読み込み契約: **変更なし**。

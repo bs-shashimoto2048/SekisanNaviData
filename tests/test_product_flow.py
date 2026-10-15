@@ -163,6 +163,38 @@ class RunProductCleanupTest(FlowBase):
         self.assertTrue(r["failed"]["A1BN0001"].startswith("InferenceRequestError"))
         self.assertTrue(any("推論APIの失敗内容(製番 A1BN0001 は未完了)" in m for m in self.logged("error")))
 
+    def test_system_exit_is_failure_cleans_partial_output_and_reraises_without_leaking_details(self):
+        def boom(ctx):
+            raise SystemExit(r"C:\secret\x password=abc")        # sys.exit() 相当(終了コード・メッセージにパス/秘密が入っていても記録しない)
+        self.dir_product.mkdir()
+        results = self.new_results()
+        with mock.patch.object(pf, "process_product", boom):
+            with self.assertRaises(SystemExit):                  # 従来どおり終了させる(CLI の挙動は変えない)
+                pf.run_product(self.ctx(), results)
+        self.assertEqual(results, {"completed": [], "failed": {"A1BN0001": pf.SYSTEM_EXIT_REASON}, "skipped": {}})
+        self.rmtree.assert_called_once_with(str(self.dir_product))          # 部分出力は既存の失敗と同じ後始末で削除
+        self.assertFalse(any("secret" in m or "password" in m for m in self.logged("error") + self.logged("info")))
+
+    def test_system_exit_never_deletes_outside_output_root(self):
+        outside = self.tmp / "other"
+        outside.mkdir()
+        results = self.new_results()
+        with mock.patch.object(pf, "process_product", lambda c: (_ for _ in ()).throw(SystemExit(1))):
+            with self.assertRaises(SystemExit):
+                pf.run_product(self.ctx(dir_product=str(outside)), results)
+        self.assertEqual(self.rmtree.call_count, 0)
+        self.assertTrue(outside.is_dir())
+        self.assertIn("A1BN0001", results["failed"])
+        self.assertTrue(any("Directory cleanup error" in m for m in self.logged("error")))
+
+    def test_system_exit_without_product_folder_deletes_nothing(self):
+        results = self.new_results()
+        with mock.patch.object(pf, "process_product", lambda c: (_ for _ in ()).throw(SystemExit())):
+            with self.assertRaises(SystemExit):
+                pf.run_product(self.ctx(), results)
+        self.assertEqual(self.rmtree.call_count, 0)
+        self.assertIn("A1BN0001", results["failed"])
+
     def test_folder_outside_output_root_is_never_deleted(self):
         outside = self.tmp / "other"
         outside.mkdir()

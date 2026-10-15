@@ -16,6 +16,7 @@ LOCK_FILE = "ops_run.local.lock"
 SKIPPED = "スキップ"
 ALL_PRODUCTS = "(通常処理)"
 DRY_RUN_LABEL = "(検証のみ)"
+SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
 DRY_RUN_OK_REASON = "検証のみ(dry-run): 起動・ロック・COM・設定の読込を確認しました。製番処理は実行していません"
 
 
@@ -143,6 +144,8 @@ class RunManager:
             status, reason = self._summarize(res, product_label)
         except Exception as e:  # noqa: BLE001 - どんな失敗も「完了」にしない
             status, reason = FAILED, f"{type(e).__name__}: {e}"
+        except SystemExit:  # 下位モジュールの sys.exit()。履歴を「実行中」のまま残さない。終了コード・メッセージは記録しない(固定の理由)
+            status, reason = FAILED, SYSTEM_EXIT_REASON
         finally:
             try:
                 self.com_uninit()      # 初期化したのと同じスレッドで必ず終了する

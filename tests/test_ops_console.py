@@ -451,6 +451,35 @@ class RunnerTest(NoRealSubprocess):
         self.assertNotIn("secret", run["reason"])
         self.assertFalse(mgr.status()["running"])
 
+    def test_system_exit_from_main_is_a_fixed_failure_never_left_running_or_completed(self):
+        for code in (None, 1, r"C:\secret\app.local.yaml password=abc"):
+            events = []
+            def boom(_c=code, **kw):
+                raise SystemExit(_c)
+            mgr, hist = self.make(boom, com_init=lambda: events.append("init"), com_uninit=lambda: events.append("uninit"))
+            mgr.start_manual("A1TEST0001")[1].join(5)
+            run = hist.runs()[0]
+            self.assertEqual(run["status"], "失敗", code)                        # 「実行中」のまま残さない・完了にしない
+            self.assertTrue(run.get("finished"), code)
+            self.assertEqual(run["reason"], "処理が途中で終了しました(SystemExit)", code)   # 終了コード・メッセージは出さない
+            self.assertEqual(events, ["init", "uninit"], code)                  # COM の終了処理は従来どおり
+            self.assertFalse(mgr.status()["running"], code)                     # ロックも解放
+            self.assertIsNone(mgr.current)
+            for f in self.state.iterdir():
+                if f.suffix == ".jsonl":
+                    f.unlink()
+
+    def test_system_exit_in_scheduled_run_is_recorded_as_failed_and_returns_failed(self):
+        def boom(**kw):
+            raise SystemExit(r"\\server\share secret")
+        mgr, hist = self.make(boom)
+        self.assertEqual(mgr.run_scheduled(), FAILED)                          # run-scheduled の終了コード 1 になる
+        run = hist.runs()[0]
+        self.assertEqual((run["kind"], run["status"]), ("定期", "失敗"))
+        self.assertTrue(run.get("finished"))
+        self.assertNotIn("server", run["reason"])
+        self.assertFalse(mgr.status()["running"])
+
     def test_skipped_product_is_not_reported_as_completed(self):
         mgr, hist = self.make(lambda **kw: {"completed": [], "failed": {}, "skipped": {"A1TEST0001": "処理済み"}})
         mgr.start_manual("A1TEST0001")[1].join(5)
