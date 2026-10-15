@@ -36,6 +36,11 @@ def check_config(config: dict) -> dict:
         elif "<" in str(value):
             sample.append(f"{section}.{key}")
     problems = []
+    try:                                                          # 任意項目 api.request_timeout の値(省略可。指定するなら正の有限数)
+        from pipeline.settings import parse_request_timeout
+        parse_request_timeout((config.get("api") or {}).get("request_timeout"))
+    except ValueError:
+        problems.append("api.request_timeout が不正です(正の有限の数[秒]で指定。省略すると従来どおり待ち続けます)")
     if missing:
         problems.append("未設定の項目があります: " + ", ".join(missing))
     if sample:
