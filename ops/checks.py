@@ -93,6 +93,12 @@ def http_get(url: str, timeout: float = 3.0) -> Tuple[int, str]:
         return res.status, res.read(2000).decode("utf-8", "replace")
 
 
+def _is_connection_refused(e: BaseException) -> bool:
+    """接続拒否(待ち受けるプロセスがない)か。urllib の URLError は reason に本体を持つ。"""
+    cause = getattr(e, "reason", None)
+    return any(isinstance(x, ConnectionRefusedError) or getattr(x, "winerror", None) == 10061 for x in (e, cause))
+
+
 def default_health_url(config: dict) -> Optional[str]:
     """推論 API の状態確認 URL(/health)。API 設定ファイルが読めないときは None。"""
     from bs_pkg import config_loader
@@ -136,5 +142,9 @@ def run_checks(config_path, settings: OpsSettings, *,
             status, _ = get(url)
             results.append(_item("推論 API(/health)", OK if status == 200 else NG, f"状態確認の応答コード {status}"))
     except Exception as e:  # noqa: BLE001
-        results.append(_item("推論 API(/health)", NG, f"状態確認に失敗しました({type(e).__name__})"))
+        if _is_connection_refused(e):   # 接続先・例外メッセージは出さない(原因の可能性だけ案内する)
+            detail = "接続が拒否されました(API が未起動、または server.yaml の接続先が古い可能性があります)"
+        else:
+            detail = f"状態確認に失敗しました({type(e).__name__})"
+        results.append(_item("推論 API(/health)", NG, detail))
     return results
