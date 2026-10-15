@@ -28,9 +28,16 @@ def parse_request_timeout(value) -> Optional[float]:
     指定するときは正の有限の数だけ(0・負・NaN・無限大・真偽値・文字列などは ConfigValueError)。根拠のない既定値は持たない。"""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ConfigValueError("api.request_timeout は、正の有限の数(秒)で指定してください(省略すると従来どおり待ち続けます)")
-    return float(value)
+    error = ConfigValueError("api.request_timeout は、正の有限の数(秒)で指定してください(省略すると従来どおり待ち続けます)")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise error
+    try:
+        seconds = float(value)          # float の範囲を超える非常に大きな整数は OverflowError(math.isfinite も同様)になるため、ここで受ける
+    except OverflowError:
+        raise error from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise error
+    return seconds
 
 
 def default_config_path(base_dir, script_name: str) -> str:

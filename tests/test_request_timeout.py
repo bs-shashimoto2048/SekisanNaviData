@@ -38,6 +38,13 @@ class ParseTest(unittest.TestCase):
             with self.assertRaises(ConfigValueError, msg=repr(bad)):
                 parse_request_timeout(bad)
 
+    def test_huge_integers_beyond_float_range_are_rejected_not_overflow(self):
+        for bad in (10 ** 400, -(10 ** 400), 10 ** 309, 2 ** 5000):             # float に変換できない(OverflowError になる)整数
+            with self.assertRaises(ConfigValueError, msg=str(bad)[:20]):
+                parse_request_timeout(bad)
+        self.assertEqual(parse_request_timeout(10 ** 300), 1e300)               # float の範囲内の大きな整数は、有限の正の数として従来どおり通る
+        self.assertEqual(parse_request_timeout(2 ** 1000), float(2 ** 1000))
+
     def test_error_message_has_no_value_and_says_what_to_do(self):
         try:
             parse_request_timeout("secret-value")
@@ -74,6 +81,15 @@ class LoadSettingsTest(unittest.TestCase):
             with self.assertRaises(ConfigValueError):
                 self.load({"request_timeout": bad})
         self.assertFalse((self.tmp / "out").exists())                                # 読込時の検出。出力先は作らない
+
+    def test_huge_yaml_integer_is_rejected_at_load(self):
+        cfg_text = f"data:\n  output: {self.tmp / 'out'}\n  storage: a_product\napi:\n  request_timeout: {10 ** 400}\n"   # YAML の非常に大きな整数
+        path = self.tmp / "huge.yaml"
+        path.write_text(cfg_text, encoding="utf-8")
+        self.assertIsInstance(yaml.safe_load(cfg_text)["api"]["request_timeout"], int)         # YAML は整数として読む(オーバーフローしない)
+        with self.assertRaises(ConfigValueError):                                              # OverflowError ではなく ConfigValueError
+            settings_mod.load_settings(str(path))
+        self.assertFalse((self.tmp / "out").exists())
 
 
 class TimeoutInMainTest(MainIntegrationBase):
@@ -127,6 +143,20 @@ class TimeoutInMainTest(MainIntegrationBase):
         self.assertIn("設定値が不正", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
         self.assertFalse((self.out_root / "a_product").exists())
+
+    def test_cli_rejects_a_huge_yaml_integer_with_exit_code_1_and_no_traceback(self):
+        text = self.config_path.read_text(encoding="utf-8")
+        cfg = yaml.safe_load(text)
+        cfg["api"]["request_timeout"] = 10 ** 400                                     # safe_dump も大きな整数をそのまま書く
+        self.config_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(app._cli(["--config", str(self.config_path)]), 1)
+        self.assertIn("設定値が不正", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("OverflowError", err.getvalue())
+        self.assertFalse((self.out_root / "a_product").exists())                       # 出力フォルダもログも作らない
+        self.assertEqual(self.host_calls if hasattr(self, "host_calls") else [], [])   # ホスト照会にも進まない
 
     def test_timeout_fails_the_product_through_the_existing_path_without_retry_or_partial_output(self):
         # 実の slice_prediction_request を通し、requests.post だけをモック(タイムアウトを起こす)
@@ -187,10 +217,11 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual(checks.check_config(base)["status"], "ok")                  # 省略
         ok = {**base, "api": {**base["api"], "request_timeout": 300}}
         self.assertEqual(checks.check_config(ok)["status"], "ok")
-        bad = {**base, "api": {**base["api"], "request_timeout": 0}}
-        res = checks.check_config(bad)
-        self.assertEqual(res["status"], "ng")
-        self.assertIn("api.request_timeout が不正", res["detail"])
+        for bad_value in (0, 10 ** 400):                                             # 非常に大きな整数も NG(例外にしない)
+            bad = {**base, "api": {**base["api"], "request_timeout": bad_value}}
+            res = checks.check_config(bad)
+            self.assertEqual(res["status"], "ng")
+            self.assertIn("api.request_timeout が不正", res["detail"])
 
 
 if __name__ == "__main__":
