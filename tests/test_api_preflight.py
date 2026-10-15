@@ -122,6 +122,26 @@ class PreflightUnitTest(unittest.TestCase):
             self.assertIn(f"HTTP {code}", reason)
             self.assert_clean(reason)
 
+    def test_redirects_are_not_followed_and_are_not_success(self):
+        def redirecting_get(url, allow_redirects=True, **kw):
+            """requests.get と同じ振る舞いの模擬: 既定(追跡する)なら転送先の 200 を返し、追跡しなければ最初の 3xx を返す"""
+            return SimpleNamespace(status_code=200 if allow_redirects else 302)
+        reason, calls = self.check(lambda u, **kw: redirecting_get(u, **kw))
+        self.assertIs(calls[0][1]["allow_redirects"], False)            # /health の GET はリダイレクトを追跡しない
+        self.assertIn("HTTP 302", reason)                               # 最初の応答(302)で失敗にする
+        self.assertEqual(len(calls), 1)                                 # 転送先へは行かない
+        self.assert_clean(reason)
+        for code in (301, 303, 307, 308):                               # 他のリダイレクトも成功扱いにしない
+            reason, calls = self.check(lambda u, c=code, **kw: SimpleNamespace(status_code=c))
+            self.assertIn(f"HTTP {code}", reason)
+            self.assertIs(calls[0][1]["allow_redirects"], False)
+
+    def test_real_requests_get_signature_is_called_with_allow_redirects_false(self):
+        with mock.patch.object(requests, "get", return_value=SimpleNamespace(status_code=200)) as g:   # 実接続しない
+            self.assertIsNone(api_preflight.unavailable_reason(self.cfg(), get=requests.get))
+        self.assertEqual(g.call_count, 1)
+        self.assertIs(g.call_args.kwargs["allow_redirects"], False)
+
     # ---- プロキシ(実際の /predict と同じ決め方)
     def test_proxy_follows_use_proxy_like_the_predict_request(self):
         _, calls = self.check(lambda u, **kw: SimpleNamespace(status_code=200), use_proxy=False)

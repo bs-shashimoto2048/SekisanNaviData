@@ -1,5 +1,5 @@
 # 推論 API の事前確認(本番モード)。重い製番処理(設計データ読込・印刷・変換・画像作成)に入る前に、
-# 既存の API 設定ファイル(server.yaml)の接続先へ GET /health だけを行い、利用できなければ理由(固定の文言)を返す。
+# 既存の API 設定ファイル(server.yaml)の接続先へ GET /health だけを行い(リダイレクトは追跡しない)、利用できなければ理由(固定の文言)を返す。
 # - 接続先(URL・ホスト名・ポート)・パス・例外メッセージは、返す理由にも、ログにも含めない(例外型と HTTP 応答コードだけ)。
 # - プロキシは、実際の /predict と同じ決め方(api.use_proxy、server.yaml の proxy.host / proxy.port)にそろえる。
 # - 統合モード(検証用の推論サーバーを app が起動する設定)では呼ばない。そちらは起動時に /health の準備完了を確認する。
@@ -54,7 +54,8 @@ def unavailable_reason(config_data: dict, *, get: Callable = requests.get) -> Op
     except Exception as e:  # noqa: BLE001 - 読めない・項目が足りない(メッセージには値が入り得るので型名だけ)
         return _reason(f"server.yaml を読み込めません: {type(e).__name__}")
     try:
-        res = get(url, proxies=proxies, timeout=timeout)
+        # リダイレクトは追跡しない(別の場所の 200 を「使える」と誤認しない)。最初の応答が 200 以外なら失敗にする
+        res = get(url, proxies=proxies, timeout=timeout, allow_redirects=False)
     except requests.exceptions.Timeout:
         return _reason(f"/health が {timeout:g} 秒以内に応答しませんでした(タイムアウト)")
     except Exception as e:  # noqa: BLE001 - 接続拒否・名前解決・その他の通信エラー

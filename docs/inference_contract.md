@@ -33,7 +33,7 @@ S6(`docs/refactor_plan.md` §10)で、データ作成側・推論サーバー・
   | `page_nmb` | ページ番号(文字列) |
   | `extension` | 入力画像の拡張子(`png`) |
 - サーバーは `work_dir/{page_nmb}.{extension}` を入力画像として読む。サーバーの受理条件(`inference_server/safety.validate_request`): `work_dir` は絶対パスで、実体解決後にサーバーの出力ルート配下(ルート自身・`..`・本番共有は拒否)、`page_nmb` は数字 1〜6 桁、`extension` は `png`/`jpeg`/`jpg`、画像が存在すること。
-- **事前確認(本番モード)**: `app.main` は、推論サーバーを自分で起動しない設定(`inference_server` の節なし)のとき、重い処理(ホスト照会・設計データ読込・印刷・変換・画像作成)に入る前に、API 設定ファイルの接続先へ **`GET /health` を 1 度だけ**行う(`pipeline/api_preflight.py`)。プロキシは `/predict` と同じ決め方(`api.use_proxy`、`server.yaml` の `proxy.host` / `proxy.port`)。応答待ちは既定 5 秒(`api.health_timeout` で変更可。`/predict` のタイムアウトとは別)。HTTP 200 なら続行する。
+- **事前確認(本番モード)**: `app.main` は、推論サーバーを自分で起動しない設定(`inference_server` の節なし)のとき、重い処理(ホスト照会・設計データ読込・印刷・変換・画像作成)に入る前に、API 設定ファイルの接続先へ **`GET /health` を 1 度だけ**行う(`pipeline/api_preflight.py`)。プロキシは `/predict` と同じ決め方(`api.use_proxy`、`server.yaml` の `proxy.host` / `proxy.port`)。応答待ちは既定 5 秒(`api.health_timeout` で変更可。`/predict` のタイムアウトとは別)。**リダイレクトは追跡しない**(`allow_redirects=False`)。**最初の応答が HTTP 200 のときだけ**続行し、301/302/307 などのリダイレクトも失敗として扱う(転送先の 200 を「使える」と誤認しない)。
   - 続行しない場合(`server.yaml` が無い・読めない・項目不足、接続拒否、タイムアウト、HTTP 200 以外、その他の通信エラー)は、**製番処理を始めず失敗として記録して終了**する(終了コード 1・製番は完了扱いにしない・製番フォルダなどの部分出力を作らない)。通常処理は 1 度の確認で全製番を止め、`results["failed"]["(全体)"]` に理由を入れる。製番を指定した実行では、指定した製番ごとに同じ理由を失敗として記録する。
   - 理由は固定の文言で、**接続先(URL・ホスト名・ポート)・パス・例外メッセージは含めない**(例外型と HTTP 応答コードだけ)。履歴・ログにも同じ文言だけが残る。
   - 統合モード(`inference_server.enabled: true`)では呼ばない(検証用サーバーの起動時に `/health` の準備完了を確認する従来どおり)。
