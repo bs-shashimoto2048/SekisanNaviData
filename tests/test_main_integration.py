@@ -203,10 +203,17 @@ class MainIntegrationBase(unittest.TestCase):
             f"INF: APIリクエスト| API-URL:http://mock/predict, 推論対象:{dir_product}\\{p}.jpeg\n"
             f"INF: 推論完了 -> '{dir_product}\\{p}_detected.txt'" for p in page_list)
 
+    def _fake_preflight(self, config_data, **kw):
+        """推論 API の事前確認の代わり(実接続しない)。self.preflight_reason が None なら使える、文字列なら使えない理由"""
+        self.preflight_calls.append(1)
+        return self.preflight_reason
+
     # ---------------------------------------------------------------- run
     def run_main(self, *, in_use=False, convert_error=None, **main_kwargs):
         self.print_script_calls, self.convert_calls, self.api_calls, self.in_use_calls = [], [], [], []
         self.host_calls = []
+        self.preflight_calls = []
+        self.preflight_reason = getattr(self, "preflight_reason", None)
         real_open = builtins.open
 
         def logged_open(file, mode="r", *a, **kw):
@@ -268,6 +275,7 @@ class MainIntegrationBase(unittest.TestCase):
             st.enter_context(mock.patch.object(app.cad_mod, "convert_dwg2dxf", convert))
             st.enter_context(mock.patch.object(app.image_mod, "slice_prediction_request", self._fake_slice_prediction_request))
             st.enter_context(mock.patch.object(app.shutil, "rmtree", self.rmtree))
+            st.enter_context(mock.patch.object(app.api_preflight, "unavailable_reason", self._fake_preflight))  # 既定は「使える」
             st.enter_context(contextlib.redirect_stdout(self.stdout))
             st.enter_context(contextlib.redirect_stderr(self.stderr))  # Logger の StreamHandler は stderr
             self.results = app.main(config_path=self.config_path, **main_kwargs)   # {completed, failed, skipped}
