@@ -30,6 +30,7 @@ import warnings
 from bs_pkg import config_loader, design_mod, host_mod, image_mod, util_mod
 # Dedicated Module: 専用モジュール, スクリプト内の処理は全て外出しのモジュールで行う。
 import cad_data_process as cad_mod        # CAD/設計データ・画像解析用(テストの差し替え点)
+from pipeline import api_preflight    # 推論 API の事前確認(本番モードで、重い処理の前に /health を確認する)
 from pipeline import product_flow     # 製番 1 件の処理(Step.1〜5)・結果記録・失敗時の後始末
 from pipeline import settings as settings_mod # 設定の読込・検証(サンプル設定の拒否、出力先、推論サーバー設定の検証)
 import print_support                      # 印刷スクリプト(WIRING.SCR)作成(テストの差し替え点)
@@ -143,6 +144,17 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
             raise
 
     try:
+        # 本番モード(推論サーバーを自分で起動しない)では、重い処理に入る前に推論 API の /health を 1 度だけ確認する。
+        # 使えなければ、ホスト照会・設計データ・印刷・変換・画像作成のどれも始めず、失敗として記録して終了する(完了扱い・部分出力なし)。
+        if manager is None:
+            unavailable = api_preflight.unavailable_reason(config_data)
+            if unavailable is not None:
+                logger.error(f"{unavailable}\n")
+                for key in (list(products) if products is not None else ["(全体)"]):
+                    results["failed"][key] = unavailable
+                return results      # finally が結果のログを出して終了する
+            logger.info("推論 API の事前確認: OK(/health)\n")
+
         if products is None:
             logger.info(f"{'-'*80}")
             logger.info(f"ホストより当月(～当日)出図完了製番(3番)リスト取得:")
