@@ -21,7 +21,6 @@ import io
 import os
 import re
 import shutil
-import stat
 import struct
 import sys
 import uuid
@@ -33,6 +32,9 @@ sys.path.insert(0, str(ROOT))
 
 import requests  # noqa: E402
 import yaml  # noqa: E402
+
+from interim.pathsafe import (  # noqa: E402,F401  (他の参照・テストのため、同じ名前で公開する)
+    _is_unc_text, _norm, has_link_in_path, is_link, is_network_drive, is_under, lexically_within)
 
 ISOLATED_DIRNAME = "output_interim"
 SMOKE_DIRNAME = "smoke"
@@ -54,67 +56,6 @@ class SmokeFailed(Exception):
 
 
 # ---------------------------------------------------------------------------- 安全条件
-def _norm(p) -> str:
-    return os.path.normcase(os.path.normpath(str(p)))
-
-
-def is_under(path, root) -> bool:
-    """実体解決後に、path が root の配下(root 自身は不可)か。"""
-    p, r = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(root))
-    try:
-        return os.path.commonpath([p, r]) == r and p != r
-    except ValueError:                                  # 別ドライブ等
-        return False
-
-
-def lexically_within(path, root, allow_equal: bool = True) -> bool:
-    """表記上(.. を畳んだ後)、path が root の内側か。実体解決はしない。"""
-    p, r = _norm(path), _norm(root)
-    try:
-        if os.path.commonpath([p, r]) != r:
-            return False
-    except ValueError:
-        return False
-    return allow_equal or p != r
-
-
-def is_link(path) -> bool:
-    """シンボリックリンク・ジャンクション等の再解析ポイント(Windows の FILE_ATTRIBUTE_REPARSE_POINT)か。存在しなければ False。"""
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-
-
-def has_link_in_path(path, base) -> bool:
-    """base から path までの、既存の各階層(path 自身を含む)に再解析ポイントがあるか。path は base の内側であること。"""
-    rel = os.path.relpath(os.path.normpath(str(path)), os.path.normpath(str(base)))
-    cur = os.path.normpath(str(base))
-    for part in Path(rel).parts:
-        if part in ("", "."):
-            continue
-        cur = os.path.join(cur, part)
-        if is_link(cur):
-            return True
-    return False
-
-
-def is_network_drive(path) -> bool:
-    """Windows のネットワークドライブ(DRIVE_REMOTE)か。UNC もここで True になる。Windows 以外は False。"""
-    if os.name != "nt":
-        return False
-    import ctypes
-    anchor = os.path.splitdrive(os.path.realpath(path))[0]
-    if anchor.startswith("\\\\"):
-        return True
-    return ctypes.windll.kernel32.GetDriveTypeW(anchor + "\\") == 4
-
-
-def _is_unc_text(text: str) -> bool:
-    return str(text).replace("/", "\\").startswith("\\\\")
-
-
 def validate_config(config_path, repo_root, *, net_drive=is_network_drive):
     """設定ファイルを検証して (設定, 隔離出力ルート, API 設定フォルダ) を返す。違反は SmokeRefused。通信・書き込み・削除はしない。"""
     repo_root = Path(repo_root)
