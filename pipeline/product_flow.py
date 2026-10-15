@@ -84,6 +84,9 @@ def safe_rmtree(target: str, allowed_root: str, **kwargs):
     shutil.rmtree(target, **kwargs)
 
 
+SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
+
+
 def record_result(results: dict, product: str, result: ProductResult):
     """製番の結果を、戻り値(results)へ記録する。"""
     if result.status == COMPLETED:
@@ -118,6 +121,14 @@ def run_product(ctx: ProductContext, results: dict):
         if failure_log is not None:
             logger.error(f"推論APIの失敗内容(製番 {ctx.product} は未完了):\n{failure_log}")
         cleanup_after_exception(ctx)
+    except SystemExit:
+        # 下位モジュール(design_mod の印刷など)の sys.exit()。Exception ではないため上では捕まらず、製番フォルダ(部分出力)が残ったまま
+        # 次回「処理済み」と見なされてしまう。他の失敗と同じ後始末(出力ルート配下に限る)をしてから、従来どおり終了させる(再送出)。
+        # 終了コード・メッセージは記録しない(固定の理由)。
+        logger.error(f"Process Aborted (SystemExit) for product {ctx.product}\n")
+        results["failed"][ctx.product] = SYSTEM_EXIT_REASON
+        cleanup_after_exception(ctx)
+        raise
 
 
 # ##############################################################################
