@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>暫定 API 操作</title>
+<title>暫定 API 操作・製番処理</title>
 <style>
   :root { --bg:#f3f5f8; --panel:#ffffff; --line:#cdd5df; --ink:#16202c; --sub:#5a6877; --accent:#1c5fd4; --ok:#177a3c; --ng:#b3261e; --warn:#9a6700; --run:#1c5fd4; --btnink:#ffffff; }
   @media (prefers-color-scheme: dark) {
@@ -35,10 +35,17 @@
   ul.steps li { display: flex; gap: 10px; }
   .ok { color: var(--ok); font-weight: 700; } .ng { color: var(--ng); font-weight: 700; } .na { color: var(--sub); }
   .count { font-size: 24px; font-weight: 700; margin-top: 8px; }
+  input[type=text], input[type=time], input[type=number] { font: inherit; height: 48px; padding: 4px 10px; border: 2px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+  input[type=text] { width: 14em; } input[type=time] { width: 8em; } input[type=number] { width: 4.5em; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+  .kv2 { color: var(--sub); } .path { font-family: Consolas, monospace; font-weight: 700; color: var(--ink); }
+  .warn { color: var(--warn); font-weight: 700; }
+  table { border-collapse: collapse; width: 100%; font-size: 18px; } th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); } th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4) { white-space: nowrap; }
+  ul.files { margin: 6px 0 0; padding-left: 1.2em; font-size: 18px; columns: 2; }
 </style>
 </head>
 <body>
-<header>暫定 API 操作(Sahi・この PC の loopback のみ)</header>
+<header>暫定 API 操作・製番処理(この PC の隔離領域のみ)</header>
 <main>
   <section id="guide">
     <h2>この画面の URL と使い方</h2>
@@ -75,6 +82,36 @@
     <ul class="steps" id="steps"></ul>
     <div class="count" id="count"></div>
     <div class="msg" id="smokeMsg"></div>
+  </section>
+  <section>
+    <h2>製番を 1 件指定して実行(既存の製番処理)</h2>
+    <div class="row"><label for="product">製番</label><input type="text" id="product" maxlength="20" autocomplete="off" placeholder="英数字 4〜20 文字">
+      <button id="btnRun">実行</button></div>
+    <div class="kv2">出力先(隔離): <span class="path" id="runTarget">製番を入力すると表示されます</span></div>
+    <div class="note" id="runTargetNote">出力は隔離領域 output_interim の中だけです(共有の出力先には書き込みません)。既存の製番処理(app.main)をそのまま使います。ホスト DB・設計データは読み取りだけです。</div>
+    <div class="state" style="margin-top:8px"><span class="badge idle" id="runBadge">待機中</span><span class="kv" id="runMeta"></span></div>
+    <div class="msg" id="runMsg"></div>
+    <div id="filesBox" style="display:none"><b>生成ファイル</b><ul class="files" id="files"></ul></div>
+  </section>
+
+  <section>
+    <h2>全製番の仮定期実行(専用タスク)</h2>
+    <div class="note" style="margin-top:0">通常の定期タスクとは別名・別設定です(通常タスクは操作しません)。対象は全対象製番(通常処理)、出力先は隔離領域だけです。</div>
+    <div class="warn" id="logonOnly">タスクは、この PC にログオンしている間だけ動きます(ログオフ中・スリープ中は動きません)。</div>
+    <div class="row"><label for="schTime">開始時刻</label><input type="time" id="schTime" value="08:00"><label for="schDays">間隔(日)</label><input type="number" id="schDays" min="1" max="30" value="2"><span class="kv2">既定は 2 日(1 日置き)</span></div>
+    <div class="state"><span class="badge idle" id="schBadge">確認中</span><span class="kv" id="schMeta"></span></div>
+    <div class="msg" id="schMsg"></div>
+    <div class="buttons">
+      <button id="btnSchReg">登録・更新</button>
+      <button id="btnSchDel" class="danger">解除</button>
+      <button id="btnSchRef" class="secondary">状態更新</button>
+    </div>
+    <div class="note">実行には、推論 API が「準備完了」である必要があります(API は手動起動です。未起動なら、失敗として履歴に残ります)。</div>
+  </section>
+
+  <section>
+    <h2>実行履歴(直近 10 件)</h2>
+    <table><thead><tr><th>開始</th><th>種別</th><th>製番</th><th>状態</th><th>理由</th></tr></thead><tbody id="hist"></tbody></table>
   </section>
 </main>
 <script>
@@ -182,6 +219,107 @@ $("btnSmoke").onclick = () => act("/api/smoke", "スモークを開始");
 $("btnRefresh").onclick = () => { delete $("apiMsg").dataset.sticky; refresh(); };
 refresh();
 setInterval(() => { if (!busyLocal) refresh(); }, 2000);
+
+// ---- 製番の指定実行・仮定期実行 ----
+const PRODUCT_RE = /^[A-Za-z0-9]{4,20}$/;
+let runBusy = false, runInfo = null, runSticky = false, schBusy = false;
+
+async function loadTarget() {
+  const p = $("product").value.trim();
+  if (!PRODUCT_RE.test(p)) { runInfo = null; $("runTarget").textContent = "製番を入力すると表示されます"; return; }
+  const { data } = await call("GET", "/api/run/target?product=" + encodeURIComponent(p));
+  if (data.ok) { runInfo = data; $("runTarget").textContent = data.output_dir + (data.exists ? "(既に出力あり → スキップされます)" : ""); }
+  else { runInfo = null; $("runTarget").textContent = data.error || "確認できません"; }
+}
+
+function renderRuns(d) {
+  const b = $("runBadge");
+  const hist = d.history || [];
+  const p = $("product").value.trim();
+  let label = "待機中", cls = "idle", meta = "";
+  if (d.running) { label = "実行中"; cls = "running"; meta = d.current ? (d.current.kind + " / " + d.current.product) : ""; }
+  else {
+    const last = hist.find((h) => h.product === p && h.kind === "手動");
+    if (last) {
+      label = last.status; cls = last.status === "完了" ? "success" : (last.status === "失敗" ? "failed" : (last.status === "スキップ" ? "starting" : "idle"));
+      meta = last.finished || last.started || "";
+      if (last.reason && !runSticky) { $("runMsg").textContent = last.reason; $("runMsg").className = "msg" + (last.status === "失敗" ? " ng" : ""); }
+    }
+  }
+  b.textContent = label; b.className = "badge " + cls; $("runMeta").textContent = meta;
+  $("btnRun").disabled = runBusy || d.running || !PRODUCT_RE.test(p);
+  const files = d.files || [];
+  $("filesBox").style.display = files.length ? "" : "none";
+  const ul = $("files"); ul.innerHTML = "";
+  files.forEach((f) => { const li = document.createElement("li"); li.textContent = f.name + "(" + f.size + " B)"; ul.appendChild(li); });
+  const tb = $("hist"); tb.innerHTML = "";
+  hist.forEach((h) => {
+    const tr = document.createElement("tr");
+    [h.started || "", h.kind || "", h.product || "", h.status || "", h.reason || ""].forEach((t) => { const td = document.createElement("td"); td.textContent = t; tr.appendChild(td); });
+    tb.appendChild(tr);
+  });
+}
+
+async function refreshRuns() {
+  const p = $("product").value.trim();
+  const { data } = await call("GET", "/api/runs" + (PRODUCT_RE.test(p) ? "?product=" + encodeURIComponent(p) : ""));
+  if (data.ok) renderRuns(data);
+}
+
+async function runProduct() {
+  const p = $("product").value.trim();
+  runBusy = true; runSticky = true; $("btnRun").disabled = true;
+  $("runMsg").className = "msg"; $("runMsg").textContent = "実行を開始しています…";
+  try {
+    const res = await fetch("/api/run", { method: "POST", headers: { "X-Interim-Request": "1", "Content-Type": "application/json" }, body: JSON.stringify({ product: p }) });
+    const data = await res.json();
+    if (!res.ok) { $("runMsg").textContent = data.error || "開始できませんでした。"; $("runMsg").className = "msg ng"; runSticky = true; }
+    else { $("runMsg").textContent = "実行を開始しました(完了まで状態が自動更新されます)。"; runSticky = false; }
+  } catch (e) { $("runMsg").textContent = "操作に失敗しました。"; $("runMsg").className = "msg ng"; }
+  finally { runBusy = false; await refreshRuns(); }
+}
+
+function renderSchedule(d) {
+  const b = $("schBadge");
+  let label = "未登録", cls = "idle";
+  if (d.foreign) { label = "別のタスク"; cls = "failed"; }
+  else if (d.registered) { label = d.enabled === false ? "登録済み(無効)" : "登録済み(有効)"; cls = d.enabled === false ? "starting" : "success"; }
+  b.textContent = label; b.className = "badge " + cls;
+  const m = [d.task_name];
+  if (d.registered && d.time) m.push(d.interval_days + " 日ごと " + d.time);
+  m.push("対象: " + d.scope); m.push("出力先: " + d.output_dir);
+  $("schMeta").textContent = m.join(" / ");
+  if (d.logon_only) $("logonOnly").textContent = d.logon_only;
+  if (d.registered && !schBusy) { if (d.time) $("schTime").value = d.time; if (d.interval_days) $("schDays").value = d.interval_days; }
+  $("btnSchReg").disabled = schBusy || d.foreign; $("btnSchDel").disabled = schBusy || !d.registered || d.foreign;
+  if (d.foreign) { $("schMsg").textContent = "同名のタスクが既にあり、この画面が登録したものではないため、上書き・解除しません。"; $("schMsg").className = "msg ng"; }
+}
+
+async function refreshSchedule() {
+  const { data } = await call("GET", "/api/schedule");
+  if (data.ok) renderSchedule(data);
+}
+
+async function schAct(path, body, label) {
+  schBusy = true; $("btnSchReg").disabled = true; $("btnSchDel").disabled = true;
+  $("schMsg").className = "msg"; $("schMsg").textContent = label + "しています…";
+  try {
+    const res = await fetch(path, { method: "POST", headers: { "X-Interim-Request": "1", "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const data = await res.json();
+    if (!res.ok) { $("schMsg").textContent = data.error || "操作に失敗しました。"; $("schMsg").className = "msg ng"; }
+    else { $("schMsg").textContent = label + "しました。"; $("schMsg").className = "msg ok"; renderSchedule(data); }
+  } catch (e) { $("schMsg").textContent = "操作に失敗しました。"; $("schMsg").className = "msg ng"; }
+  finally { schBusy = false; await refreshSchedule(); }
+}
+
+$("product").oninput = () => { runSticky = false; $("runMsg").textContent = ""; loadTarget(); refreshRuns(); };
+$("btnRun").onclick = runProduct;
+$("btnSchReg").onclick = () => schAct("/api/schedule/register", { time: $("schTime").value, interval_days: parseInt($("schDays").value, 10) }, "登録・更新");
+$("btnSchDel").onclick = () => schAct("/api/schedule/unregister", {}, "解除");
+$("btnSchRef").onclick = () => { $("schMsg").textContent = ""; refreshSchedule(); };
+refreshRuns(); refreshSchedule();
+setInterval(() => { if (!runBusy) refreshRuns(); }, 2000);
+setInterval(() => { if (!schBusy) refreshSchedule(); }, 15000);
 </script>
 </body>
 </html>

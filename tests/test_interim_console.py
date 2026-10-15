@@ -530,7 +530,8 @@ class LocalSettingsAndStaticTest(unittest.TestCase):
         for name in ("manager.py", "server.py"):
             lines = (ROOT / "interim" / name).read_text(encoding="utf-8").splitlines()
             src = chr(10).join(ln.split("  # ")[0] for ln in lines if not ln.lstrip().startswith("#"))      # コメントは除く(禁止事項の説明が入るため)
-            for forbidden in ("schtasks", "host_mod", "design_mod", "app.main", "ops_history", "requests.", "ops.", "pipeline."):
+            forbidden_all = ("schtasks", "host_mod", "design_mod", "app.main", "ops_history", "requests.", "pipeline.")
+            for forbidden in forbidden_all + (("ops.",) if name == "manager.py" else ()):         # API 管理部は ops を使わない(server.py は例外型だけ)
                 self.assertNotIn(forbidden, src, (name, forbidden))
             for ln in src.splitlines():
                 if "http://" in ln:
