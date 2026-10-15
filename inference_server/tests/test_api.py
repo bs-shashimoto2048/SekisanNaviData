@@ -94,7 +94,26 @@ class HealthTest(ApiBase):
         self.state.error = "FileNotFoundError: model"
         r = self.client.get("/health")
         self.assertEqual((r.status_code, r.json["status"]), (500, "failed"))
-        self.assertIn("model", r.json["error"])
+        self.assertEqual(r.json["error"], "FileNotFoundError")        # 例外の型名だけ(メッセージはパスを含み得るのでログのみ)
+
+    def test_body_has_no_internal_information_in_any_state(self):
+        self.state.error = rf"FileNotFoundError: {self.root}\model\best.pt password=pw123"
+        states = []
+        for ready, error in ((True, None), (False, None), (False, self.state.error)):
+            self.state.ready, self.state.error = ready, error
+            r = self.client.get("/health")
+            states.append(r.status_code)
+            self.assertEqual(set(r.json) - {"error"}, {"instance_id", "backend", "mode", "status", "ready"})
+            text = r.get_data(as_text=True)
+            for leaked in (self.root, os.path.realpath(self.root), "output_root", "pid", "model", "pw123", "best.pt"):
+                self.assertNotIn(leaked, text)
+            self.assertFalse(r.is_json and r.status_code in (301, 302, 307, 308))
+        self.assertEqual(states, [200, 503, 500])                     # 状態コードの意味は不変
+
+    def test_health_does_not_redirect(self):
+        r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("Location", r.headers)
 
 
 class PredictTest(ApiBase):

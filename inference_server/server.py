@@ -78,10 +78,11 @@ def create_app(state: ServerState):
 
     @app.get("/health")
     def health():
-        body = {"instance_id": state.instance_id, "backend": state.backend_name, "mode": "test",
-                "output_root": state.output_root, "pid": os.getpid()}
+        # 状態(200/503/500)と本文のキーは契約。内部情報(出力ルートのパス・プロセス ID)と、例外メッセージ(パスを含み得る)は返さない
+        # (詳細はサーバーのログ)。失敗時の error は例外の型名だけ。
+        body = {"instance_id": state.instance_id, "backend": state.backend_name, "mode": "test"}
         if state.error:
-            return jsonify({**body, "status": "failed", "ready": False, "error": state.error}), 500
+            return jsonify({**body, "status": "failed", "ready": False, "error": str(state.error).split(":", 1)[0][:80]}), 500
         if not state.ready:
             return jsonify({**body, "status": "loading", "ready": False}), 503
         return jsonify({**body, "status": "ok", "ready": True}), 200

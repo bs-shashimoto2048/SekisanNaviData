@@ -44,7 +44,7 @@ S6(`docs/refactor_plan.md` §10)で、データ作成側・推論サーバー・
 | エンドポイント | ステータスと内容 |
 |---|---|
 | `POST /predict` | **200** `{"text_file_path": <検出テキストのパス>, "detections": <件数>}` / **400** 入力の拒否(`{"error": …}`) / **500** サーバーの準備失敗・推論失敗 / **503** 準備中 |
-| `GET /health` | **200** 準備完了(`ready: true`、`instance_id`)/ **503** 読み込み中 / **500** 準備失敗 |
+| `GET /health` | **200** 準備完了(`ready: true`、`instance_id`)/ **503** 読み込み中 / **500** 準備失敗。本文は `instance_id`・`backend`・`mode`・`status`・`ready`(失敗時は `error` = 例外の**型名だけ**)。**内部情報(出力ルートのパス・プロセス ID)・例外メッセージは含めない**(詳細はサーバーのログ)。リダイレクトなし |
 | `POST /verify_workdir` | **200** 目印ファイルが見える / **400** 入力の拒否 / **409** 見えない(別の場所を指している) |
 | `POST /shutdown` | **200** / **403** `instance_id` 不一致 / **501** 停止手段なし |
 
@@ -86,6 +86,8 @@ S6(`docs/refactor_plan.md` §10)で、データ作成側・推論サーバー・
 - `inference_server.*`(検証設定のみ。既定は無効): `enabled`・`port`・`backend`・`request_timeout` ほか(`docs/inference_server.md`)。
 
 ## 7. 確定していないこと(本番サーバー側。管理者への確認が必要)
+> **更新(前提の変更)**: 推論 API は自分たちで開発中で、**稼働中の本番サーバーはまだ無い**(GPU サーバーへの配置は後段)。下表は「管理者に確認する事実」ではなく「配置時に決める・実測する事項」として読む。暫定・隔離運用と移行条件は [inference_api_interim_operation.md](inference_api_interim_operation.md)(案)。`/health` の目標契約は同 §5。
+
 下記はこのリポジトリのコード・テストでは確定できず、**契約の変更もしていない**。入力は `docs/acceptance_handoff.md` §5。
 | 項目 | 現状 |
 |---|---|

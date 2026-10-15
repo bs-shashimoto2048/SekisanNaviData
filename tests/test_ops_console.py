@@ -19,8 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import requests  # noqa: E402
 import yaml  # noqa: E402
 
+from pipeline import api_preflight  # noqa: E402
 from ops import checks, history as history_mod, runner as runner_mod, scheduler as scheduler_mod, server as server_mod  # noqa: E402
 from ops.history import COMPLETED, FAILED, History, sanitize_reason  # noqa: E402
 from ops.runner import ALL_PRODUCTS, SKIPPED, Busy, RunLock, RunManager  # noqa: E402
@@ -164,8 +166,7 @@ class ChecksTest(NoRealSubprocess):
 
     def run_it(self, cfg, settings=OpsSettings(), **kw):
         base = dict(load_config=lambda p: cfg, design_check=lambda: (True, "参照先 2 件中 2 件に到達できました"),
-                    host_check=lambda initials: (True, "読み取り照会に成功しました"), health_url=lambda c: "http://127.0.0.1:1/health",
-                    get=lambda url: (200, "{}"))
+                    host_check=lambda initials: (True, "読み取り照会に成功しました"), health_check=lambda c: None)
         base.update(kw)
         return {r["name"]: r for r in checks.run_checks("dummy.yaml", settings, **base)}
 
@@ -241,54 +242,158 @@ class ChecksTest(NoRealSubprocess):
         self.assertNotIn("pw123", json.dumps(res, ensure_ascii=False))
         self.assertEqual(res["推論 API(/health)"]["status"], "ok")
 
-    def test_inference_api_is_only_asked_for_health_never_predict(self):
-        urls = []
-        self.run_it(self.config(), health_url=lambda c: "http://127.0.0.1:9/health", get=lambda url: urls.append(url) or (200, ""))
-        self.assertEqual(urls, ["http://127.0.0.1:9/health"])
-        self.assertTrue(all(u.endswith("/health") for u in urls))
+    # ---- 推論 API(/health): 製番処理の事前確認(pipeline.api_preflight)と同じ判定 ----
+    HEALTH = "推論 API(/health)"
+    SECRETS = ("10.9.8.7", "secret-host", "proxy.secret", "pw123", "8123")
+
+    def health_env(self, server_yaml=None, **api):
+        """server.yaml(合成値)を一時フォルダへ書き、api 設定を持つ config を返す。server_yaml=None なら書かない。"""
+        d = self.tmp / "api"
+        d.mkdir(exist_ok=True)
+        if server_yaml is not None:
+            (d / "api.yaml").write_text(yaml.safe_dump(server_yaml), encoding="utf-8")
+        cfg = self.config()
+        cfg["api"] = {"dir_venv": str(d), "yaml_file": "api.yaml", **api}
+        return cfg
+
+    GOOD_YAML = {"host": {"pc_ip": "10.9.8.7", "port": 8123}, "proxy": {"host": "proxy.secret", "port": 3128}}
+
+    def health_item(self, cfg, get):
+        calls = []
+
+        def _get(url, **kw):
+            calls.append((url, kw))
+            return get(url, **kw)
+        item = self.run_it(cfg, health_check=lambda c: api_preflight.unavailable_reason(c, get=_get))[self.HEALTH]
+        return item, calls
+
+    def assert_no_secrets(self, item):
+        text = json.dumps(item, ensure_ascii=False)
+        for sx in self.SECRETS + (str(self.tmp), "http://"):
+            self.assertNotIn(sx, text)
+
+    def test_default_health_check_is_the_preflight_function_itself(self):
+        cfg = self.config()
+        with mock.patch.object(api_preflight, "unavailable_reason", return_value="理由") as m:
+            self.assertEqual(checks.default_health_check(cfg), "理由")
+        m.assert_called_once_with(cfg)                                          # 同じ関数・同じ config(判定条件を別実装しない)
+        self.assertEqual(self.run_it(cfg, health_check=lambda c: "理由")[self.HEALTH]["status"], "ng")
+
+    def test_ok_only_when_preflight_would_pass_and_uses_the_same_request_conditions(self):
+        cfg = self.health_env(self.GOOD_YAML)
+        item, calls = self.health_item(cfg, lambda url, **kw: SimpleNamespace(status_code=200))
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(len(calls), 1)
+        url, kw = calls[0]
+        self.assertTrue(url.endswith("/health"))                                # /predict は呼ばない
+        self.assertIs(kw["allow_redirects"], False)                             # リダイレクトは追跡しない(事前確認と同じ)
+        self.assertEqual(kw["timeout"], api_preflight.HEALTH_TIMEOUT)
+        self.assertEqual(kw["proxies"]["http"], "http://proxy.secret:3128")     # /predict と同じプロキシ設定(画面だけプロキシなしにしない)
+        self.assert_no_secrets(item)
         src = (ROOT / "ops" / "checks.py").read_text(encoding="utf-8")
-        self.assertNotIn("/predict\"", src.replace("/predict は呼ばない", ""))   # コードとして /predict を組み立てない
+        self.assertNotIn("/predict\"", src.replace("/predict は呼ばない", ""))
 
-    def test_health_failure_or_non_200_is_ng_and_unconfigured_is_skipped(self):
-        self.assertEqual(self.run_it(self.config(), get=lambda u: (503, ""))["推論 API(/health)"]["status"], "ng")
+    def test_screen_result_equals_preflight_result_for_every_outcome(self):
+        def refused(url, **kw):
+            raise requests.exceptions.ConnectionError(ConnectionRefusedError(10061, "host=secret-host password=pw123"))
 
-        def refuse(u):
-            raise ConnectionRefusedError("x")
-        self.assertEqual(self.run_it(self.config(), get=refuse)["推論 API(/health)"]["status"], "ng")
-        self.assertEqual(self.run_it(self.config(), health_url=lambda c: None)["推論 API(/health)"]["status"], "skip")
+        def timeout(url, **kw):
+            raise requests.exceptions.ReadTimeout("secret-host pw123")
 
-    def test_health_connection_refused_is_guided_and_other_errors_are_not(self):
+        def other(url, **kw):
+            raise OSError("C:\\secret pw123")
+
+        cases = [lambda u, **k: SimpleNamespace(status_code=200), lambda u, **k: SimpleNamespace(status_code=503),
+                 lambda u, **k: SimpleNamespace(status_code=500), lambda u, **k: SimpleNamespace(status_code=302),
+                 lambda u, **k: SimpleNamespace(status_code=404), refused, timeout, other]
+        cfg = self.health_env(self.GOOD_YAML, health_timeout=2)
+        for get in cases:
+            expected = api_preflight.unavailable_reason(cfg, get=get)
+            item, _ = self.health_item(cfg, get)
+            self.assertEqual(item["status"], "ok" if expected is None else "ng")      # 画面が OK ⇔ 事前確認が通る
+            if expected is not None:
+                self.assertEqual(item["detail"], sanitize_reason(expected))            # 理由も同じ固定文言
+            self.assert_no_secrets(item)
+
+    def test_health_non_200_responses_are_ng_with_http_code_only(self):
+        cfg = self.health_env(self.GOOD_YAML)
+        for code in (503, 500, 302, 404):
+            item, _ = self.health_item(cfg, lambda u, _c=code, **k: SimpleNamespace(status_code=_c))
+            self.assertEqual(item["status"], "ng", code)
+            self.assertIn(f"HTTP {code}", item["detail"])
+            self.assert_no_secrets(item)
+
+    def test_health_connection_refused_is_ng_with_guidance_and_no_secrets(self):
+        cfg = self.health_env(self.GOOD_YAML)
         hint = "API が未起動、または server.yaml の接続先が古い可能性"
-        secret = "host=secret-host path=C:\\secret password=pw123"
 
-        def refused_direct(u):
-            raise ConnectionRefusedError(secret)
+        def refused(url, **kw):
+            raise requests.exceptions.ConnectionError(ConnectionRefusedError(10061, "host=secret-host path=C:\\secret password=pw123"))
+        item, _ = self.health_item(cfg, refused)
+        self.assertEqual(item["status"], "ng")
+        self.assertIn(hint, item["detail"])
+        self.assert_no_secrets(item)
 
-        def refused_urlerror(u):                        # urllib は ConnectionRefusedError を URLError.reason に包む
-            raise urllib.error.URLError(ConnectionRefusedError(10061, secret))
+        def other(url, **kw):
+            raise requests.exceptions.ConnectionError(OSError("host=secret-host password=pw123"))
+        item, _ = self.health_item(cfg, other)
+        self.assertEqual(item["status"], "ng")
+        self.assertNotIn(hint, item["detail"])                                  # 接続拒否以外には案内を付けない
+        self.assert_no_secrets(item)
 
-        def refused_winerror(u):
-            raise urllib.error.URLError(OSError(None, secret, None, 10061))
+        def timed_out(url, **kw):
+            raise requests.exceptions.ConnectTimeout("secret-host pw123")
+        item, _ = self.health_item(cfg, timed_out)
+        self.assertEqual(item["status"], "ng")
+        self.assertIn("タイムアウト", item["detail"])
+        self.assert_no_secrets(item)
 
-        def timed_out(u):
-            raise TimeoutError(secret)
+    def test_health_missing_or_broken_settings_are_ng_and_not_called(self):
+        calls = []
 
-        def other_urlerror(u):
-            raise urllib.error.URLError(OSError(secret))
-
-        for fn in (refused_direct, refused_urlerror, refused_winerror):
-            item = self.run_it(self.config(), get=fn)["推論 API(/health)"]
-            self.assertEqual(item["status"], "ng")                                 # 判定は従来どおり NG
-            self.assertIn(hint, item["detail"])
-            self.assertNotIn("secret", item["detail"])                             # 接続先・メッセージは出さない
-            self.assertNotIn("pw123", item["detail"])
-        for fn in (timed_out, other_urlerror):
-            item = self.run_it(self.config(), get=fn)["推論 API(/health)"]
+        def get(url, **kw):
+            calls.append(url)
+        # server.yaml が無い(本番モードでは、事前確認と同じく NG。SKIP にしない)
+        item, _ = self.health_item(self.health_env(None), get)
+        self.assertEqual(item["status"], "ng")
+        self.assertIn("server.yaml が見つかりません", item["detail"])
+        # server.yaml に接続先の項目が無い / プロキシ項目が無い(use_proxy 既定 true)
+        for bad in ({"host": {"pc_ip": "10.9.8.7"}}, {"host": {"pc_ip": "10.9.8.7", "port": 8123}}):
+            item, _ = self.health_item(self.health_env(bad), get)
             self.assertEqual(item["status"], "ng")
-            self.assertNotIn(hint, item["detail"])                                 # 接続拒否以外には案内を付けない
-            self.assertIn("状態確認に失敗しました", item["detail"])
-            self.assertNotIn("secret", item["detail"])
-        self.assertEqual(self.run_it(self.config(), get=lambda u: (503, ""))["推論 API(/health)"]["detail"], "状態確認の応答コード 503")
+            self.assertIn("server.yaml を読み込めません", item["detail"])
+            self.assert_no_secrets(item)
+        # api 設定の項目欠落
+        cfg = self.config()
+        cfg["api"] = {"yaml_file": "api.yaml"}
+        item, _ = self.health_item(cfg, get)
+        self.assertEqual(item["status"], "ng")
+        self.assertIn("API の設定項目を読み込めません", item["detail"])
+        self.assertEqual(calls, [])                                             # 設定が欠けているときは通信しない
+
+    def test_use_proxy_false_skips_proxy_like_the_preflight(self):
+        cfg = self.health_env({"host": {"pc_ip": "10.9.8.7", "port": 8123}}, use_proxy=False)
+        item, calls = self.health_item(cfg, lambda u, **k: SimpleNamespace(status_code=200))
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(calls[0][1]["proxies"], {"http": None, "https": None})
+
+    def test_health_is_skipped_only_in_integrated_mode_like_app_main(self):
+        cfg = self.health_env(None)
+        cfg["inference_server"] = {"enabled": True}
+        called = []
+        item = self.run_it(cfg, health_check=lambda c: called.append(1))[self.HEALTH]
+        self.assertEqual(item["status"], "skip")
+        self.assertEqual(called, [])                                            # 統合モードでは確認しない(app.main も呼ばない)
+        cfg["inference_server"] = {"enabled": False}
+        self.assertEqual(self.run_it(cfg, health_check=lambda c: "理由")[self.HEALTH]["status"], "ng")
+
+    def test_unexpected_exception_from_the_check_is_ng_with_type_only(self):
+        def boom(c):
+            raise RuntimeError("host=secret-host password=pw123")
+        item = self.run_it(self.config(), health_check=boom)[self.HEALTH]
+        self.assertEqual(item["status"], "ng")
+        self.assertIn("RuntimeError", item["detail"])
+        self.assert_no_secrets(item)
 
     def test_checks_never_start_a_product_run(self):
         main_func = mock.Mock(name="app.main")

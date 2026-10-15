@@ -20,6 +20,7 @@ dist/
 # 実行時の出力・検証用出力(実データ由来を含む)
 output/
 output_test/
+output_interim/
 debug_images/
 inference_server/.infer_tmp/
 
