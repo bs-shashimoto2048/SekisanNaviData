@@ -257,6 +257,39 @@ class ChecksTest(NoRealSubprocess):
         self.assertEqual(self.run_it(self.config(), get=refuse)["推論 API(/health)"]["status"], "ng")
         self.assertEqual(self.run_it(self.config(), health_url=lambda c: None)["推論 API(/health)"]["status"], "skip")
 
+    def test_health_connection_refused_is_guided_and_other_errors_are_not(self):
+        hint = "API が未起動、または server.yaml の接続先が古い可能性"
+        secret = "host=secret-host path=C:\\secret password=pw123"
+
+        def refused_direct(u):
+            raise ConnectionRefusedError(secret)
+
+        def refused_urlerror(u):                        # urllib は ConnectionRefusedError を URLError.reason に包む
+            raise urllib.error.URLError(ConnectionRefusedError(10061, secret))
+
+        def refused_winerror(u):
+            raise urllib.error.URLError(OSError(None, secret, None, 10061))
+
+        def timed_out(u):
+            raise TimeoutError(secret)
+
+        def other_urlerror(u):
+            raise urllib.error.URLError(OSError(secret))
+
+        for fn in (refused_direct, refused_urlerror, refused_winerror):
+            item = self.run_it(self.config(), get=fn)["推論 API(/health)"]
+            self.assertEqual(item["status"], "ng")                                 # 判定は従来どおり NG
+            self.assertIn(hint, item["detail"])
+            self.assertNotIn("secret", item["detail"])                             # 接続先・メッセージは出さない
+            self.assertNotIn("pw123", item["detail"])
+        for fn in (timed_out, other_urlerror):
+            item = self.run_it(self.config(), get=fn)["推論 API(/health)"]
+            self.assertEqual(item["status"], "ng")
+            self.assertNotIn(hint, item["detail"])                                 # 接続拒否以外には案内を付けない
+            self.assertIn("状態確認に失敗しました", item["detail"])
+            self.assertNotIn("secret", item["detail"])
+        self.assertEqual(self.run_it(self.config(), get=lambda u: (503, ""))["推論 API(/health)"]["detail"], "状態確認の応答コード 503")
+
     def test_checks_never_start_a_product_run(self):
         main_func = mock.Mock(name="app.main")
         with mock.patch.object(runner_mod.RunManager, "start_manual", side_effect=AssertionError("製番処理は呼ばない")):
