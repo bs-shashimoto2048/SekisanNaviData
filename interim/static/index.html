@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>暫定 API 操作</title>
+<style>
+  :root { --bg:#f3f5f8; --panel:#ffffff; --line:#cdd5df; --ink:#16202c; --sub:#5a6877; --accent:#1c5fd4; --ok:#177a3c; --ng:#b3261e; --warn:#9a6700; --run:#1c5fd4; --btnink:#ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12171d; --panel:#1b222b; --line:#344050; --ink:#e8edf3; --sub:#9fb0c1; --accent:#6aa3ff; --ok:#5dd18a; --ng:#ff8b83; --warn:#e3b341; --run:#6aa3ff; --btnink:#0b1320; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Yu Gothic UI", "Meiryo UI", "Segoe UI", sans-serif; font-size: 20px; line-height: 1.5; }
+  header { padding: 10px 24px; font-size: 28px; font-weight: 700; background: var(--panel); border-bottom: 2px solid var(--line); }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 18px 14px; }
+  h2 { margin: 0 0 8px; font-size: 22px; }
+  .url { font-family: Consolas, monospace; font-size: 22px; font-weight: 700; color: var(--accent); }
+  ol { margin: 6px 0 0 1.4em; padding: 0; }
+  li { margin: 2px 0; }
+  .note { color: var(--sub); font-size: 18px; margin-top: 6px; }
+  .state { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .badge { display: inline-block; min-width: 7.5em; text-align: center; padding: 6px 16px; border-radius: 22px; font-weight: 700; font-size: 24px; color: #fff; background: var(--sub); }
+  .badge.idle { background: #6b7785; } .badge.starting, .badge.loading { background: var(--warn); }
+  .badge.ready { background: var(--ok); } .badge.failed { background: var(--ng); } .badge.external { background: #6b4fbb; }
+  .badge.running { background: var(--run); } .badge.success { background: var(--ok); }
+  .kv { color: var(--sub); }
+  .buttons { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+  button { font: inherit; font-weight: 700; height: 52px; padding: 0 24px; border: 2px solid var(--accent); border-radius: 8px; background: var(--accent); color: var(--btnink); cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button.danger { background: var(--ng); border-color: var(--ng); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .msg { min-height: 1.5em; margin-top: 8px; color: var(--sub); } .msg.ng { color: var(--ng); } .msg.ok { color: var(--ok); }
+  ul.steps { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 4px; }
+  ul.steps li { display: flex; gap: 10px; }
+  .ok { color: var(--ok); font-weight: 700; } .ng { color: var(--ng); font-weight: 700; } .na { color: var(--sub); }
+  .count { font-size: 24px; font-weight: 700; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>暫定 API 操作(Sahi・この PC の loopback のみ)</header>
+<main>
+  <section id="guide">
+    <h2>この画面の URL と使い方</h2>
+    <div>URL: <span class="url" id="url">-</span></div>
+    <ol>
+      <li><b>起動</b> を押す。モデルの読み込みに 20〜60 秒ほどかかり、状態が「起動中」→「準備中」→「準備完了」と変わります。</li>
+      <li>状態は 2 秒ごとに自動更新されます。すぐ確認したいときは <b>更新</b> を押します。</li>
+      <li>「準備完了」になったら <b>スモーク実行</b>(合成の白い画像 1 枚。検出 0 件は正常です)。</li>
+      <li>終わるときは <b>停止</b>(この画面が起動した API だけを停止します)。画面を閉じても API は止まりません。</li>
+    </ol>
+    <div class="note">操作できるのは、この PC の 127.0.0.1 と暫定領域(output_interim)の中だけです。実図面・製番処理・DB・共有・CAD には触れません。</div>
+  </section>
+
+  <section>
+    <h2>API の状態</h2>
+    <div class="state">
+      <span class="badge idle" id="apiBadge">確認中</span>
+      <span class="kv" id="apiMeta"></span>
+    </div>
+    <div class="msg" id="apiMsg"></div>
+    <div class="buttons">
+      <button id="btnStart">起動</button>
+      <button id="btnRefresh" class="secondary">更新</button>
+      <button id="btnStop" class="danger">停止</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>スモーク(合成 PNG 1 枚)</h2>
+    <div class="state">
+      <span class="badge idle" id="smokeBadge">未実行</span>
+      <button id="btnSmoke">スモーク実行</button>
+    </div>
+    <ul class="steps" id="steps"></ul>
+    <div class="count" id="count"></div>
+    <div class="msg" id="smokeMsg"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const STEP_NAMES = ["安全条件", "事前確認(/health)", "/health の本文", "推論の依頼(/predict)", "検出結果ファイル"];
+const SMOKE_LABELS = { idle: "未実行", running: "実行中", success: "成功", failed: "失敗" };
+let busyLocal = false;
+
+$("url").textContent = location.origin + "/";
+
+async function call(method, path) {
+  const opt = { method, headers: {} };
+  if (method === "POST") opt.headers["X-Interim-Request"] = "1";
+  const res = await fetch(path, opt);
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = { ok: false, error: "応答を読み取れませんでした。" }; }
+  return { status: res.status, data };
+}
+
+function render(d) {
+  if (!d || !d.api) return;
+  const a = d.api;
+  const badge = $("apiBadge");
+  badge.textContent = a.label;
+  badge.className = "badge " + a.state;
+  const meta = [];
+  if (a.port) meta.push("ポート " + a.port);
+  if (a.http) meta.push("/health: HTTP " + a.http);
+  if (a.external) meta.push("外部から起動された API(操作しません)");
+  if (a.stale) meta.push("古い server.yaml が残っています");
+  if (!a.settings_ok) meta.push("ローカル設定が未設定です");
+  $("apiMeta").textContent = meta.join(" / ");
+  const msg = $("apiMsg");
+  if (a.state === "failed" && a.reason) { msg.textContent = a.reason; msg.className = "msg ng"; }
+  else if (a.state === "external") { msg.textContent = "外部から起動された API が動いています。この画面では起動も停止もしません。"; msg.className = "msg"; }
+  else if (a.stale) { msg.textContent = "古い server.yaml が残っています(外部のもの)。稼働中でないと確認してから、手動で対処してください。"; msg.className = "msg ng"; }
+  else if (!a.settings_ok) { msg.textContent = "ローカル設定(モデル・推論用 venv)が未設定、または使えません。"; msg.className = "msg ng"; }
+  else if (!msg.dataset.sticky) { msg.textContent = ""; msg.className = "msg"; }
+
+  $("btnStart").disabled = busyLocal || !d.can.start;
+  $("btnStop").disabled = busyLocal || !d.can.stop;
+  $("btnSmoke").disabled = busyLocal || !d.can.smoke;
+
+  const s = d.smoke || { state: "idle", ok_steps: [] };
+  const sb = $("smokeBadge");
+  sb.textContent = SMOKE_LABELS[s.state] || s.state;
+  sb.className = "badge " + (s.state === "idle" ? "idle" : s.state);
+  const steps = $("steps");
+  steps.innerHTML = "";
+  if (s.state !== "idle") {
+    const okSet = new Set(s.ok_steps || []);
+    let failedMarked = false;
+    STEP_NAMES.forEach((name, i) => {
+      const n = i + 1;
+      const li = document.createElement("li");
+      let mark = "–", cls = "na";
+      if (okSet.has(n)) { mark = "OK"; cls = "ok"; }
+      else if (s.state === "failed" && !failedMarked) { mark = "NG"; cls = "ng"; failedMarked = true; }
+      else if (s.state === "running" && !failedMarked && okSet.size === i) { mark = "…"; cls = "na"; }
+      li.innerHTML = '<span class="' + cls + '" style="min-width:2.4em"></span><span></span>';
+      li.children[0].textContent = mark;
+      li.children[1].textContent = n + ". " + name;
+      steps.appendChild(li);
+    });
+  }
+  $("count").textContent = (s.state === "success" && s.detections !== null) ? "検出件数: " + s.detections + " 件(0 件は正常)" : "";
+  const sm = $("smokeMsg");
+  if (s.state === "failed") { sm.textContent = s.refused ? "安全条件により拒否されました(何も実行していません)。" : "スモークに失敗しました。"; sm.className = "msg ng"; }
+  else if (s.state === "success") { sm.textContent = "事前確認・/health・/predict・検出結果ファイルの形式まで成功しました。"; sm.className = "msg ok"; }
+  else { sm.textContent = ""; sm.className = "msg"; }
+}
+
+async function refresh() {
+  try {
+    const { data } = await call("GET", "/api/status");
+    render(data);
+  } catch (e) {
+    $("apiBadge").textContent = "画面サーバーに接続できません";
+    $("apiBadge").className = "badge failed";
+  }
+}
+
+async function act(path, label) {
+  busyLocal = true;
+  ["btnStart", "btnStop", "btnSmoke"].forEach((id) => { $(id).disabled = true; });
+  const msg = $("apiMsg");
+  msg.dataset.sticky = "1"; msg.className = "msg"; msg.textContent = label + "しています…";
+  try {
+    const { status, data } = await call("POST", path);
+    if (status >= 400 && data.error) { msg.textContent = data.error; msg.className = "msg ng"; }
+    else { msg.textContent = ""; delete msg.dataset.sticky; }
+    render(data.api ? data : null);
+  } catch (e) {
+    msg.textContent = "操作に失敗しました。"; msg.className = "msg ng";
+  } finally {
+    busyLocal = false;
+    await refresh();
+  }
+}
+
+$("btnStart").onclick = () => act("/api/start", "起動");
+$("btnStop").onclick = () => act("/api/stop", "停止");
+$("btnSmoke").onclick = () => act("/api/smoke", "スモークを開始");
+$("btnRefresh").onclick = () => { delete $("apiMsg").dataset.sticky; refresh(); };
+refresh();
+setInterval(() => { if (!busyLocal) refresh(); }, 2000);
+</script>
+</body>
+</html>

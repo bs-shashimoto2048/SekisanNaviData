@@ -1,10 +1,9 @@
 # 動作チェック(運用画面の「2. 動作チェック」)。設定形式・出力先・変換ソフト・設計サーバー参照先を確認する。
 # 読み取りだけで、何も書かない・製番処理もしない。
 #   - ホスト DB: 読み取り専用の照会(出図済み製番の一覧取得 = SELECT)だけ。
-#   - 推論 API: /health の状態確認だけ。/predict は呼ばない。
+#   - 推論 API: /health の状態確認だけ。/predict は呼ばない。判定は製番処理の事前確認(pipeline.api_preflight)と同じ関数。
 # 結果の文言にはパス・ホスト名・秘密情報を入れない(画面に表示するため)。
 import os
-import urllib.request
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -91,36 +90,23 @@ def default_host_check(initials: str) -> Tuple[bool, str]:
     return (True, f"読み取り照会に成功しました(出図済み製番 {len(items)} 件)")
 
 
-def http_get(url: str, timeout: float = 3.0) -> Tuple[int, str]:
-    """プロキシを使わない GET。状態確認(/health)専用。"""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(url, timeout=timeout) as res:   # noqa: S310 - http のみを組み立てて渡している
-        return res.status, res.read(2000).decode("utf-8", "replace")
+def default_health_check(config: dict) -> Optional[str]:
+    """推論 API の /health 確認。製番処理の事前確認(pipeline.api_preflight)と**同じ関数**を使う(接続先・プロキシ・リダイレクト・
+    タイムアウトの条件が同一)。使えるなら None、使えないなら固定文言の理由(接続先・パス・例外メッセージなし)を返す。"""
+    from pipeline import api_preflight
+    return api_preflight.unavailable_reason(config)
 
 
-def _is_connection_refused(e: BaseException) -> bool:
-    """接続拒否(待ち受けるプロセスがない)か。urllib の URLError は reason に本体を持つ。"""
-    cause = getattr(e, "reason", None)
-    return any(isinstance(x, ConnectionRefusedError) or getattr(x, "winerror", None) == 10061 for x in (e, cause))
-
-
-def default_health_url(config: dict) -> Optional[str]:
-    """推論 API の状態確認 URL(/health)。API 設定ファイルが読めないときは None。"""
-    from bs_pkg import config_loader
-    api = config.get("api") or {}
-    path = os.path.join(str(api.get("dir_venv", "")), str(api.get("yaml_file", "")))
-    if not os.path.isfile(path):
-        return None
-    cfg = config_loader.load_yaml(path)
-    return f"http://{cfg['host']['pc_ip']}:{cfg['host']['port']}/health"
+def _integrated_mode(config: dict) -> bool:
+    """推論サーバー統合(検証設定)か。app.main と同じ判定。統合モードでは事前確認をしない(起動時に app が health/ready を確認する)。"""
+    return bool((config.get("inference_server") or {}).get("enabled", False))
 
 
 def run_checks(config_path, settings: OpsSettings, *,
                load_config: Callable = _load_config,
                design_check: Callable = default_design_check,
                host_check: Callable = default_host_check,
-               health_url: Callable = default_health_url,
-               get: Callable = http_get) -> List[dict]:
+               health_check: Callable = default_health_check) -> List[dict]:
     """全項目を順に確認して結果のリストを返す。1 項目の失敗で他の確認を止めない。"""
     results: List[dict] = []
     try:
@@ -139,17 +125,16 @@ def run_checks(config_path, settings: OpsSettings, *,
             results.append(_item(name, OK if ok else NG, detail))
         except Exception as e:  # noqa: BLE001
             results.append(_item(name, NG, f"確認できませんでした({type(e).__name__})"))
-    try:
-        url = health_url(config)
-        if url is None:
-            results.append(_item("推論 API(/health)", SKIP, "API 設定が見つからないため確認しません(推論サーバー統合の場合は起動時に確認します)"))
-        else:
-            status, _ = get(url)
-            results.append(_item("推論 API(/health)", OK if status == 200 else NG, f"状態確認の応答コード {status}"))
-    except Exception as e:  # noqa: BLE001
-        if _is_connection_refused(e):   # 接続先・例外メッセージは出さない(原因の可能性だけ案内する)
-            detail = "接続が拒否されました(API が未起動、または server.yaml の接続先が古い可能性があります)"
-        else:
-            detail = f"状態確認に失敗しました({type(e).__name__})"
-        results.append(_item("推論 API(/health)", NG, detail))
+    # 推論 API: 製番処理の事前確認と同じ判定。ここが OK なら、同じ設定で事前確認も通る(接続先・プロキシ・リダイレクト・タイムアウトが同一)。
+    if _integrated_mode(config):
+        results.append(_item("推論 API(/health)", SKIP, "推論サーバー統合の設定のため確認しません(起動時に準備完了を確認します)"))
+    else:
+        try:
+            reason = health_check(config)
+            if reason is None:
+                results.append(_item("推論 API(/health)", OK, "製番処理の事前確認と同じ条件で、HTTP 200 を確認しました"))
+            else:
+                results.append(_item("推論 API(/health)", NG, reason))
+        except Exception as e:  # noqa: BLE001 - 理由は固定で返る想定。万一の例外も、型名だけにする
+            results.append(_item("推論 API(/health)", NG, f"確認できませんでした({type(e).__name__})"))
     return results

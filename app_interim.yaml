@@ -1,0 +1,36 @@
+# *******************************************
+# 暫定・隔離運用の専用設定(サンプル。docs/inference_api_interim_operation.md)
+# *******************************************
+# この PC 上で、推論 API(inference_server/server.py。検証専用)を手動で起動し続け、本番モードの経路
+# (app.main は API を起動せず、事前確認で /health を確認する)をローカルだけで確認するための設定。
+# - 本番設定(app.yaml / app.local.yaml)・本番共有・実 DB・実タスクは参照しない。相対パスのみで、実パス・認証情報は書かない。
+# - 出力先・server.yaml・ログは、すべて ./output_interim 配下(Git 管理外)。入力は合成データだけを使う。
+# - 実値が必要なら app_interim.local.yaml(*.local.yaml は Git 管理外)に書く。コミットしない。
+# - ポートはこのファイルに書かない(起動スクリプトの -Port で指定し、server.yaml へ書かれる)。
+# - inference_server の節は置かない(置くと統合モード = アプリが API を起動する別の経路になる)。
+# 使い方(手順は docs/inference_api_interim_operation.md §3.3): tools\run_interim_api.ps1 で API を手動起動 → 運用画面などに --config app_interim.yaml を指定
+data:
+  output: ./output_interim               # 隔離出力先(Git 管理外)
+  storage: a_product                     # データ格納先
+  initials: A1                           # 処理対象製番頭文字:先頭2文字
+  box_types: ["OS", "IS", "OA", "IA"]    # 処理対象箱体型式
+
+# API設定ファイル参照先(起動スクリプトが書く server.yaml。隔離出力先の中)
+api:
+  dir_venv: ./output_interim/api
+  yaml_file: server.yaml
+  use_proxy: false                       # この PC の loopback だけを使うためプロキシなし(server.yaml に proxy 項目は書かれない)
+  # request_timeout は未設定(GPU 環境で実測するまで省略 = 従来どおり待ち続ける)
+
+# 座標算出時に参照する各データの名称・拡張子
+data_extension:
+  target_draw: .baninf
+  cubicle_size: .cbbox
+  original_draw: .png
+  detected_draw: _detected.txt
+  convert_bfr: .dwg
+  convert_aft: .dxf
+
+dwg_conversion:
+  converter: C:/Program Files/ODA/ODAFileConverter 26.10.0/ODAFileConverter.exe  # app_test.yaml と同じ(ローカルの変換ソフト。本番共有上は不可)。暫定運用では CAD 変換は実行しない
+  cad_version: ACAD2018
