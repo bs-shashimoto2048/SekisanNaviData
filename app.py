@@ -191,7 +191,8 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
                 target_initial=target_initial, box_types=box_types,
                 converter_path=converter_path, converter_version=converter_version,
                 converter_extension=converter_extension, converted_extension=converted_extension,
-                manager=manager, request_timeout=settings.request_timeout if manager is not None else None)
+                # 推論の応答待ち: 統合モードは inference_server.request_timeout、本番モードは api.request_timeout(省略 = None = 従来どおり待ち続ける)
+                manager=manager, request_timeout=settings.request_timeout if manager is not None else cfg.api_request_timeout)
             product_flow.run_product(ctx, results)
     except Exception as e:
         logger.error(f"Process Failed: {e}\n")
@@ -224,6 +225,9 @@ def _cli(argv=None) -> int:
         res = main(config_path=args.config)
     except inference_support.InferenceServerError as e:
         print(f"推論サーバーの準備に失敗したため終了します: {e}", file=sys.stderr)
+        return 1
+    except settings_mod.ConfigValueError as e:      # 設定値の不正(製番処理を始める前に検出)
+        print(f"設定値が不正なため終了します: {e}", file=sys.stderr)
         return 1
     return 1 if res["failed"] else 0
 

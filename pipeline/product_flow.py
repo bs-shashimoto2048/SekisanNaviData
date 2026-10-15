@@ -435,6 +435,10 @@ def step4_detect_objects(ctx: ProductContext) -> Optional[ProductResult]:
         inference_support.verify_shared_work_dir(ctx.manager.base_url, dir_product)
         logger.info(f" └> work_dir をサーバーと共有できていることを確認: {dir_product = }")
         request_kwargs["timeout"] = ctx.request_timeout
+    elif ctx.request_timeout is not None:
+        # 本番モードで api.request_timeout が指定されたときだけ渡す(省略時は渡さず、従来どおり待ち続ける)。
+        # 超過は requests のタイムアウトとして image_mod が InferenceRequestError にし、製番の失敗・後始末の既存の経路で扱う(再試行なし)
+        request_kwargs["timeout"] = ctx.request_timeout
     # 失敗(HTTPエラー・接続失敗・検出ファイル未生成)は InferenceRequestError で送出され、この製番は失敗として扱われる
     # (image_mod への依存は pipeline.inference_client に集約。契約は docs/inference_contract.md)
     response = inference_client.request_detections(

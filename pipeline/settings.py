@@ -6,6 +6,7 @@
 # - 対象製番・箱体型式・CAD 変換の設定は、**使う時点で**読む(プロパティ)。従来は推論サーバー設定の検証の後で読んでいたため、
 #   設定が不足していて、かつ推論サーバー設定が不正なときに先に出るエラー(InferenceServerError)を変えないため。
 # - 推論サーバー設定の検証(build_inference_manager)は、出力フォルダ・ログを作る前に呼ぶ(本番共有・範囲外なら何も書かずに失敗)。
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,20 @@ from bs_pkg import config_loader
 import inference_support
 
 SAMPLE_CONFIG_KEYS = (("data", "output"), ("api", "dir_venv"), ("dwg_conversion", "converter"))
+
+
+class ConfigValueError(ValueError):
+    """設定値が不正(製番処理を始める前に、読込時に検出する)。"""
+
+
+def parse_request_timeout(value) -> Optional[float]:
+    """api.request_timeout(本番モードの /predict の応答待ち[秒])。省略(None)は従来どおり待ち続ける(None のまま)。
+    指定するときは正の有限の数だけ(0・負・NaN・無限大・真偽値・文字列などは ConfigValueError)。根拠のない既定値は持たない。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ConfigValueError("api.request_timeout は、正の有限の数(秒)で指定してください(省略すると従来どおり待ち続けます)")
+    return float(value)
 
 
 def default_config_path(base_dir, script_name: str) -> str:
@@ -43,6 +58,7 @@ class Settings:
     storage: str
     infer_cfg: dict         # inference_server セクション(無ければ空)
     infer_enabled: bool
+    api_request_timeout: Optional[float] = None   # api.request_timeout(本番モード用。省略 = None = 従来どおり待ち続ける)。読込時に検証済み
 
     # --- 読込時に決まる出力先 ---
     @property
@@ -96,8 +112,10 @@ def load_settings(config_path=None, default_path: Optional[Callable[[], str]] = 
     if infer_enabled:
         data_dir = os.path.abspath(data_dir)  # work_dir をサーバーと共有できる絶対パスにする
     storage: str = config_data["data"]["storage"]
+    # 不正値は、出力フォルダ・ログ・ホスト照会より前(ここ)で分かるようにする(統合モードでは使わないが、書いてあれば同じく検証する)
+    api_request_timeout = parse_request_timeout((config_data.get("api") or {}).get("request_timeout"))
     return Settings(config_path=my_yaml_path, config_data=config_data, data_dir=data_dir, storage=storage,
-                    infer_cfg=infer_cfg, infer_enabled=infer_enabled)
+                    infer_cfg=infer_cfg, infer_enabled=infer_enabled, api_request_timeout=api_request_timeout)
 
 
 def build_inference_manager(cfg: Settings) -> Tuple[Any, Any]:
