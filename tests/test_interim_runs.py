@@ -203,7 +203,7 @@ class ManualRunTest(Base):
         (call,) = self.main.calls
         self.assertEqual(call["products"], [PRODUCT])                                            # 1 製番だけ。ホストの全件取得は app.main が省く
         self.assertEqual(Path(call["config_path"]), self.repo / "app_interim.yaml")             # app.yaml / app.local.yaml ではない
-        self.assertNotIn("output_root", call)                                                    # 出力先は設定(隔離)どおり
+        self.assertEqual(Path(call["output_root"]), self.repo / "output_interim")               # 設定どおりの場所を、絶対パスで渡す
         self.assertEqual(info["output_dir"], f"output_interim/a_product/output/{PRODUCT}")
         r = runs.history.runs()[0]
         self.assertEqual((r["kind"], r["product"], r["status"]), ("手動", PRODUCT, "完了"))
@@ -436,7 +436,7 @@ class ScheduledRunTest(Base):
         self.assertEqual(runs.run_scheduled(), "完了")
         (call,) = self.main.calls
         self.assertNotIn("products", call)                                                       # 全対象製番(ホストの出図済み − 処理済み)
-        self.assertNotIn("output_root", call)
+        self.assertEqual(Path(call["output_root"]), self.repo / "output_interim")               # 定期実行も絶対パスの出力ルート
         self.assertEqual(Path(call["config_path"]), self.repo / "app_interim.yaml")
         r = runs.history.runs()[0]
         self.assertEqual((r["kind"], r["status"]), ("定期", "完了"))
@@ -594,6 +594,166 @@ class StaticAndDocsTest(unittest.TestCase):
         for forbidden in ("app.local.yaml", "output_root=", "ops_console.py", "/Create", "subprocess", "shutil.rmtree", "os.remove", "unlink("):
             self.assertNotIn(forbidden, code, forbidden)                                          # 削除は既存の製番処理に任せる(ここでは削除しない)
         self.assertIn('PRODUCTION_TASK_NAME = "SekisanNaviData_Ops"', code)
+
+
+class AbsoluteWorkDirTest(Base):
+    """外部 API モードでは、アプリが相対の data.output を絶対パス化しない。暫定実行は、検証済みの絶対パスの出力ルートを渡し、
+    製番ごとの work_dir(推論 API に渡る値)が絶対パスで隔離ルート配下になることを、製番処理の前に確認する。すべてモック。"""
+
+    def api_work_dir(self, call, product=PRODUCT) -> str:
+        """app.main に渡る引数から、アプリが推論要求に使う work_dir を、本物の設定読込と同じ手順で組み立てる(設定は YAML を読むだけ)。"""
+        from pipeline import settings as settings_mod
+        cfg = settings_mod.load_settings(str(call["config_path"]))
+        cfg = settings_mod.with_output_root(cfg, call["output_root"])
+        return os.path.join(cfg.output_dir, product)
+
+    def test_relative_config_yields_an_absolute_work_dir_under_the_isolated_root(self):
+        runs = self.make()
+        runs.start(PRODUCT)
+        self.wait_idle(runs)
+        (call,) = self.main.calls
+        work_dir = self.api_work_dir(call)
+        self.assertTrue(os.path.isabs(call["output_root"]))
+        self.assertTrue(os.path.isabs(work_dir))
+        self.assertEqual(Path(work_dir), self.repo / "output_interim" / "a_product" / "output" / PRODUCT)
+        self.assertTrue(rn.pathsafe.is_under(work_dir, self.repo / "output_interim"))
+        # 前提の確認: output_root を渡さない(従来の)経路では、相対のままになる(これが API に拒否された原因)
+        from pipeline import settings as settings_mod
+        cfg = settings_mod.load_settings(str(call["config_path"]))
+        self.assertFalse(os.path.isabs(os.path.join(cfg.output_dir, PRODUCT)))
+
+    def test_work_dir_does_not_depend_on_the_current_working_directory(self):
+        other = Path(tempfile.mkdtemp(prefix="sekisan_cwd_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, ignore_errors=True))
+        before = os.getcwd()
+        os.chdir(other)
+        try:
+            runs = self.make()
+            runs.start(PRODUCT)
+            self.wait_idle(runs)
+            (call,) = self.main.calls
+            work_dir = self.api_work_dir(call)
+        finally:
+            os.chdir(before)
+        self.assertEqual(Path(work_dir), self.repo / "output_interim" / "a_product" / "output" / PRODUCT)
+
+    def test_work_dir_is_accepted_by_the_api_side_validation_with_the_same_root(self):
+        sys.path.insert(0, str(ROOT / "inference_server"))
+        self.addCleanup(lambda: sys.path.remove(str(ROOT / "inference_server")))
+        import safety as server_safety                                                          # API 側の検査(変更しない)
+        runs = self.make()
+        runs.start(PRODUCT)
+        self.wait_idle(runs)
+        work_dir = self.api_work_dir(self.main.calls[0])
+        os.makedirs(work_dir)
+        api_root = str(self.repo / "output_interim")                                             # API の --output-root と同じ基準
+        self.assertEqual(Path(server_safety.validate_work_dir(work_dir, api_root)), Path(os.path.realpath(work_dir)))
+        with self.assertRaises(server_safety.SafetyError):                                       # 相対のままなら、API 側は拒否する(緩めていない)
+            server_safety.validate_work_dir(os.path.relpath(work_dir, self.repo), api_root)
+
+    def test_work_dir_for_rejects_relative_escaping_and_mismatched_paths(self):
+        t = rn.validate_run_config(self.repo / "app_interim.yaml", self.repo, net_drive=lambda p: False)
+        good = rn.work_dir_for(t, PRODUCT)
+        self.assertTrue(os.path.isabs(good))
+        tampered = [
+            dict(t, output_root=Path("output_interim")),                                         # 相対の出力ルート
+            dict(t, output_root=self.repo),                                                      # 隔離ルートの外(リポジトリ直下)
+            dict(t, output_root=self.repo / "output_interim" / ".." / "x"),                      # .. を含む
+            dict(t, output_root=Path(tempfile.gettempdir()) / "elsewhere"),                      # 別の場所
+            dict(t, product_root=self.repo / "output_interim" / "other" / "output"),             # 検証済みの製番フォルダと不一致
+            dict(t, isolated_root=self.repo / "output_interim" / "api"),                         # API の出力ルートが、work_dir を含まない別の場所
+            dict(t, storage="..", product_root=self.repo / "output_interim" / "output"),          # storage による脱出
+        ]
+        for bad in tampered:
+            with self.assertRaises(rn.IsolationError, msg=str(bad)):
+                rn.work_dir_for(bad, PRODUCT)
+        for bad_product in ("..", "A1/../../x", "A1TEST0001\\..", "", None, "a b"):
+            with self.assertRaises(rn.IsolationError, msg=str(bad_product)):
+                rn.work_dir_for(t, bad_product)
+
+    def test_mismatch_fails_before_the_heavy_processing_and_leaks_no_path(self):
+        runs = self.make()
+        orig = runs.target
+
+        def tampered():
+            return dict(orig(), output_root=Path("output_interim"))                              # 相対の出力ルートが紛れ込んだ
+        runs.target = tampered
+        with mock.patch.object(runs, "_resolve_main", side_effect=AssertionError("重い処理へ進んではいけない")) as heavy:
+            with self.assertRaises(rn.IsolationError) as cm:
+                runs._guarded_main(config_path=str(runs.config_path), products=[PRODUCT])
+        heavy.assert_not_called()
+        self.assertEqual(self.main.calls, [])
+        self.assertNotIn(str(self.repo), str(cm.exception))
+
+    def test_failure_in_the_worker_is_recorded_without_real_paths_and_does_not_start_app_main(self):
+        runs = self.make()
+        orig = runs.target
+        runs.target = lambda: dict(orig(), product_root=self.repo / "output_interim" / "other" / "output")
+        runs.start(PRODUCT)                                                                      # start() の検証は別(target_for は元の target を使わない場合がある)
+        self.wait_idle(runs)
+        r = runs.history.runs()[0]
+        self.assertEqual(r["status"], "失敗")
+        self.assertEqual(self.main.calls, [])
+        blob = json.dumps(r, ensure_ascii=False) + (self.repo / "output_interim" / "run_state" / "ops_history.local.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(str(self.repo), blob)
+        self.assertNotIn(str(self.repo).replace("\\", "\\\\"), blob)                             # JSON のエスケープ表記も
+        self.assertEqual(r["reason"], "IsolationError")                                          # 理由は例外の種類名だけ(メッセージは残さない)
+
+    @unittest.skipUnless(sys.platform == "win32", "ジャンクションは Windows のみ")
+    def test_product_folder_replaced_by_a_link_is_refused_before_app_main(self):
+        import _winapi
+        runs = self.make()
+        outside = Path(tempfile.mkdtemp(prefix="sekisan_outside_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+        out_dir = self.repo / "output_interim" / "a_product" / "output"
+        out_dir.mkdir(parents=True)
+        link = out_dir / PRODUCT
+        _winapi.CreateJunction(str(outside), str(link))                                          # 製番フォルダが外へ出るリンク
+        self.addCleanup(lambda: link.exists() and os.rmdir(str(link)))
+        runs.start(PRODUCT)
+        self.wait_idle(runs)
+        self.assertEqual(runs.history.runs()[0]["status"], "失敗")
+        self.assertEqual(self.main.calls, [])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_real_main_requires_the_repository_as_working_directory(self):
+        """アプリは api.dir_venv(相対)を作業ディレクトリ基準で読む。リポジトリ以外なら、実の app.main(重い処理)へ進まない。"""
+        runs = self.make(main_func=None)
+        other = Path(tempfile.mkdtemp(prefix="sekisan_cwd_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, ignore_errors=True))
+        before = os.getcwd()
+        os.chdir(other)
+        try:
+            with mock.patch.object(runs, "_resolve_main", side_effect=AssertionError("重い処理へ進んではいけない")) as heavy:
+                with self.assertRaises(rn.IsolationError):
+                    runs._guarded_main(config_path=str(runs.config_path), products=[PRODUCT])
+            heavy.assert_not_called()
+            os.chdir(self.repo)
+            fake = FakeMain(Result(completed=[PRODUCT]))
+            with mock.patch.object(runs, "_resolve_main", return_value=fake):
+                runs._guarded_main(config_path=str(runs.config_path), products=[PRODUCT])
+            self.assertEqual(len(fake.calls), 1)
+        finally:
+            os.chdir(before)
+
+    def test_storage_dotdot_is_refused_for_scheduled_and_manual_runs_before_app_main(self):
+        """storage が ".." だと、出力先が隔離ルートの外(リポジトリ直下の output)になる。定期実行(製番指定なし)でも、app.main の前に拒否する。"""
+        write_config(self.repo, data={"storage": ".."})
+        runs = self.make()
+        with self.assertRaises(rn.IsolationError):
+            runs.target()
+        self.assertEqual(runs.run_scheduled(), "失敗")
+        with self.assertRaises(rn.IsolationError):
+            runs.start(PRODUCT)
+        self.assertEqual(self.main.calls, [])
+        self.assertFalse((self.repo / "output").exists())
+
+    def test_scheduled_run_also_passes_the_absolute_output_root(self):
+        runs = self.make()
+        runs.run_scheduled()
+        (call,) = self.main.calls
+        self.assertEqual(Path(call["output_root"]), self.repo / "output_interim")
+        self.assertNotIn("products", call)
 
 
 if __name__ == "__main__":

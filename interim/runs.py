@@ -5,7 +5,8 @@
 #   失敗時の製番フォルダの後始末(出力ルート配下に限る削除)・処理済み判定・対象判定は、既存の処理に任せる。ここでは削除しない。
 # - 出力先は、専用設定 app_interim.yaml の data.output が ./output_interim の内側であることを、**実行のたびに**検証する
 #   (表記上の位置で判定し、リンク/ジャンクション/UNC/ネットワークドライブを拒否。共有の出力先には書かない)。app.yaml / app.local.yaml は読まない。
-#   output_root の上書きは使わない(設定どおり)。
+#   app.main へは output_root として、検証済みの**絶対パス**の出力ルートを渡す(外部 API モードではアプリが相対の data.output を絶対パス化せず、
+#   相対の work_dir が API に拒否されるため。場所は設定どおりで、表記だけ絶対パスにする)。work_dir は実行前に隔離ルート基準で検証する。
 # - 実行管理(二重起動の防止・COM の初期化と終了・履歴・SystemExit の扱い)は ops.runner.RunManager をそのまま使う。状態・履歴・ロックは
 #   隔離領域 output_interim/run_state に置く(運用画面 ops_console の ops.local.yaml / ops_history.local.jsonl とは別。いずれも Git 管理外)。
 # - 仮定期実行のタスクは、通常の定期タスク(SekisanNaviData_Ops)とは別名(SekisanNaviData_InterimOps)・別の起動入口(interim_console.py run-scheduled)。
@@ -38,6 +39,7 @@ MESSAGES = {
     "api_not_ready": "推論 API が準備完了ではありません。先に「API の状態」で起動し、準備完了にしてください。",
     "busy": "製番処理を実行中です。完了してから開始してください。",
     "isolation": "出力先が隔離領域(output_interim)であることを確認できないため、実行しません。",
+    "work_dir": "処理対象フォルダ(work_dir)を、隔離領域(output_interim)内の絶対パスとして確認できないため、実行しません。",
     "bad_product": "製番は英数字 4〜20 文字で指定してください。",
     "task_foreign": "同名のタスクが既にあり、この画面が登録したものではないため、上書き・解除しません。",
 }
@@ -102,9 +104,31 @@ def validate_run_config(config_path, repo_root, *, net_drive=pathsafe.is_network
             raise IsolationError(MESSAGES["isolation"])
     base = Path(output) if Path(output).is_absolute() else repo_root / output
     root = Path(os.path.normpath(str(base / storage / "output")))
-    if pathsafe.has_link_in_path(root, repo_root):
+    if not pathsafe.lexically_within(root, isolated) or pathsafe.has_link_in_path(root, repo_root):     # storage が ".." 等でも、最終位置が隔離ルートの内側であること
         raise IsolationError(MESSAGES["isolation"])
-    return {"storage": storage, "product_root": root, "product_root_rel": root.relative_to(repo_root).as_posix()}
+    # output_root: app.main に渡す絶対パスの出力ルート(設定の data.output を、作業ディレクトリではなくリポジトリ基準で解決したもの)。
+    # 外部 API モードでは、アプリは data.output を絶対パス化しない。相対のままだと work_dir が相対になり、API に拒否される。
+    output_root = Path(os.path.normpath(str(base)))
+    return {"storage": storage, "product_root": root, "product_root_rel": root.relative_to(repo_root).as_posix(),
+            "output_root": output_root, "isolated_root": Path(isolated)}
+
+
+def work_dir_for(target: dict, product: str) -> str:
+    """app.main が推論 API に渡す work_dir(= 出力ルート/storage/output/製番)を、実行前に組み立てて検証する。
+    絶対パスで、API が使う出力ルート(output_interim。API 起動時の --output-root と同じ基準)の配下に実体解決後も収まることを確認する。違反は IsolationError。"""
+    output_root, isolated = str(target["output_root"]), str(target["isolated_root"])
+    try:
+        product = validate_product_no(product)
+    except SettingsError:
+        raise IsolationError(MESSAGES["work_dir"]) from None
+    work_dir = os.path.join(output_root, target["storage"], "output", product)
+    if (not os.path.isabs(output_root) or not os.path.isabs(work_dir) or os.path.normpath(work_dir) != work_dir
+            or os.path.normpath(os.path.join(str(target["product_root"]), product)) != work_dir       # 検証済みの製番フォルダと同一
+            or not pathsafe.lexically_within(work_dir, isolated)
+            or not pathsafe.is_under(work_dir, isolated)                                             # 実体解決後(リンク経由)も隔離ルート配下
+            or pathsafe.has_link_in_path(work_dir, isolated)):                                       # 製番フォルダ自身がリンクになっていない
+        raise IsolationError(MESSAGES["work_dir"])
+    return work_dir
 
 
 class InterimScheduler(TaskScheduler):
@@ -174,10 +198,23 @@ class InterimRuns:
         return validate_run_config(self.config_path, self.repo, net_drive=self._net_drive)
 
     def _guarded_main(self, **kw):
-        """RunManager が呼ぶ入口。出力先の隔離を実行のたびに検証してから、既存の app.main をそのまま呼ぶ(output_root の上書きはしない)。"""
-        self.target()                                                    # 違反なら IsolationError(履歴には固定の文言で「失敗」として残る)
-        kw.pop("output_root", None)
+        """RunManager が呼ぶ入口。出力先の隔離を実行のたびに検証してから、既存の app.main を呼ぶ。
+        外部 API モードではアプリが data.output を絶対パス化しないため、検証済みの絶対パスの出力ルートを output_root として渡す
+        (場所は設定の data.output と同じ。表記だけ絶対パスにする)。work_dir の検証に失敗したら、app.main(重い処理)へ進まない。"""
+        t = self.target()                                                # 違反なら IsolationError(履歴には固定の文言で「失敗」として残る)
+        for product in kw.get("products") or []:                         # 指定実行: 製番ごとの work_dir を、API の出力ルート基準で事前に検証
+            work_dir_for(t, product)
+        if not os.path.isabs(str(t["output_root"])):
+            raise IsolationError(MESSAGES["work_dir"])
+        self._check_cwd()
+        kw["output_root"] = str(t["output_root"])
         return self._resolve_main()(**kw)
+
+    def _check_cwd(self):
+        """実の app.main を呼ぶときだけ: アプリは api.dir_venv(相対)を作業ディレクトリ基準で読むため、作業ディレクトリがリポジトリであることを確認する
+        (別の場所の server.yaml を読んで別の API へ要求しない)。"""
+        if self._main_func is None and os.path.normcase(os.path.realpath(os.getcwd())) != os.path.normcase(str(self.repo)):
+            raise IsolationError(MESSAGES["work_dir"])
 
     def _resolve_main(self) -> Callable:
         if self._main_func is not None:
