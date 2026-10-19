@@ -104,7 +104,7 @@ def validate_run_config(config_path, repo_root, *, net_drive=pathsafe.is_network
             raise IsolationError(MESSAGES["isolation"])
     base = Path(output) if Path(output).is_absolute() else repo_root / output
     root = Path(os.path.normpath(str(base / storage / "output")))
-    if pathsafe.has_link_in_path(root, repo_root):
+    if not pathsafe.lexically_within(root, isolated) or pathsafe.has_link_in_path(root, repo_root):     # storage が ".." 等でも、最終位置が隔離ルートの内側であること
         raise IsolationError(MESSAGES["isolation"])
     # output_root: app.main に渡す絶対パスの出力ルート(設定の data.output を、作業ディレクトリではなくリポジトリ基準で解決したもの)。
     # 外部 API モードでは、アプリは data.output を絶対パス化しない。相対のままだと work_dir が相対になり、API に拒否される。

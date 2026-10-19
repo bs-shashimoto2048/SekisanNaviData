@@ -639,7 +639,8 @@ class AbsoluteWorkDirTest(Base):
 
     def test_work_dir_is_accepted_by_the_api_side_validation_with_the_same_root(self):
         sys.path.insert(0, str(ROOT / "inference_server"))
-        import safety as server_safety                                                           # API 側の検査(変更しない)
+        self.addCleanup(lambda: sys.path.remove(str(ROOT / "inference_server")))
+        import safety as server_safety                                                          # API 側の検査(変更しない)
         runs = self.make()
         runs.start(PRODUCT)
         self.wait_idle(runs)
@@ -734,6 +735,18 @@ class AbsoluteWorkDirTest(Base):
             self.assertEqual(len(fake.calls), 1)
         finally:
             os.chdir(before)
+
+    def test_storage_dotdot_is_refused_for_scheduled_and_manual_runs_before_app_main(self):
+        """storage が ".." だと、出力先が隔離ルートの外(リポジトリ直下の output)になる。定期実行(製番指定なし)でも、app.main の前に拒否する。"""
+        write_config(self.repo, data={"storage": ".."})
+        runs = self.make()
+        with self.assertRaises(rn.IsolationError):
+            runs.target()
+        self.assertEqual(runs.run_scheduled(), "失敗")
+        with self.assertRaises(rn.IsolationError):
+            runs.start(PRODUCT)
+        self.assertEqual(self.main.calls, [])
+        self.assertFalse((self.repo / "output").exists())
 
     def test_scheduled_run_also_passes_the_absolute_output_root(self):
         runs = self.make()
