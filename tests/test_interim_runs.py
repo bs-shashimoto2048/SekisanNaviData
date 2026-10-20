@@ -756,5 +756,233 @@ class AbsoluteWorkDirTest(Base):
         self.assertNotIn("products", call)
 
 
+BOXSPEC_REASON = "material.csv を作成できません: 設計フォルダに *.boxspec がありません(材料情報を作れません)"
+
+
+def info_json(last="2026-10-19T11:55:39", nxt="2026-10-21T11:51:00", result=1, missed=0, ac=True):
+    return json.dumps({"last": last, "next": nxt, "result": result, "missed": missed, "ac": ac})
+
+
+class ScheduleResultViewTest(Base):
+    """画面の「前回の結果と次回の予定」: 最終起動・終了コード・次回予定(Task Scheduler。読み取りだけ)、直近の定期実行の件数・失敗の種類(履歴から。製番は除く)、
+    要確認(固定文言)。実 PowerShell・実タスク・実 DB は使わない(info_runner と schtasks をモックにする)。"""
+
+    NOW = rn.datetime(2026, 10, 20, 14, 0)
+
+    def runs_with(self, info="", now=None, api_ready=lambda: True):
+        calls = []
+
+        def runner(name):
+            calls.append(name)
+            if isinstance(info, Exception):
+                raise info
+            return info() if callable(info) else info
+        runs = self.make(info_runner=runner, now=lambda: now or self.NOW, api_ready=api_ready)
+        runs.info_calls = calls
+        return runs
+
+    def add_scheduled(self, runs, status, reason, kind="定期"):
+        rid = runs.history.start(kind, "(全体)")
+        runs.history.finish(rid, status, reason)
+        return rid
+
+    # ---- 履歴の要約(製番は出さない) ----
+    def test_summary_gives_counts_and_failure_kinds_without_product_numbers(self):
+        reason = f"完了 20 件・失敗 1 件・スキップ 3 件 — {PRODUCT}: {BOXSPEC_REASON}"
+        s = rn.summarize_run_reason(reason, "失敗")
+        self.assertEqual((s["completed"], s["failed"], s["skipped"]), (20, 1, 3))
+        self.assertEqual(s["failure_kinds"], [{"label": "材料情報(*.boxspec)が無い・作れない(設計データ不足の可能性)", "count": 1}])
+        self.assertEqual((s["unclassified_failed"], s["whole_run_failed"]), (0, False))
+        self.assertNotIn(PRODUCT, json.dumps(s, ensure_ascii=False))
+
+    def test_summary_groups_kinds_counts_unlisted_failures_and_handles_plain_completion(self):
+        items = " / ".join([f"A1X0000{i}: {BOXSPEC_REASON}" for i in range(1, 3)] + ["A1X00003: InferenceRequestError", "A1X00004: ValueError: x", "A1X00005: ???"])
+        s = rn.summarize_run_reason(f"完了 4 件・失敗 8 件・スキップ 0 件 — {items}", "失敗")
+        kinds = {k["label"]: k["count"] for k in s["failure_kinds"]}
+        self.assertEqual(kinds["材料情報(*.boxspec)が無い・作れない(設計データ不足の可能性)"], 2)
+        self.assertEqual(kinds["推論 API への要求の失敗(InferenceRequestError)"], 1)
+        self.assertEqual(kinds["例外(ValueError)"], 1)
+        self.assertEqual(kinds["その他の失敗"], 1)
+        self.assertEqual(s["unclassified_failed"], 3)                                             # 8 件のうち、列挙された 5 件を除く(列挙は 5 件まで・切り詰めあり)
+        self.assertNotIn("A1X0", json.dumps(s, ensure_ascii=False))
+        ok = rn.summarize_run_reason("完了 5 件・スキップ 2 件", "完了")
+        self.assertEqual((ok["completed"], ok["failed"], ok["skipped"], ok["failure_kinds"]), (5, 0, 2, []))
+
+    def test_whole_run_failure_has_no_counts_and_a_fixed_label(self):
+        s = rn.summarize_run_reason("推論 API を利用できないため、製番処理を開始しませんでした(接続できません)", "失敗")
+        self.assertEqual((s["completed"], s["whole_run_failed"]), (None, True))
+        self.assertEqual(s["failure_kinds"], [{"label": "推論 API を利用できない(事前確認で停止)", "count": 1}])
+        self.assertEqual(rn.summarize_run_reason("IsolationError", "失敗")["failure_kinds"][0]["label"], "例外(IsolationError)")
+
+    def test_last_result_labels_are_fixed_phrases(self):
+        self.assertEqual(rn.format_last_result(0), "正常終了")
+        self.assertIn("失敗を含む", rn.format_last_result(1))
+        self.assertEqual(rn.format_last_result(267009), "実行中")
+        self.assertEqual(rn.format_last_result(267011), "まだ実行されていません")
+        self.assertIn("異常終了", rn.format_last_result(2147942402))
+        self.assertEqual(rn.format_last_result(None), "")
+
+    # ---- Task Scheduler の情報(最終起動・次回予定・終了コード) ----
+    def test_run_info_parses_values_and_is_cached_until_invalidated(self):
+        runs = self.runs_with(info_json())
+        runs.schedule_register("11:51", 2)
+        s = runs.schedule_state()
+        self.assertEqual((s["last_run"], s["next_run"], s["last_result"], s["missed_runs"], s["ac_online"]), ("2026-10-19 11:55", "2026-10-21 11:51", 1, 0, True))
+        self.assertIn("失敗を含む", s["last_result_label"])
+        n = len(runs.info_calls)
+        runs.schedule_state()
+        self.assertEqual(len(runs.info_calls), n)                                                 # 30 秒間は使い回す(15 秒ごとの更新で PowerShell を呼び過ぎない)
+        runs.scheduler.invalidate_info()
+        runs.schedule_state()
+        self.assertEqual(len(runs.info_calls), n + 1)
+
+    def test_run_info_failures_are_swallowed_and_never_leak_messages(self):
+        for bad in (RuntimeError(r"C:\secret\x password=pw123 host=secret-host"), "not json", json.dumps({"last": "2026-13-45", "next": "", "result": 0}),
+                    json.dumps({"last": "x", "next": "", "result": 0}), "[]"):
+            runs = self.runs_with(bad)
+            runs.schedule_register("11:51", 2)
+            s = runs.schedule_state()
+            self.assertEqual((s["info_available"], s["last_run"], s["next_run"], s["last_result"]), (False, None, None, None), msg=str(bad)[:30])
+            self.assertFalse(any(b in json.dumps(s, ensure_ascii=False) for b in ("secret", "pw123")))
+
+    def test_never_run_task_has_no_last_run_and_unregistered_task_is_not_queried(self):
+        runs = self.runs_with(info_json(last="", result=267011))
+        self.assertEqual(runs.schedule_state()["info_available"], False)                          # 未登録のときは Task Scheduler を読まない
+        self.assertEqual(runs.info_calls, [])
+        runs.schedule_register("11:51", 2)
+        s = runs.schedule_state()
+        self.assertEqual((s["last_run"], s["last_result"], s["last_result_label"]), (None, 267011, "まだ実行されていません"))
+
+    def test_info_runner_is_not_the_real_one_when_only_schtasks_is_mocked(self):
+        runs = self.make()                                                                         # info_runner 未指定・schtasks だけモック → 実機の情報は読まない
+        runs.schedule_register("11:51", 2)
+        self.assertEqual(runs.schedule_state()["info_available"], False)
+
+    def test_default_info_runner_is_read_only_and_restricted_to_the_dedicated_name(self):
+        from interim import taskinfo
+        seen = []
+
+        def fake_run(args, **kw):
+            seen.append(args)
+            return SimpleNamespace(returncode=0, stdout=info_json().encode("utf-8"), stderr=b"")
+        with mock.patch("interim.taskinfo.subprocess.run", side_effect=fake_run):
+            out = taskinfo.default_info_runner("SekisanNaviData_InterimOps")
+            for bad in ("SekisanNaviData_Ops", "SekisanNaviData_Interim'; Remove-Item x", "Other", "SekisanNaviData_Interim Ops"):
+                with self.assertRaises(ValueError, msg=bad):
+                    taskinfo.default_info_runner(bad)
+        self.assertEqual(json.loads(out)["result"], 1)
+        (args,) = seen
+        script = args[-1]
+        self.assertIn("Get-ScheduledTaskInfo -TaskName 'SekisanNaviData_InterimOps'", script)
+        for write_verb in ("Register-", "Unregister-", "Set-", "Start-", "Stop-", "Enable-", "Disable-", "Remove-", "New-", "schtasks", "/Run"):
+            self.assertNotIn(write_verb, script, write_verb)                                       # 読み取りだけ(タスクを変更・実行しない)
+
+    # ---- 状態の組み立て ----
+    def test_state_combines_task_info_and_the_latest_scheduled_history_without_secrets(self):
+        runs = self.runs_with(info_json())
+        runs.schedule_register("11:51", 2)
+        self.add_scheduled(runs, "失敗", f"完了 20 件・失敗 1 件・スキップ 3 件 — {PRODUCT}: {BOXSPEC_REASON}")
+        self.add_scheduled(runs, "完了", "", kind="手動")                                           # 手動は対象外
+        self.add_scheduled(runs, "完了", "ローカル設定とタスクの起動経路を確認しました", kind="定期(検証)")      # 検証用(--dry-run)は対象外
+        s = runs.schedule_state()
+        last = s["last_scheduled"]
+        self.assertEqual((last["status"], last["completed"], last["failed"], last["skipped"]), ("失敗", 20, 1, 3))
+        self.assertEqual(last["failure_kinds"][0]["count"], 1)
+        self.assertIsNotNone(last["started"])
+        blob = json.dumps(s, ensure_ascii=False)
+        for secret in (PRODUCT, str(self.repo), "boxspec がありません"):
+            self.assertNotIn(secret, blob, secret)                                                 # 製番・実パス・失敗理由の原文は出さない
+        self.assertTrue(any("前回の定期実行に失敗が含まれます(失敗 1 件)" in a for a in s["attention"]))
+
+    def test_no_scheduled_history_gives_none_and_duration_is_computed(self):
+        runs = self.runs_with(info_json())
+        runs.schedule_register("11:51", 2)
+        self.assertIsNone(runs.schedule_state()["last_scheduled"])
+        rid = runs.history.start("定期", "(全体)")
+        runs.history.finish(rid, "完了", "完了 3 件・スキップ 1 件")
+        last = runs.schedule_state()["last_scheduled"]
+        self.assertEqual((last["status"], last["completed"], last["failed"]), ("完了", 3, 0))
+        self.assertIsInstance(last["duration_minutes"], int)
+
+    # ---- 要確認(固定文言) ----
+    def attention(self, runs):
+        return runs.schedule_state()["attention"]
+
+    def test_attention_unregistered_and_disabled(self):
+        runs = self.runs_with(info_json())
+        self.assertEqual(self.attention(runs), ["専用タスクが登録されていません(自動実行されません)。"])
+        runs.schedule_register("11:51", 2)
+        self.task["enabled"] = False
+        self.assertTrue(any("専用タスクが無効です" in a for a in self.attention(runs)))
+        self.assertIsNone(runs.schedule_state()["last_scheduled"])
+
+    def test_attention_is_quiet_when_everything_is_healthy(self):
+        runs = self.runs_with(info_json(result=0), now=rn.datetime(2026, 10, 20, 9, 0))           # 次回まで 24 時間超: API・電源は促さない
+        runs.schedule_register("11:51", 2)
+        self.add_scheduled(runs, "完了", "完了 5 件・スキップ 1 件")
+        self.assertEqual(self.attention(runs), [])
+
+    def test_attention_nonzero_exit_code_without_a_failed_history_and_missed_runs(self):
+        runs = self.runs_with(info_json(result=2147942402, missed=2), now=rn.datetime(2026, 10, 20, 9, 0))
+        runs.schedule_register("11:51", 2)
+        a = " ".join(self.attention(runs))
+        self.assertIn("終了コード 2147942402", a)
+        self.assertIn("見逃した実行が 2 回", a)
+
+    def test_attention_stale_when_the_task_did_not_start_on_schedule(self):
+        runs = self.runs_with(info_json(last="2026-10-14T11:51:00", nxt="2026-10-22T11:51:00", result=0), now=rn.datetime(2026, 10, 20, 9, 0))
+        runs.schedule_register("11:51", 2)
+        self.assertTrue(any("予定どおりに起動していない可能性" in a for a in self.attention(runs)))
+        ok = self.runs_with(info_json(last="2026-10-19T11:51:00", result=0), now=rn.datetime(2026, 10, 20, 9, 0))
+        ok.schedule_register("11:51", 2)
+        self.assertFalse(any("予定どおり" in a for a in self.attention(ok)))
+
+    def test_attention_asks_for_api_and_ac_power_only_when_the_next_run_is_near(self):
+        near = self.runs_with(info_json(result=0, ac=False), now=rn.datetime(2026, 10, 21, 8, 0), api_ready=lambda: False)
+        near.schedule_register("11:51", 2)
+        a = " ".join(self.attention(near))
+        self.assertIn("推論 API を「準備完了」にしてください", a)
+        self.assertIn("バッテリー駆動", a)
+        self.assertNotIn("A1", a)
+        ready = self.runs_with(info_json(result=0, ac=True), now=rn.datetime(2026, 10, 21, 8, 0), api_ready=lambda: True)
+        ready.schedule_register("11:51", 2)
+        self.assertEqual(self.attention(ready), [])
+        boom = self.runs_with(info_json(result=0), now=rn.datetime(2026, 10, 21, 8, 0), api_ready=lambda: (_ for _ in ()).throw(RuntimeError("secret-host")))
+        boom.schedule_register("11:51", 2)
+        self.assertTrue(any("推論 API を" in a for a in self.attention(boom)))                      # 判定に失敗したら、未準備として促す(例外メッセージは出さない)
+
+    def test_attention_when_no_next_run_is_available(self):
+        runs = self.runs_with(info_json(nxt="", result=0))
+        runs.schedule_register("11:51", 2)
+        self.assertTrue(any("次回の実行予定を確認できません" in a for a in self.attention(runs)))
+
+    # ---- HTTP と画面 ----
+    def test_http_schedule_endpoint_returns_the_result_fields(self):
+        runs = self.runs_with(info_json())
+        runs.schedule_register("11:51", 2)
+        manager = mg.ApiManager(self.repo, settings_path=self.repo / "none.yaml", spawn=None)
+        server = srv.make_server(manager, 0, runs=runs)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{server.server_address[1]}/api/schedule", timeout=15) as res:
+            d = json.loads(res.read())
+        for key in ("last_run", "next_run", "last_result", "last_result_label", "missed_runs", "last_scheduled", "attention", "info_available"):
+            self.assertIn(key, d)
+        self.assertEqual((d["last_run"], d["next_run"]), ("2026-10-19 11:55", "2026-10-21 11:51"))
+        self.assertNotIn(str(self.repo), json.dumps(d, ensure_ascii=False))
+
+    def test_the_screen_has_the_result_panel_and_uses_text_nodes_only(self):
+        html = (ROOT / "interim" / "static" / "index.html").read_text(encoding="utf-8")
+        for element_id in ("schResult", "schAttention", "schLastRun", "schNextRun", "schLastBadge", "schLastMeta", "schLastCounts", "schLastKinds"):
+            self.assertIn(f'id="{element_id}"', html)
+        body = html.split("function renderScheduleResult")[1].split("async function refreshSchedule")[0]
+        self.assertNotIn("${", body)
+        for ln in body.splitlines():
+            if "innerHTML" in ln:
+                self.assertEqual(ln.split("innerHTML", 1)[1].strip(), '= "";', ln)                  # 空にするだけ。データを HTML として挿入しない
+        self.assertIn("textContent", body)
+
+
 if __name__ == "__main__":
     unittest.main()
