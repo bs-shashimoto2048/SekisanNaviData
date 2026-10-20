@@ -877,6 +877,44 @@ class ScheduleResultViewTest(Base):
         for write_verb in ("Register-", "Unregister-", "Set-", "Start-", "Stop-", "Enable-", "Disable-", "Remove-", "New-", "schtasks", "/Run"):
             self.assertNotIn(write_verb, script, write_verb)                                       # 読み取りだけ(タスクを変更・実行しない)
 
+    def test_task_name_validation_is_an_exact_match_and_rejects_before_any_read(self):
+        """専用名だけを完全一致で受け付ける。末尾の改行・前後の空白・改行を含む名前・通常タスク名などは、PowerShell を起動する前に拒否する。"""
+        from interim import taskinfo
+        self.assertEqual(taskinfo._TASK_NAME_OK.pattern, "SekisanNaviData_Interim[A-Za-z0-9_]*")        # `$` を使わない(末尾の改行を許さない)
+        ok = ["SekisanNaviData_InterimOps", "SekisanNaviData_Interim", "SekisanNaviData_InterimOps_verify", "SekisanNaviData_Interim2"]
+        bad = ["SekisanNaviData_Ops", "SekisanNaviData_InterimOps\n", "SekisanNaviData_InterimOps\r\n", "SekisanNaviData_InterimOps\r",
+               " SekisanNaviData_InterimOps", "SekisanNaviData_InterimOps ", "\nSekisanNaviData_InterimOps", "SekisanNaviData_InterimOps\t",
+               "SekisanNaviData_Interim\nOps", "SekisanNaviData_Interim Ops", "SekisanNaviData_InterimOps\x00", "", "   ", "\n",
+               "sekisannavidata_interimops", "SekisanNaviData_Interim'x", "SekisanNaviData_Interim;Ops", "SekisanNaviData_Interim.Ops",
+               "SekisanNaviData_Interim-Ops", "SekisanNaviData_Interim\u65e5\u672c", "SekisanNaviData_Interim\uff11", "Other_InterimOps",
+               "SekisanNaviData_InterimOps\\..\\SekisanNaviData_Ops", None, 123, b"SekisanNaviData_InterimOps", ["SekisanNaviData_InterimOps"]]
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout=info_json().encode("utf-8"), stderr=b"")
+        with mock.patch("interim.taskinfo.subprocess.run", side_effect=fake_run):
+            for name in ok:
+                self.assertEqual(json.loads(taskinfo.default_info_runner(name))["result"], 1, repr(name))
+            self.assertEqual(len(calls), len(ok))
+            n_before = len(calls)
+            for name in bad:
+                with self.assertRaises(ValueError, msg=repr(name)):
+                    taskinfo.default_info_runner(name)
+            self.assertEqual(len(calls), n_before)                                                     # 拒否した名前では、PowerShell を一度も起動していない
+        for name in ok:                                                                                  # 受け付けた名前は、そのまま(前後に何も付かず)スクリプトに入る
+            script = next(c for c in calls if f"'{name}'" in c[-1])[-1]
+            self.assertIn(f"Get-ScheduledTaskInfo -TaskName '{name}';", script)
+
+    def test_a_rejected_name_makes_the_screen_show_unavailable_without_error_details(self):
+        """名前が不正で読み取りを拒否されても、画面側は「取得できません」になるだけで、例外の詳細(名前を含む)は出ない。"""
+        from interim import taskinfo
+        with mock.patch("interim.taskinfo.subprocess.run", side_effect=AssertionError("PowerShell を起動してはいけない")):
+            sch = rn.InterimScheduler(r"C:\py\python.exe", "x.py", task_name="SekisanNaviData_InterimOps", runner=self.runner,
+                                      info_runner=taskinfo.default_info_runner)
+            sch.task_name = "SekisanNaviData_InterimOps\n"                                             # 万一、不正な名前が紛れ込んでも
+            self.assertIsNone(sch.run_info())                                                            # 読み取らず、None(取得できません)になる
+
     # ---- 状態の組み立て ----
     def test_state_combines_task_info_and_the_latest_scheduled_history_without_secrets(self):
         runs = self.runs_with(info_json())
