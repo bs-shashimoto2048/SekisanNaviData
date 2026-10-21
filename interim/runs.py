@@ -57,6 +57,7 @@ STALE_MARGIN = timedelta(hours=3)                         # 前回の起動か�
 SOON = timedelta(hours=24)                                # 次回の実行まで、この時間以内なら、API・電源の準備を促す
 _SUMMARY = re.compile(r"^完了 (\d+) 件(?:・失敗 (\d+) 件)?・スキップ (\d+) 件(?: — (.*))?$")
 _ITEM = re.compile(r"^[^:/]{1,40}: (.*)$")
+_STEP2_STAGE = re.compile(r"\[Step\.2\] (印刷\(PDF\)|DXF 変換|JPEG 変換|PNG 前処理)の成果物が不足")
 _EXC_TOKEN = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Failure))\b")
 _ISO = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$")
 
@@ -79,6 +80,9 @@ def format_last_result(code) -> str:
 def classify_failure(why: str) -> str:
     """失敗理由(履歴の文字列)を、固定のラベルに分類する。製番・パス・例外メッセージは返さない(返すのは固定文言か例外のクラス名だけ)。"""
     w = why or ""
+    m_stage = _STEP2_STAGE.search(w)
+    if m_stage:                                             # Step.2 の成果物の検査(印刷 PDF・DXF・JPEG・PNG のどの段階か。件数は履歴の理由で確認)
+        return f"Step.2 の成果物が不足({m_stage.group(1)})"
     if "boxspec" in w or "material.csv" in w:
         return "材料情報(*.boxspec)が無い・作れない(設計データ不足の可能性)"
     if "design.csv" in w:
