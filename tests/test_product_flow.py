@@ -271,8 +271,14 @@ class Step2Test(FlowBase):
         pages = [str(i) for i in range(10, 17)]
         ctx = self.plan_ctx(pages, [f"{p}.dwg" for p in pages])
         ctx.print_pages = pages
+        self.dir_product.mkdir()
+
+        def fake_script(chunk, *_a, **_k):          # 印刷の代わりに、印刷後に PDF ができている状態にする(印刷直後に成果物を検査するため)
+            for p in chunk:
+                (self.dir_product / f"{p}.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+            return "s.scr"
         with mock.patch.object(pf.cad_mod, "is_file_in_use", return_value=False), \
-                mock.patch.object(pf.print_support, "output_print_script", return_value="s.scr") as out, \
+                mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script) as out, \
                 mock.patch.object(pf.design_mod, "print_dwg_for_pdf") as prt, \
                 mock.patch.object(pf.cad_mod, "countdown"):
             self.assertIsNone(pf._print_drawings(ctx))

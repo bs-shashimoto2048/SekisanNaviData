@@ -12,12 +12,28 @@
 | 対象製番 | 当月 3 番出図済み製番を取得し、処理済みを除外 | `bs_pkg.host_mod` | **ホスト(DB)** |
 | 条件判定 | 整理番号あり・製番頭 2 文字・箱体型式・処理済みでないこと | `host_mod.get_property_data` | **ホスト** |
 | Step.1 | 設計フォルダの `.baninf` から盤情報 DF を作り CSV 出力。共通製作仕様書(`{整理番号}S0\1.dwg`)があれば PDF 化 | `cad_data_process`、`design_mod`、`print_support` | **設計サーバー(共有)**、IJCAD |
-| Step.2 | ページ選別(X/x 始まり除外)→ 全印刷対象を PDF 化 → 推論対象の DWG をコピー → DXF 変換 → PDF→JPEG→前処理 PNG | `cad_data_process`、`image_mod`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
+| Step.2 | ページ選別(X/x 始まり除外)→ 全印刷対象を PDF 化 → 推論対象の DWG をコピー → DXF 変換 → PDF→JPEG→前処理 PNG(**各段階の直後に成果物を検査する**。下の「Step.2 の成果物の検査」) | `cad_data_process`、`image_mod`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
 | Step.3 | DXF の図枠寸法と PNG の図枠寸法から縮尺を算出し、`product_df` に書き戻す | `cad_data_process`(`get_frame_size`、`specified_frame_detection`、`update_frame_info`) | なし |
 | Step.4 | 推論 API へ PNG を送り `*_detected.txt` を得る → CAD 座標へ変換して `detected_df.csv` | `image_mod.slice_prediction_request`、`estimate_code_processer.create_detected_csv` | **推論 API(本番はリモート、検証は loopback)** |
 | Step.5 | 積算コード集計: `estcode_df.csv` を作り、操作パネル・盤内トランスの数量を数える | `estimate_code_processer` | なし |
 
 失敗・スキップは製番単位で `results = {"completed", "failed", "skipped"}` に記録され、失敗があれば終了コード 1(`_cli`)。失敗した製番のフォルダは、出力ルート配下に限って削除される(`_safe_rmtree`)。
+
+### Step.2 の成果物の検査(Issue #20)
+印刷(IJCAD)・DXF 変換(ODA)・PDF→JPEG→PNG(`bs_pkg.image_mod`。例外を握りつぶして次のページへ進む)は、成果物ができなくても正常終了することがある。以前は、欠落が Step.3 で初めて `FileNotFoundError` になり、全ページの印刷・変換を終えてから、どの段階かも分からない形で失敗していた(2026-10-21 の定期実行)。
+そこで、各段階の直後(`pipeline/product_flow.py` の `check_stage_artifacts`)に、**期待する成果物が、あるか・空でないか・読めるか**を検査し、欠けていればその段階で製番を失敗にする(後続の変換・推論へ進まない。後始末は既存の `run_product` で、出力ルート配下の対象製番フォルダだけ)。
+
+| 段階(直後に検査) | 検査する成果物 | 不正の判定 |
+|---|---|---|
+| 印刷(5 枚ずつの塊ごと) | 印刷対象ページの `{ページ}.pdf`(PDF だけのページを含む) | 空、先頭が `%PDF-` でない。欠けているときだけ最大 20 秒、1 秒ごとに再確認(IJCAD の書き込み遅れ) |
+| DXF 変換 | 推論対象ページの `{ページ}{convert_aft}` | 空。欠けているときだけ最大 5 秒再確認 |
+| PDF→JPEG | 推論対象ページの `{ページ}.{image_mod の detect_conversion.extention}` | 空、画像として開けない |
+| JPEG→PNG | 推論対象ページの `{ページ}{original_draw}`(Step.3・推論が読む名前) | 空、画像として開けない |
+
+- 失敗理由は固定形式: `[Step.2] {段階}の成果物が不足しています: 対象 N 件中 M 件(欠落 a 件・空または不正 b 件)(未完了)`。製番・パス・例外メッセージ・設定値は含めない(ページ名はログにだけ残す)。暫定運用の画面では「Step.2 の成果物が不足({段階})」と分類される。
+- 出力の形式・既存のスキップ・正常処理は変えない(出力契約は変更なし)。欠落の**根本原因**(印刷・変換がなぜ欠けたか)の解消・自動再試行は、この検査の対象外。
+- **振る舞いの変化に注意**: 推論対象でない「PDF だけのページ」の PDF が欠けた製番も、**失敗**になる(出力契約の表のとおり、`{ページ}.pdf` は印刷対象の全ページ。以前は、PDF が欠けたまま「完了」になり得た)。失敗した製番は、次回の実行で毎回やり直される。
+- **後始末の確認**: 失敗の後始末(`ignore_errors=True` の静かな削除)のあとも製番フォルダが残った場合は、ログに警告を出す(IJCAD などがファイルを掴んだままだと削除しきれず、次回以降は「処理済み」として飛ばされるため。削除の挙動そのものは変えていない)。
 
 ### 設定
 - 本番は `app.local.yaml`(Git 管理外)。`app.yaml` はサンプルで、`<...>` が残ったままだと起動時にエラー。

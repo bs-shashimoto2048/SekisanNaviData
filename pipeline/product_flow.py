@@ -8,11 +8,13 @@
 #   モジュール属性を経由して呼ぶ。`from x import f` の形にしない。
 import os
 import shutil
+import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
+from PIL import Image
 from bs_pkg import config_loader, design_mod, host_mod, image_mod
 
 import cad_data_process as cad_mod        # CAD/設計データ・画像解析用
@@ -84,6 +86,82 @@ def safe_rmtree(target: str, allowed_root: str, **kwargs):
     shutil.rmtree(target, **kwargs)
 
 
+# ##############################################################################
+# Step.2 の成果物の検査(各段階の直後)
+# ##############################################################################
+# 印刷(IJCAD)・DXF 変換(ODA)・PDF→JPEG→PNG(bs_pkg.image_mod)は、成果物ができなくても例外にならないことがある
+# (image_mod は例外を握りつぶして次のページへ進む)。確認しないと、欠落は Step.3 で初めて FileNotFoundError になり、
+# 全ページの印刷・変換を終えてから、段階も分からない形で失敗する。そこで、各段階の直後に「期待する成果物が、あるか・空でないか・読めるか」を検査する。
+# 失敗理由は固定形式(段階名と件数だけ。製番・パス・例外メッセージ・設定値は含めない)。ページ名はログにだけ残す。
+STAGE_PRINT, STAGE_DXF, STAGE_JPEG, STAGE_PNG = "印刷(PDF)", "DXF 変換", "JPEG 変換", "PNG 前処理"
+ARTIFACT_GRACE_PRINT = 20      # 印刷は IJCAD が非同期に PDF を書き終えることがあるため、欠けているときだけ、最大この秒数(1 秒ごとに再確認)待つ
+ARTIFACT_GRACE_DXF = 5         # 変換ソフトの終了直後の書き込み遅れ用(同上)。画像変換は同じプロセス内で完了するので待たない
+_artifact_sleep = time.sleep   # テストが差し替える(実際には待たない)
+
+
+def _is_nonempty_file(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _is_valid_pdf(path: str) -> bool:
+    if not _is_nonempty_file(path):
+        return False
+    with open(path, "rb") as f:
+        return f.read(5) == b"%PDF-"
+
+
+def _is_valid_image(path: str) -> bool:
+    if not _is_nonempty_file(path):
+        return False
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001 - 読めない画像は不正として数える(理由に例外メッセージは出さない)
+        return False
+
+
+def _inspect_artifacts(dir_product: str, pages: List[str], name_of: Callable[[str], str], valid: Callable[[str], bool]) -> Tuple[List[str], List[str]]:
+    """(欠落したページ, 存在するが空・不正なページ) を返す。"""
+    missing, invalid = [], []
+    for page in pages:
+        path = os.path.join(dir_product, name_of(page))
+        if not os.path.isfile(path):
+            missing.append(page)
+        elif not valid(path):
+            invalid.append(page)
+    return missing, invalid
+
+
+def check_stage_artifacts(ctx: "ProductContext", stage: str, pages: List[str], name_of: Callable[[str], str], valid: Callable[[str], bool],
+                          grace: int = 0) -> Optional["ProductResult"]:
+    """段階の直後に、対象ページの成果物を検査する。すべて揃っていれば None(次の段階へ)。欠けていれば、その段階で製番を失敗にする
+    (後続の重い処理へ進まない。製番フォルダは run_product が出力ルート配下に限って後始末する)。"""
+    missing: List[str] = []
+    invalid: List[str] = []
+    for attempt in range(int(grace) + 1):
+        missing, invalid = _inspect_artifacts(ctx.dir_product, pages, name_of, valid)
+        if not missing and not invalid:
+            return None
+        if attempt < int(grace):
+            _artifact_sleep(1.0)
+    ctx.logger.warning(f" └> [{stage}] 成果物が不足しています(欠落: {missing} / 空または不正: {invalid})\n")
+    bad = len(missing) + len(invalid)
+    # 固定形式(「 / 」は使わない: 履歴は失敗した製番を「 / 」で連結するため、理由の中にあると画面の集計が分かれてしまう)
+    return ProductResult(FAILED, f"[Step.2] {stage}の成果物が不足しています: 対象 {len(pages)} 件中 {bad} 件"
+                                 f"(欠落 {len(missing)} 件・空または不正 {len(invalid)} 件)(未完了)", cleanup=True)
+
+
+def _jpeg_extension() -> str:
+    """PDF→JPEG の出力拡張子(bs_pkg.image_mod の設定 detect_conversion.extention。読めなければ既定の jpeg)。
+    image_mod は `{ページ}.{この値}` で書くので、同じ値を加工せずに使う(名前の食い違いで誤検出しない)。"""
+    try:
+        ext = (config_loader.load_yaml(image_mod.YAML_FILE_PATH).get("detect_conversion") or {}).get("extention") or "jpeg"
+    except Exception:  # noqa: BLE001
+        ext = "jpeg"
+    return str(ext)
+
+
 SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
 
 
@@ -105,6 +183,14 @@ def cleanup_after_exception(ctx: ProductContext):
             ctx.logger.error(f"Directory cleanup error: {del_error}")
 
 
+def _warn_if_folder_remains(ctx: ProductContext):
+    """後始末(ignore_errors=True の静かな削除)のあとも製番フォルダが残っていれば、ログに警告を出す(削除の挙動は変えない)。
+    IJCAD などがファイルを掴んだままだと削除しきれず、次回以降は check_product が「処理済み」として飛ばし続けるため、気づけるようにする。"""
+    if os.path.exists(ctx.dir_product):
+        ctx.logger.warning("後始末で製番フォルダを削除しきれませんでした(使用中のファイルが残っている可能性)。"
+                           f"このままだと次回以降は処理済みとして扱われます。確認が必要です: {ctx.dir_product}\n")
+
+
 def run_product(ctx: ProductContext, results: dict):
     """製番 1 件を処理し、結果の記録と後始末をここで行う。例外は製番の失敗として扱い、次の製番へ進めるようにする。"""
     logger = ctx.logger
@@ -112,6 +198,7 @@ def run_product(ctx: ProductContext, results: dict):
         result = process_product(ctx)
         if result.cleanup:
             safe_rmtree(ctx.dir_product, ctx.output_dir, ignore_errors=True)
+            _warn_if_folder_remains(ctx)
         record_result(results, ctx.product, result)
     except Exception as e:
         logger.error(f"Process Failed for product {ctx.product}: {e}\n")
@@ -274,8 +361,7 @@ def step2_inference_images(ctx: ProductContext) -> Optional[ProductResult]:
     result = _print_drawings(ctx)
     if result is not None:
         return result
-    _make_inference_images(ctx)
-    return None
+    return _make_inference_images(ctx)         # 成果物が欠けていれば、その段階の失敗(ProductResult)。揃っていれば None(Step.3 へ)
 
 
 def _select_pages(ctx: ProductContext) -> Optional[ProductResult]:
@@ -325,6 +411,10 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
         design_mod.print_dwg_for_pdf(product_script_win, len(chunk_5))
         logger.info(f" └> Page: {chunk_5}")
         cad_mod.countdown(len(chunk_5)*4)
+        # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む)。欠けていれば次の塊・後続へ進まない
+        result = check_stage_artifacts(ctx, STAGE_PRINT, chunk_5, lambda p: f"{p}.pdf", _is_valid_pdf, ARTIFACT_GRACE_PRINT)
+        if result is not None:
+            return result
     if exit_outer:
         logger.warning(f"図面使用中のため製番をスキップします: {ctx.product}")
         return ProductResult(SKIPPED, "図面使用中(未完了)", cleanup=True)
@@ -332,8 +422,9 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
     return None
 
 
-def _make_inference_images(ctx: ProductContext):
-    """推論対象ページだけ、DWG のコピー → DXF 変換(図枠寸法用) → 推論用の画像(JPEG → 前処理 PNG)を作る。"""
+def _make_inference_images(ctx: ProductContext) -> Optional[ProductResult]:
+    """推論対象ページだけ、DWG のコピー → DXF 変換(図枠寸法用) → 推論用の画像(JPEG → 前処理 PNG)を作る。
+    各段階の直後に、推論対象ページの成果物(DXF・JPEG・PNG)を検査し、欠けていればその段階で失敗にする。"""
     logger = ctx.logger
     logger.info(f"CAD図面(DWG)コピー:")
     logger.info(f" ※ ODAFileConverter 26.10.0 はディレクトリ単位でしか処理できない")
@@ -348,13 +439,28 @@ def _make_inference_images(ctx: ProductContext):
     logger.info(f" └> 変換元: {ctx.dwg_copy_dir}")
     logger.info(f" └> 変換先: {ctx.dir_product}")
     logger.info(f" └> 対象ページ: {ctx.baninf_pages}\n")
+    # DXF 変換の直後: 推論対象ページの <ページ><変換後拡張子>(Step.3 が図枠寸法を読む名前)。変換ソフトが終了コード 0 でも出力が無い場合を、ここで止める
+    result = check_stage_artifacts(ctx, STAGE_DXF, ctx.baninf_pages, lambda p: f"{p}{ctx.converted_extension}", _is_nonempty_file, ARTIFACT_GRACE_DXF)
+    if result is not None:
+        return result
 
     # PDF→JPEG→PNG変換
     logger.info(f"推論用画像作成: PDF -> JPEG(2481px X 1754px)\n")
     image_mod.pdf_to_images(ctx.dir_product, ctx.baninf_pages)
+    # JPEG 変換の直後: 推論対象ページの <ページ>.<image_mod の detect_conversion.extention>(image_mod は失敗を握りつぶすので、ここで確かめる)
+    jpeg_ext = _jpeg_extension()
+    result = check_stage_artifacts(ctx, STAGE_JPEG, ctx.baninf_pages, lambda p: f"{p}.{jpeg_ext}", _is_valid_image)
+    if result is not None:
+        return result
 
     logger.info(f"推論用画像前処理: JPEG -> PNG(Gaus,Bedian,Sharp,Bilateral,Binary,Crop)\n")
     image_mod.process_images_from_jpeg(ctx.dir_product, ctx.baninf_pages)
+    # PNG 前処理の直後: 推論対象ページの <ページ><original_draw>(Step.3・推論が読む名前)
+    png_ext = ctx.config_data["data_extension"]["original_draw"]
+    result = check_stage_artifacts(ctx, STAGE_PNG, ctx.baninf_pages, lambda p: f"{p}{png_ext}", _is_valid_image)
+    if result is not None:
+        return result
+    return None
 
 
 def step3_frame_scale(ctx: ProductContext) -> Optional[ProductResult]:

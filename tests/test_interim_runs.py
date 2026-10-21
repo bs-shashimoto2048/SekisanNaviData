@@ -808,6 +808,24 @@ class ScheduleResultViewTest(Base):
         ok = rn.summarize_run_reason("完了 5 件・スキップ 2 件", "完了")
         self.assertEqual((ok["completed"], ok["failed"], ok["skipped"], ok["failure_kinds"]), (5, 0, 2, []))
 
+    def test_step2_artifact_failures_get_a_fixed_label_per_stage_and_stay_anonymous(self):
+        """Step.2 の成果物の検査(Issue #20)の失敗は、段階ごとの固定ラベルになる。理由の中に「 / 」が無いので、連結された履歴でも分割されない。"""
+        reasons = {
+            "印刷(PDF)": "[Step.2] 印刷(PDF)の成果物が不足しています: 対象 5 件中 1 件(欠落 1 件・空または不正 0 件)(未完了)",
+            "DXF 変換": "[Step.2] DXF 変換の成果物が不足しています: 対象 3 件中 2 件(欠落 2 件・空または不正 0 件)(未完了)",
+            "JPEG 変換": "[Step.2] JPEG 変換の成果物が不足しています: 対象 3 件中 1 件(欠落 0 件・空または不正 1 件)(未完了)",
+            "PNG 前処理": "[Step.2] PNG 前処理の成果物が不足しています: 対象 3 件中 1 件(欠落 1 件・空または不正 0 件)(未完了)",
+        }
+        for stage, reason in reasons.items():
+            self.assertEqual(rn.classify_failure(reason), f"Step.2 の成果物が不足({stage})")
+            s = rn.summarize_run_reason(f"完了 4 件・失敗 2 件・スキップ 0 件 — {PRODUCT}: {reason} / A1X00002: {BOXSPEC_REASON}", "失敗")
+            kinds = {k["label"]: k["count"] for k in s["failure_kinds"]}
+            self.assertEqual(kinds[f"Step.2 の成果物が不足({stage})"], 1)
+            self.assertEqual(kinds["材料情報(*.boxspec)が無い・作れない(設計データ不足の可能性)"], 1)
+            self.assertEqual(s["unclassified_failed"], 0)
+            self.assertNotIn(PRODUCT, json.dumps(s, ensure_ascii=False))
+        self.assertEqual(rn.classify_failure("FileNotFoundError: x"), "例外(FileNotFoundError)")           # 従来の失敗は、従来どおりの分類
+
     def test_whole_run_failure_has_no_counts_and_a_fixed_label(self):
         s = rn.summarize_run_reason("推論 API を利用できないため、製番処理を開始しませんでした(接続できません)", "失敗")
         self.assertEqual((s["completed"], s["whole_run_failed"]), (None, True))
