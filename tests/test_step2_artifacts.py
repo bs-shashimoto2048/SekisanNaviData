@@ -302,6 +302,38 @@ class ReasonHygieneAndCleanupTest(Base):
                 p.stop()
         rmtree.assert_called_once_with(str(self.dir_product), ignore_errors=True)
         self.assertTrue(pf.is_under(str(self.dir_product), str(self.output_dir)))
+        # 削除しきれずにフォルダが残った(ここでは rmtree がモックで、削除されない)ときは、ログで警告する(次回以降「処理済み」扱いになるため)
+        warned = [str(c.args[0]) for c in self.logger.warning.call_args_list if "削除しきれませんでした" in str(c.args[0])]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("処理済みとして扱われます", warned[0])
+
+    def test_no_leftover_warning_when_the_cleanup_really_removed_the_folder(self):
+        self.skip["jpeg"] = {"10"}
+        results = {"completed": [], "failed": {}, "skipped": {}}
+        started = []
+        try:
+            for p in self.patches():
+                p.start()
+                started.append(p)
+            with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
+                    mock.patch.object(pf, "_select_pages", return_value=None):
+                pf.run_product(self.ctx(), results)                         # 実の削除(一時フォルダの中だけ)
+        finally:
+            for p in started:
+                p.stop()
+        self.assertFalse(self.dir_product.exists())
+        self.assertFalse(any("削除しきれませんでした" in str(c.args[0]) for c in self.logger.warning.call_args_list))
+
+
+class JpegExtensionTest(unittest.TestCase):
+    def test_uses_the_image_mod_setting_as_is_and_falls_back_to_jpeg(self):
+        for configured, expected in (({"detect_conversion": {"extention": "jpeg"}}, "jpeg"), ({"detect_conversion": {"extention": ".jpeg"}}, ".jpeg"),
+                                     ({"detect_conversion": {"extention": "JPG"}}, "JPG"), ({}, "jpeg"), ({"detect_conversion": {"extention": ""}}, "jpeg")):
+            with mock.patch.object(pf.config_loader, "load_yaml", return_value=configured):
+                self.assertEqual(pf._jpeg_extension(), expected, str(configured))      # image_mod が `{ページ}.{値}` で書く名前と同じ
+        with mock.patch.object(pf.config_loader, "load_yaml", side_effect=OSError("secret")):
+            self.assertEqual(pf._jpeg_extension(), "jpeg")                              # 読めなければ既定(例外は外へ出さない)
+        self.assertEqual(pf._jpeg_extension(), "jpeg")                                  # 実際の設定(bs_pkg の image_mod.yaml)
 
 
 if __name__ == "__main__":

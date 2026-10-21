@@ -153,12 +153,13 @@ def check_stage_artifacts(ctx: "ProductContext", stage: str, pages: List[str], n
 
 
 def _jpeg_extension() -> str:
-    """PDF→JPEG の出力拡張子(bs_pkg.image_mod の設定 detect_conversion.extention。読めなければ既定の jpeg)。"""
+    """PDF→JPEG の出力拡張子(bs_pkg.image_mod の設定 detect_conversion.extention。読めなければ既定の jpeg)。
+    image_mod は `{ページ}.{この値}` で書くので、同じ値を加工せずに使う(名前の食い違いで誤検出しない)。"""
     try:
         ext = (config_loader.load_yaml(image_mod.YAML_FILE_PATH).get("detect_conversion") or {}).get("extention") or "jpeg"
     except Exception:  # noqa: BLE001
         ext = "jpeg"
-    return str(ext).lstrip(".").lower()
+    return str(ext)
 
 
 SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
@@ -182,6 +183,14 @@ def cleanup_after_exception(ctx: ProductContext):
             ctx.logger.error(f"Directory cleanup error: {del_error}")
 
 
+def _warn_if_folder_remains(ctx: ProductContext):
+    """後始末(ignore_errors=True の静かな削除)のあとも製番フォルダが残っていれば、ログに警告を出す(削除の挙動は変えない)。
+    IJCAD などがファイルを掴んだままだと削除しきれず、次回以降は check_product が「処理済み」として飛ばし続けるため、気づけるようにする。"""
+    if os.path.exists(ctx.dir_product):
+        ctx.logger.warning("後始末で製番フォルダを削除しきれませんでした(使用中のファイルが残っている可能性)。"
+                           f"このままだと次回以降は処理済みとして扱われます。確認が必要です: {ctx.dir_product}\n")
+
+
 def run_product(ctx: ProductContext, results: dict):
     """製番 1 件を処理し、結果の記録と後始末をここで行う。例外は製番の失敗として扱い、次の製番へ進めるようにする。"""
     logger = ctx.logger
@@ -189,6 +198,7 @@ def run_product(ctx: ProductContext, results: dict):
         result = process_product(ctx)
         if result.cleanup:
             safe_rmtree(ctx.dir_product, ctx.output_dir, ignore_errors=True)
+            _warn_if_folder_remains(ctx)
         record_result(results, ctx.product, result)
     except Exception as e:
         logger.error(f"Process Failed for product {ctx.product}: {e}\n")
