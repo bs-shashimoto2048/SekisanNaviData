@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bs_pkg import image_mod  # noqa: E402
+import importlib  # noqa: E402
 from pipeline import product_flow as pf  # noqa: E402
+
+# cad_data 配下は窓口(cad_data_process)経由が原則のため、design.csv を作る補助だけ importlib で直接読む(構造テストの直 import 禁止ルールに合わせる)
+write_design_csv = importlib.import_module("cad_data.design_page_db").write_design_csv
 
 STEPS = ["check_product", "step1_design_data", "step2_inference_images", "step3_frame_scale",
          "step4_detect_objects", "step5_aggregate"]
@@ -234,11 +238,17 @@ class CheckProductTest(FlowBase):
 
 
 class Step2Test(FlowBase):
-    def plan_ctx(self, pages, files):
+    def plan_ctx(self, pages, files, design_ids=None, design_csv=True):
         d = self.tmp / "design"
         d.mkdir()
         for f in files:
             (d / f).write_bytes(b"x")
+        # 製番フォルダの design.csv(Step.1 が作る)。既定では、ページ名と図面名のすべてを「ページ番号」として載せる
+        self.dir_product.mkdir(exist_ok=True)
+        if design_csv:
+            ids = list(pages) + [Path(f).stem for f in files] if design_ids is None else design_ids
+            rows = [["", "S001", "A1BN0001", str(i), "", f"図名{i}"] + [""] * 18 for i in dict.fromkeys(str(x) for x in ids)]
+            write_design_csv(rows, self.dir_product)
         return self.ctx(product_df=pd.DataFrame({"PAGE": pages}), dir_design_product=str(d))
 
     def test_select_pages_ok_stores_plan(self):
@@ -256,6 +266,31 @@ class Step2Test(FlowBase):
         res = pf._select_pages(self.plan_ctx(["X1"], ["24.dwg"]))
         self.assertEqual(res, pf.ProductResult(pf.SKIPPED, "推論対象ページなし", cleanup=True))
 
+    def test_select_pages_applies_the_design_csv_page_id_condition(self):
+        # 6文字以内・先頭がX/xでない・design.csv にある図面だけを印刷し、推論・座標計算にも残さない(大文字小文字は区別せず、先頭ゼロは保持)
+        files = ["21.dwg", "ABCDEF.dwg", "ABCDEFG.dwg", "X1.dwg", "01.dwg", "1.dwg", "notlisted.dwg"]
+        ctx = self.plan_ctx(["21", "ABCDEFG", "X1", "01"], files, design_ids=["21", "abcdef", "ABCDEFG", "X1", "01"])
+        self.assertIsNone(pf._select_pages(ctx))
+        self.assertEqual(ctx.print_pages, ["01", "21", "ABCDEF"])
+        self.assertEqual(ctx.baninf_pages, ["01", "21"])
+        self.assertEqual(list(ctx.product_df["PAGE"]), ["21", "01"])
+        excluded = [str(c.args[0]) for c in self.logger.info.call_args_list if "excluded_pages" in str(c.args[0])]
+        self.assertTrue(excluded and "ABCDEFG" in excluded[0] and "notlisted" in excluded[0] and "'1'" in excluded[0])
+
+    def test_select_pages_fails_safely_when_design_csv_is_missing(self):
+        res = pf._select_pages(self.plan_ctx(["21"], ["21.dwg", "22.dwg"], design_csv=False))
+        self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
+        self.assertIn("design.csv", res.reason)
+
+    def test_select_pages_fails_safely_when_design_csv_is_unreadable_or_malformed(self):
+        for content in (b"\xff\xfe\x00broken", "blank,整理番号\r\n1,2\r\n".encode("cp932"), b""):
+            with self.subTest(content=content[:12]):
+                self.setUp()
+                ctx = self.plan_ctx(["21"], ["21.dwg"], design_csv=False)
+                (self.dir_product / "design.csv").write_bytes(content)
+                res = pf._select_pages(ctx)
+                self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
+                self.assertEqual((ctx.print_pages, ctx.baninf_pages), ([], []))   # 失敗時は何も対象にしない
     def test_print_in_use_skips_before_printing_that_chunk(self):
         ctx = self.plan_ctx(["21"], ["21.dwg", "22.dwg"])
         ctx.print_pages = ["21", "22"]
@@ -271,7 +306,7 @@ class Step2Test(FlowBase):
         pages = [str(i) for i in range(10, 17)]
         ctx = self.plan_ctx(pages, [f"{p}.dwg" for p in pages])
         ctx.print_pages = pages
-        self.dir_product.mkdir()
+        self.dir_product.mkdir(exist_ok=True)
 
         def fake_script(chunk, *_a, **_k):          # 印刷の代わりに、印刷後に PDF ができている状態にする(印刷直後に成果物を検査するため)
             for p in chunk:

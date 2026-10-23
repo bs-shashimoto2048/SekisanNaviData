@@ -115,6 +115,30 @@ def write_design_csv(rows: List[List[str]], product_dir) -> str:
     return dest
 
 
+def read_design_page_ids(design_csv_path) -> List[str]:
+    """作成済みの design.csv の「ページ番号」列を、行の順に返す(値は加工しない。空欄の行は空文字のまま)。
+
+    印刷対象を決める入力のため、安全側に倒す: ファイルが無い/読めない/CP932 でない/見出し行が想定と違う/
+    列が足りない行がある/データ行が 1 つも無い、のいずれでも DesignDataError(呼び出し側は製番の失敗にする)。"""
+    path = Path(design_csv_path)
+    try:
+        text = path.read_bytes().decode("cp932")
+    except (OSError, UnicodeDecodeError) as e:
+        raise DesignDataError(f"{path.name} を読み取れません({type(e).__name__})") from e
+    try:
+        rows = list(csv.reader(text.splitlines()))
+    except csv.Error as e:
+        raise DesignDataError(f"{path.name} の形式が不正です({type(e).__name__})") from e
+    if not rows or rows[0] != DESIGN_COLUMNS:
+        raise DesignDataError(f"{path.name} の見出し行が想定と異なります")
+    body = [r for r in rows[1:] if r]  # 完全な空行だけは読み飛ばす
+    if not body:
+        raise DesignDataError(f"{path.name} にデータ行がありません")
+    if any(len(r) != LINE_COUNT for r in body):
+        raise DesignDataError(f"{path.name} に列数の異なる行があります")
+    return [r[PAGE_COLUMN_INDEX] for r in body]
+
+
 def export_design_csv(design_dir, product_dir, log=None) -> str:
     """設計製番フォルダの .db から design.csv を作り、作ったパスを返す。作れないときは DesignDataError。"""
     log = log or logger

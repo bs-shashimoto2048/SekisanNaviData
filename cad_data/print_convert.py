@@ -174,11 +174,32 @@ def is_excluded_page(name) -> bool:
     """図面名(ページ名。拡張子の有無は問わない)の先頭が X/x なら True。Windows のファイル名は大文字小文字を区別しないため両方を除外する。"""
     return Path(str(name)).stem.lower().startswith(EXCLUDED_PAGE_PREFIX)
 
-def list_print_pages(directory: str, file_ext: str = ".dwg") -> List[str]:
-    """設計製番フォルダ直下の図面(file_ext)のうち、X/x 始まりを除く全ページ名(拡張子なし)を、従来のページ並び(文字列の昇順)で返す。
+PRINT_PAGE_ID_MAX_LENGTH = 6  # design.csv の「ページ番号」がこの文字数を超える図面は印刷対象にしない
 
+def is_printable_page_id(page_id) -> bool:
+    """design.csv の「ページ番号」が印刷対象の条件を満たすか。
+    条件: 前後の空白を除いて空でなく、6 文字以内で、先頭が X/x でないこと(先頭ゼロなど文字列の中身は加工しない)。"""
+    s = str(page_id).strip()
+    return s != "" and len(s) <= PRINT_PAGE_ID_MAX_LENGTH and not s.casefold().startswith(EXCLUDED_PAGE_PREFIX)
+
+def printable_page_keys(design_page_ids) -> frozenset:
+    """design.csv の「ページ番号」の一覧から、印刷対象の条件を満たすものの照合キー(前後の空白を除き、大文字小文字を区別しない形)を返す。
+    先頭ゼロは保持する(`01` と `1` は別のページ)。"""
+    return frozenset(str(p).strip().casefold() for p in design_page_ids if is_printable_page_id(p))
+
+def page_key(name) -> str:
+    """ページ名(図面名・.baninf の PAGE。拡張子は付けない)を、printable_page_keys と照合するためのキーにする。"""
+    return str(name).strip().casefold()
+
+def list_print_pages(directory: str, file_ext: str, design_page_ids) -> List[str]:
+    """設計製番フォルダ直下の図面(file_ext)のうち、design.csv の「ページ番号」が印刷対象の条件を満たすものに対応する
+    ページ名(拡張子なし。図面ファイル名の綴りのまま)を、従来のページ並び(文字列の昇順)で返す。
+
+    design.csv に無い図面、ページ番号が 7 文字以上の図面、X/x 始まりの図面は印刷しない。照合は大文字小文字を区別しない。
+    `design_page_ids` は必須(読み取れない場合に、条件なしで全図面を印刷してしまわないため)。
     出力 PDF 名は従来どおり `{ページ名}.pdf`。ファイルを開かず、一覧だけを読む。
     """
     ext = file_ext.lower()
+    allowed = printable_page_keys(design_page_ids)
     pages = {p.stem for p in Path(directory).iterdir() if p.is_file() and p.suffix.lower() == ext}
-    return sorted(p for p in pages if not is_excluded_page(p))
+    return sorted(p for p in pages if page_key(p) in allowed)
