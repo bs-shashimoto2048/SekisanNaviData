@@ -336,5 +336,51 @@ class PipelineWithDbTest(MainIntegrationBase):
         self.assertEqual({p: p.read_bytes() for p in self.design_product.glob("*.db")}, before)
 
 
+class ReadPageIdsTest(DbBase):
+    """印刷対象を決める入力(design.csv の「ページ番号」)の読み取り。安全側に倒す: 読めない・形式が違うときは DesignDataError。"""
+
+    def make(self, *pages):
+        for p in pages:
+            self.db(f"{p}.db", page=p)
+        return dp.export_design_csv(self.design, self.out)
+
+    def test_returns_page_numbers_in_row_order_without_changing_the_values(self):
+        path = self.make("1", "01", "mb011", "屋外キュービクル", "X1")
+        ids = dp.read_design_page_ids(path)
+        self.assertEqual(sorted(ids), sorted(["1", "01", "mb011", "屋外キュービクル", "X1"]))
+        self.assertEqual(ids[:2], ["1", "01"])      # design.csv の並び(0,1,2,3,01,02,03 が先頭)のまま
+
+    def test_empty_page_number_is_returned_as_empty_string(self):
+        self.db("a.db", page="")
+        self.db("1.db", page="1")
+        ids = dp.read_design_page_ids(dp.export_design_csv(self.design, self.out))
+        self.assertEqual(sorted(ids), ["", "1"])
+
+    def test_missing_file_is_an_error(self):
+        with self.assertRaises(dp.DesignDataError):
+            dp.read_design_page_ids(self.out / "design.csv")
+
+    def test_not_cp932_is_an_error(self):
+        p = self.out / "design.csv"
+        p.write_bytes(b"\x81\x20\x81\x20")
+        with self.assertRaises(dp.DesignDataError):
+            dp.read_design_page_ids(p)
+
+    def test_wrong_header_or_empty_or_header_only_is_an_error(self):
+        p = self.out / "design.csv"
+        header = ",".join(dp.DESIGN_COLUMNS)
+        for content in ("", "blank,整理番号\r\n1,2\r\n", header + "\r\n", header + "\r\n\r\n"):
+            with self.subTest(content=content[:20]):
+                p.write_bytes(content.encode("cp932"))
+                with self.assertRaises(dp.DesignDataError):
+                    dp.read_design_page_ids(p)
+
+    def test_row_with_missing_columns_is_an_error(self):
+        p = self.out / "design.csv"
+        p.write_bytes((",".join(dp.DESIGN_COLUMNS) + "\r\n" + ",1,A1X,21\r\n").encode("cp932"))
+        with self.assertRaises(dp.DesignDataError):
+            dp.read_design_page_ids(p)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -368,14 +368,22 @@ def _select_pages(ctx: ProductContext) -> Optional[ProductResult]:
     """印刷対象と推論対象を決める(選別そのものは pipeline.page_plan)。推論できない製番はここで終わる。"""
     logger = ctx.logger
     logger.info(f"対象ページ取得:")
-    # X/x 始まりの図面は、印刷・画像化・推論・データ作成のいずれにも入れない。選別は pipeline.page_plan
-    plan = page_plan_mod.build_page_plan(ctx.product_df, ctx.dir_design_product, ctx.converter_extension)
+    # 印刷対象は design.csv の「ページ番号」が6文字以内で先頭がX/x でない図面だけ。条件外の図面は、印刷・画像化・推論・データ作成の
+    # いずれにも入れない。design.csv を読み取れないときは、条件なしで全図面を印刷してしまわないよう、製番を失敗にする。選別は pipeline.page_plan
+    design_csv = os.path.join(ctx.dir_product, cad_mod.DESIGN_CSV_NAME)
+    try:
+        design_page_ids = cad_mod.read_design_page_ids(design_csv)
+    except cad_mod.DesignDataError as e:
+        logger.error(f"design.csv を読み取れないため、印刷対象を決められません。製番 {ctx.product} を失敗とします: {e}\n")
+        return ProductResult(FAILED, f"design.csv を読み取れません(印刷対象を決められません): {e}", cleanup=True)
+    plan = page_plan_mod.build_page_plan(ctx.product_df, ctx.dir_design_product, ctx.converter_extension, design_page_ids)
     ctx.product_df = plan.product_df
     ctx.baninf_pages = plan.inference_pages
     ctx.print_pages = plan.print_pages
-    logger.info(f" └> 推論対象ページ(従来の選び方、X始まりを除く): baninf_pages = {ctx.baninf_pages}")
+    logger.info(f" └> 推論対象ページ(印刷対象の条件を満たすもの): baninf_pages = {ctx.baninf_pages}")
 
-    # 印刷対象: 設計製番フォルダの図面のうちX/x始まりを除く全ページ。推論対象以外はPDF印刷だけ行う
+    # 印刷対象: 設計製番フォルダの図面のうち、design.csv のページ番号が6文字以内で先頭がX/x でないもの。推論対象以外はPDF印刷だけ行う
+    logger.info(f" └> 条件外のため印刷・推論に入れないページ({len(plan.excluded_pages)}件): excluded_pages = {plan.excluded_pages}")
     logger.info(f" └> 印刷対象ページ({len(plan.print_pages)}件): print_pages = {plan.print_pages}")
     logger.info(f" └> PDF印刷のみのページ({len(plan.pdf_only_pages)}件): pdf_only_pages = {plan.pdf_only_pages}\n")
     if plan.status == page_plan_mod.OK:

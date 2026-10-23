@@ -12,7 +12,7 @@
 | 対象製番 | 当月 3 番出図済み製番を取得し、処理済みを除外 | `bs_pkg.host_mod` | **ホスト(DB)** |
 | 条件判定 | 整理番号あり・製番頭 2 文字・箱体型式・処理済みでないこと | `host_mod.get_property_data` | **ホスト** |
 | Step.1 | 設計フォルダの `.baninf` から盤情報 DF を作り CSV 出力。共通製作仕様書(`{整理番号}S0\1.dwg`)があれば PDF 化 | `cad_data_process`、`design_mod`、`print_support` | **設計サーバー(共有)**、IJCAD |
-| Step.2 | ページ選別(X/x 始まり除外)→ 全印刷対象を PDF 化 → 推論対象の DWG をコピー → DXF 変換 → PDF→JPEG→前処理 PNG(**各段階の直後に成果物を検査する**。下の「Step.2 の成果物の検査」) | `cad_data_process`、`image_mod`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
+| Step.2 | ページ選別(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないものだけ。読めなければ失敗)→ 全印刷対象を PDF 化 → 推論対象の DWG をコピー → DXF 変換 → PDF→JPEG→前処理 PNG(**各段階の直後に成果物を検査する**。下の「Step.2 の成果物の検査」) | `cad_data_process`、`image_mod`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
 | Step.3 | DXF の図枠寸法と PNG の図枠寸法から縮尺を算出し、`product_df` に書き戻す | `cad_data_process`(`get_frame_size`、`specified_frame_detection`、`update_frame_info`) | なし |
 | Step.4 | 推論 API へ PNG を送り `*_detected.txt` を得る → CAD 座標へ変換して `detected_df.csv` | `image_mod.slice_prediction_request`、`estimate_code_processer.create_detected_csv` | **推論 API(本番はリモート、検証は loopback)** |
 | Step.5 | 積算コード集計: `estcode_df.csv` を作り、操作パネル・盤内トランスの数量を数える | `estimate_code_processer` | なし |
@@ -52,7 +52,7 @@
 | `estcode_df.csv` | 盤ごとの積算コード数量。28 列。CP932 |
 | `design.csv` | 設計製番フォルダ直下の `.db`(ページ情報。ファイル名は問わない。ただし Windows の画像キャッシュ `Thumbs.db` だけは除く)から作る、製番単位の設計情報(1 `.db` = 1 行)。24 列(見出しは `blank, 整理番号, 製番, ページ番号, blank, 図名, 図面尺度１, 図面尺度２, 承認設計, 年, 月, 日, 承認照査, 年, 月, 日, 製作設計, 年, 月, 日, 製作照査, 年, 月, 日`。`blank` と重複する年・月・日はそのまま)。**CP932・BOM なし**。`.db` が無い・読めない製番は**失敗**(Step.1 で止まる)。詳細は下の「design.csv」 |
 | `material.csv` | 設計フォルダの `*.boxspec` から作る材料一覧(ページ × 材料シンボル × 構成部)。7 列 `PAGE, SOURCE_FILE, SYMBOL_NAME, CABTYPE, COMPONENT_CODE, COMPONENT_NAME, MATERIAL_SPEC`。**CP932・BOM なし**。`.boxspec` が無い、または解析に失敗した製番は**失敗**(Step.1 で止まり、`material.csv` は作られない)。詳細は下の「material.csv」 |
-| `{ページ}.pdf` | 印刷対象の全ページ(X/x 始まりを除く)。A3・用紙中央(`docs/print_spec.md`) |
+| `{ページ}.pdf` | 印刷対象の全ページ(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないもの)。A3・用紙中央(`docs/print_spec.md`) |
 | `{ページ}.jpeg` / `.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
 | `dwg/{ページ}.dwg` | 推論対象ページの DWG コピー |
 | `共通製作仕様書.pdf` | 共通製作仕様書があるときだけ |

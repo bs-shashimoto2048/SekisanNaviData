@@ -36,20 +36,50 @@ class ListPrintPagesTest(unittest.TestCase):
         for n in names:
             (self.dir / n).write_bytes(b"dummy")
 
+    ALL = ["3A", "21", "100", "22", "X1", "x2", "Xtra", "0"]   # design.csv の「ページ番号」(既定)
+
     def test_all_pages_except_x_in_string_order(self):
         self.touch("3A.dwg", "21.dwg", "100.DWG", "22.dwg", "X1.dwg", "x2.dwg", "Xtra.DWG", "0.dwg")
-        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg"), ["0", "100", "21", "22", "3A"])  # 文字列の昇順(従来のページ並び)
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", self.ALL), ["0", "100", "21", "22", "3A"])  # 文字列の昇順(従来のページ並び)
 
     def test_non_dwg_and_subdirectories_are_ignored(self):
         self.touch("21.dwg", "21.baninf", "22.bak", "readme.txt")
         (self.dir / "sub.dwg").mkdir()
         (self.dir / "dwg").mkdir()
-        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg"), ["21"])
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", ["21", "22", "sub", "readme"]), ["21"])
 
     def test_zero_targets(self):
-        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg"), [])
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", self.ALL), [])
         self.touch("X1.dwg", "x2.DWG")
-        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg"), [])
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", self.ALL), [])
+
+    def test_only_drawings_whose_design_csv_page_id_qualifies_are_printed(self):
+        self.touch("21.dwg", "22.dwg", "ABCDEF.dwg", "ABCDEFG.dwg", "X5.dwg", "orphan.dwg")
+        ids = ["21", "ABCDEF", "ABCDEFG", "X5", "屋外キュービクル"]       # 22 と orphan は design.csv に無い
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", ids), ["21", "ABCDEF"])
+
+    def test_matching_is_case_insensitive_and_keeps_leading_zeros(self):
+        self.touch("Mk01.dwg", "01.dwg", "1.dwg")
+        self.assertEqual(cad.list_print_pages(str(self.dir), ".dwg", ["mk01", "01"]), ["01", "Mk01"])
+
+    def test_page_ids_are_required(self):
+        with self.assertRaises(TypeError):
+            cad.list_print_pages(str(self.dir), ".dwg")   # type: ignore[call-arg]
+
+
+class PrintablePageIdTest(unittest.TestCase):
+    def test_six_characters_or_fewer_and_not_x_prefixed_are_printable(self):
+        for pid in ("0", "01", "21", "3A", "ABCDEF", "mb011", "あいうえおか", " 21 "):
+            self.assertTrue(cad.is_printable_page_id(pid), pid)
+
+    def test_seven_or_more_characters_empty_or_x_prefixed_are_not(self):
+        for pid in ("ABCDEFG", "屋外キュービクル", "", "  ", "X1", "x1", "xx01", "Xtra", "x", "X"):
+            self.assertFalse(cad.is_printable_page_id(pid), pid)
+
+    def test_keys_ignore_case_and_whitespace_but_keep_leading_zeros(self):
+        keys = cad.printable_page_keys(["Mk01", " 01 ", "1", "X1", "TOOLONGNAME"])
+        self.assertEqual(keys, frozenset({"mk01", "01", "1"}))
+        self.assertEqual(cad.page_key(" Mk01 "), "mk01")
 
 
 class PrintScriptTest(unittest.TestCase):

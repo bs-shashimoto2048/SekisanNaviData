@@ -144,7 +144,7 @@ class MainIntegrationBase(unittest.TestCase):
         for page in PDF_ONLY_PAGES + EXCLUDED_PAGES:  # .baninf の無い図面(拡張子の大文字小文字は問わない)
             (self.design_product / f"{page}.DWG").write_bytes(b"dummy-dwg-" + page.encode())
         if self.with_page_db:
-            for page in _BANINF:
+            for page in list(_BANINF) + PDF_ONLY_PAGES + EXCLUDED_PAGES:   # 印刷対象の判定は design.csv の「ページ番号」で行うため、すべての図面に .db を置く
                 write_page_db(self.design_product, f"{page}.db", page_db_lines(page))
         if self.boxspec_lines is not None:
             write_page_db(self.design_product, "301.boxspec", self.boxspec_lines)   # CP932・CRLF で書く(内容は .boxspec の行)
@@ -439,6 +439,46 @@ class MainPrintTargetsTest(MainIntegrationBase):
         self.assertEqual(self.api_calls, [])
         self.assertEqual(self.convert_calls, [])
 
+    def _add_drawing(self, name, with_db=True, db_page=None):
+        (self.design_product / f"{name}.DWG").write_bytes(b"dummy-dwg-" + name.encode())
+        if with_db:
+            write_page_db(self.design_product, f"{name}.db", page_db_lines(db_page if db_page is not None else name))
+        self.design_hash = {p: _sha(p) for p in self.design_product.rglob("*") if p.is_file()}
+
+    def test_only_drawings_with_a_qualifying_design_csv_page_number_are_printed(self):
+        # 6文字ちょうどは対象、7文字以上・design.csv に無いもの・X/x始まりは、印刷もPDFも作らない
+        self._add_drawing("ABCDEF")
+        self._add_drawing("ABCDEFG")
+        self._add_drawing("屋外キュービクル")
+        self._add_drawing("NODB", with_db=False)
+        self.run_main()
+        printed = sorted(p for call in self.print_script_calls for p in call[0])   # 5枚ずつの塊をすべて連結
+        self.assertEqual(printed, sorted(PRINT_PAGES + ["ABCDEF"]))
+        for name in ("ABCDEFG", "屋外キュービクル", "NODB", "X1", "x2", "Xtra"):
+            self.assertNotIn(name, printed)
+        self.assertEqual(self.api_calls[0][1], PAGES)                         # 推論対象は従来どおり
+        self.assertFalse([f for f in self.product_out.glob("*") if f.stem in ("ABCDEFG", "屋外キュービクル", "NODB")])
+
+    def test_matching_with_design_csv_ignores_case_and_keeps_leading_zeros(self):
+        self._add_drawing("Mk01", db_page="mK01")      # 大文字小文字が違っても照合できる
+        self._add_drawing("01")                       # design.csv の 01 とだけ照合する
+        (self.design_product / "1.DWG").write_bytes(b"dummy-dwg-1")   # design.csv に「1」は無い(先頭ゼロの 01 とは別のページ)
+        self.design_hash = {p: _sha(p) for p in self.design_product.rglob("*") if p.is_file()}
+        self.run_main()
+        printed = sorted(p for call in self.print_script_calls for p in call[0])   # 5枚ずつの塊をすべて連結
+        self.assertIn("Mk01", printed)
+        self.assertIn("01", printed)
+        self.assertNotIn("1", printed)
+
+    def test_unreadable_design_csv_fails_the_product_without_printing(self):
+        # design.csv を読み取れないときは、条件なしで全図面を印刷せず、製番を失敗にして後片付けする
+        with mock.patch.object(app.cad_mod, "read_design_page_ids", side_effect=app.cad_mod.DesignDataError("読み取れません")):
+            self.run_main()
+        self.assert_no_external_calls()
+        self.assertEqual(self.print_script_calls, [])
+        self.assertEqual(self.api_calls, [])
+        self.assertEqual(self.convert_calls, [])
+        self.assertEqual([Path(c.args[0]).resolve() for c in self.rmtree.call_args_list], [self.product_out])
     def test_x_prefixed_baninf_is_never_an_inference_page(self):
         # X始まりの .baninf があっても推論対象に入らない(既存の読込規則 + 防御的な除外)
         lines = "|".join(f"{k}${v}" for k, v in _BANINF["21"][0].items())

@@ -71,9 +71,9 @@ class OutputContractTest(MainIntegrationBase):
             self.assertEqual(rows[0], header, name)
             self.assertGreater(len(rows), 1, name)
             self.assertTrue(all(len(r) == len(header) for r in rows), name)
-        # design.csv は設計製番フォルダの .db(.baninf のあるページ分)と 1 対 1
+        # design.csv は設計製番フォルダの .db(すべての図面のページ番号)と 1 対 1。印刷・推論の対象は、この「ページ番号」で決まる
         self.assertEqual(len(list(csv.reader(io.StringIO((self.out / "design.csv").read_bytes().decode("cp932"), newline="")))) - 1,
-                         len(PAGES))
+                         len(list(self.design_product.glob("*.db"))))
 
     def test_csv_are_cp932_without_bom(self):
         # SekisanNavi は CP932 で読む。BOM なし。UTF-8 としては読めない日本語を含むファイルがあること自体が契約。
