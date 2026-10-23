@@ -168,6 +168,9 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
             # 処理済み製番を除外
             logger.info("製番(3番出図済み)リスト作成:処理済み製番削除")
             product_list = host_mod.get_missing_folders(output_dir, n3_list)
+            # 失敗後の後始末で削除しきれなかった製番フォルダは、専用マーカーがある場合だけ
+            # 未処理一覧へ戻す。従来の成功済みフォルダ(マーカーなし)は再処理しない。
+            product_list = product_flow.include_incomplete_products(output_dir, n3_list, product_list)
             logger.info(f" └> Total: {len(product_list)}, {product_list = }\n")
 
         else:

@@ -7,7 +7,9 @@
 # - 外部モジュール(cad_data_process・bs_pkg の各 *_mod・print_support など)は、テストが mock.patch.object で差し替える
 #   モジュール属性を経由して呼ぶ。`from x import f` の形にしない。
 import os
+import hashlib
 import shutil
+import stat
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -84,6 +86,65 @@ def safe_rmtree(target: str, allowed_root: str, **kwargs):
     if not is_under(target, allowed_root):
         raise RuntimeError(f"削除対象が出力ルート配下ではないため削除しません: {target}")
     shutil.rmtree(target, **kwargs)
+
+
+_INCOMPLETE_MARKER_PREFIX = ".sekisan-incomplete-"
+_INCOMPLETE_MARKER_SUFFIX = ".marker"
+
+
+def incomplete_marker_path(output_dir: str, product: str) -> str:
+    """製番名をファイル名へ露出させず、出力ルート直下の再処理マーカー位置を返す。"""
+    if not isinstance(product, str):
+        raise TypeError("製番マーカーの識別子が不正です")
+    digest = hashlib.sha256(product.encode("utf-8")).hexdigest()
+    return os.path.join(output_dir, f"{_INCOMPLETE_MARKER_PREFIX}{digest}{_INCOMPLETE_MARKER_SUFFIX}")
+
+
+def has_incomplete_marker(output_dir: str, product: str) -> bool:
+    """再処理マーカーがあるか。リンクは信頼せず失敗させる。"""
+    marker = incomplete_marker_path(output_dir, product)
+    if not os.path.lexists(marker):
+        return False
+    try:
+        info = os.lstat(marker)
+        if not stat.S_ISREG(info.st_mode) or os.path.islink(marker):
+            raise RuntimeError("再処理マーカーが通常ファイルではありません")
+        return True
+    except OSError as exc:
+        raise RuntimeError("再処理マーカーを確認できません") from exc
+
+
+def mark_incomplete(output_dir: str, product: str):
+    """処理開始を原子的に記録する。既存の有効マーカーは保持する。"""
+    marker = incomplete_marker_path(output_dir, product)
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if not has_incomplete_marker(output_dir, product):
+            raise RuntimeError("再処理マーカーが不正です")
+        return
+    os.close(fd)  # 空ファイルの原子的作成をマーカーとして使う
+
+
+def clear_incomplete_marker(output_dir: str, product: str):
+    """通常ファイルであることを確認してから再処理マーカーを消す。"""
+    marker = incomplete_marker_path(output_dir, product)
+    if not os.path.lexists(marker):
+        return
+    if not has_incomplete_marker(output_dir, product):
+        raise RuntimeError("再処理マーカーが不正です")
+    os.unlink(marker)
+
+
+def include_incomplete_products(output_dir: str, candidates: List[str], missing: List[str]) -> List[str]:
+    """通常の未処理一覧に、出力フォルダが残った再処理対象だけを順序を保って加える。"""
+    result = list(missing)
+    included = set(result)
+    for product in candidates:
+        if product not in included and has_incomplete_marker(output_dir, product):
+            result.append(product)
+            included.add(product)
+    return result
 
 
 # ##############################################################################
@@ -181,14 +242,18 @@ def cleanup_after_exception(ctx: ProductContext):
             ctx.logger.info(f"Directory removed due to product error: {ctx.dir_product}")
         except Exception as del_error:
             ctx.logger.error(f"Directory cleanup error: {del_error}")
+    if not os.path.exists(ctx.dir_product):
+        try:
+            clear_incomplete_marker(ctx.output_dir, ctx.product)
+        except Exception as marker_error:
+            ctx.logger.error(f"再処理マーカーを解除できませんでした: {type(marker_error).__name__}")
 
 
 def _warn_if_folder_remains(ctx: ProductContext):
-    """後始末(ignore_errors=True の静かな削除)のあとも製番フォルダが残っていれば、ログに警告を出す(削除の挙動は変えない)。
-    IJCAD などがファイルを掴んだままだと削除しきれず、次回以降は check_product が「処理済み」として飛ばし続けるため、気づけるようにする。"""
+    """後始末(ignore_errors=True の静かな削除)のあとも製番フォルダが残っていれば警告する。マーカーにより次回は再処理対象になる。"""
     if os.path.exists(ctx.dir_product):
         ctx.logger.warning("後始末で製番フォルダを削除しきれませんでした(使用中のファイルが残っている可能性)。"
-                           f"このままだと次回以降は処理済みとして扱われます。確認が必要です: {ctx.dir_product}\n")
+                           f"再処理マーカーを保持し、次回の全件実行で再試行します: {ctx.dir_product}\n")
 
 
 def run_product(ctx: ProductContext, results: dict):
@@ -196,9 +261,20 @@ def run_product(ctx: ProductContext, results: dict):
     logger = ctx.logger
     try:
         result = process_product(ctx)
+        if result.status == COMPLETED:
+            try:
+                clear_incomplete_marker(ctx.output_dir, ctx.product)
+            except Exception as marker_error:
+                logger.error(f"再処理マーカーを解除できませんでした: {type(marker_error).__name__}")
+                result = ProductResult(FAILED, "完了状態を記録できません(未完了)", cleanup=True)
         if result.cleanup:
             safe_rmtree(ctx.dir_product, ctx.output_dir, ignore_errors=True)
             _warn_if_folder_remains(ctx)
+            if not os.path.exists(ctx.dir_product):
+                try:
+                    clear_incomplete_marker(ctx.output_dir, ctx.product)
+                except Exception as marker_error:
+                    logger.error(f"再処理マーカーを解除できませんでした: {type(marker_error).__name__}")
         record_result(results, ctx.product, result)
     except Exception as e:
         logger.error(f"Process Failed for product {ctx.product}: {e}\n")
@@ -260,6 +336,14 @@ def check_product(ctx: ProductContext) -> Optional[ProductResult]:
 
     logger.info(f" └> OK!\n")
     logger.info(f"***Check*** 作業済み")
+    incomplete = has_incomplete_marker(ctx.output_dir, product)
+    if incomplete and os.path.exists(ctx.dir_product):
+        try:
+            safe_rmtree(ctx.dir_product, ctx.output_dir)
+        except Exception:
+            return ProductResult(FAILED, "前回の未完了フォルダを片付けられません(再処理待ち)")
+        if os.path.exists(ctx.dir_product):
+            return ProductResult(FAILED, "前回の未完了フォルダを片付けられません(再処理待ち)")
     if os.path.exists(ctx.dir_product):
         logger.info(f" └> NG: 処理済みのためスキップ\n")
         return ProductResult(SKIPPED, "処理済み")  # 既存の製番フォルダは削除しない(cleanup なし)
@@ -276,6 +360,8 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info(f"[Step.1] 図面画像及び盤情報DataFrame作成:")
     logger.info(f"{'-'*60}\n")
 
+    # フォルダ生成前に記録し、作成直後の異常終了でも再処理対象から漏れないようにする。
+    mark_incomplete(ctx.output_dir, ctx.product)
     logger.info(f"ディレクトリ作成: 設計DWG図面コピー用")
     os.makedirs(dir_product)  # Create Directory:Output(Srial Number)
     ctx.dwg_copy_dir = os.path.join(dir_product, "dwg")
