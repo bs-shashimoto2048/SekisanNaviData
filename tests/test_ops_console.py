@@ -880,6 +880,68 @@ class ServerTest(NoRealSubprocess):
         self.assertIn("ログオン中のみ動作します(ログオフ中は動きません)", html)           # 制約が画面で分かる
         self.assertIn('id="interval"', html)
 
+    def test_page_structure_matches_the_agreed_spec(self):
+        """合意済みの構成(docs/ops_console.md「画面」): 左に 1〜4、右に 5。各項目の入力・操作・履歴の列を、
+        見出しの文字列だけでなく HTML の入れ子で確認する。項目の省略・追加(独自変更)を検出する。"""
+        from html.parser import HTMLParser
+
+        class Walk(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack, self.section_parent, self.items, self.th = [], {}, {}, []
+                self._text_for, self._buf = None, ""
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                classes = (a.get("class") or "").split()
+                self.stack.append((tag, a.get("id"), classes))
+                if tag == "section":
+                    parent = next((c for t_, _i, c in reversed(self.stack[:-1]) if t_ == "div"), [])
+                    self.section_parent[a.get("id")] = parent
+                if tag in ("input", "button", "ul", "tbody") and a.get("id"):
+                    sec = next((i for t_, i, _c in reversed(self.stack) if t_ == "section"), None)
+                    self.items.setdefault(sec, []).append((tag, a.get("id")))
+                if tag == "th":
+                    self._text_for, self._buf = "th", ""
+                if tag in ("input", "br"):
+                    self.stack.pop()
+
+            def handle_endtag(self, tag):
+                if tag == "th":
+                    self.th.append(self._buf.strip())
+                    self._text_for = None
+                for k in range(len(self.stack) - 1, -1, -1):
+                    if self.stack[k][0] == tag:
+                        del self.stack[k:]
+                        break
+
+            def handle_data(self, data):
+                if self._text_for == "th":
+                    self._buf += data
+
+        code, raw = self.call("GET", "/", headers={})
+        self.assertEqual(code, 200)
+        w = Walk()
+        w.feed(raw.decode("utf-8"))
+        # 左に 1〜4、右に 5(実行履歴は右側の幅いっぱい)
+        for sid in ("s1", "s2", "s3", "s4"):
+            self.assertIn("left", w.section_parent[sid], sid)
+        self.assertIn("right", w.section_parent["s5"])
+        self.assertEqual(list(w.section_parent), ["s1", "s2", "s3", "s4", "s5"])
+        # 各項目の入力・操作(省略も追加もしない)
+        self.assertEqual(w.items["s1"], [("input", "outroot"), ("button", "save"), ("button", "reload")])
+        self.assertEqual(w.items["s2"], [("button", "check"), ("ul", "checks")])
+        self.assertEqual(w.items["s3"], [("input", "enabled"), ("input", "time"), ("input", "interval"),
+                                         ("button", "register"), ("button", "unregister")])
+        self.assertEqual(w.items["s4"], [("input", "product"), ("input", "runroot"), ("button", "run")])
+        self.assertEqual(w.items["s5"], [("tbody", "history")])
+        # 実行履歴の列(日時・種別・製番・状態・理由)
+        self.assertEqual(w.th, ["日時", "種別", "製番", "状態", "理由"])
+        html = raw.decode("utf-8")
+        for caption in ("保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "この製番を1回実行",
+                        "出力先", "有効", "開始時刻", "間隔", "日ごと", "製番"):
+            self.assertIn(caption, html, caption)
+
     def test_mutating_requests_need_the_header_and_a_loopback_host(self):
         code, _ = self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_time": "08:00"}, headers={"Content-Type": "application/json"})
         self.assertEqual(code, 403)
