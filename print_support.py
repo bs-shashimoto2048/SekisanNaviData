@@ -78,24 +78,37 @@ def output_print_script(page_list, dir_target: str, dir_product: str, plot_offse
 # PDF は待ち満了より前に書き終わっている(5 枚が約 11 秒の間に出る)ので、生存だけで失敗・終了にすると、正常な印刷まで失敗にしてしまう。
 # 区別する 3 つの事実:
 #   ① プロセスの終了(正常ならスクリプトの最後の `quit y` で終了するが、終了までの時間は未確認)
-#   ② 期待する PDF が、すべて有効に出力されたか(有効 = ある・空でない・先頭が %PDF-。書き込み中を避けるため、2 秒間サイズが変わらないこと)
-#   ③ IJCAD の応答状態(その PID のトップレベルウィンドウが、すべて「応答なし」= IsHungAppWindow か。ウィンドウが無ければ不明)
-# 判定:
+#   ② 期待する PDF が、すべて「完成」しているか。完成 = ある・空でない・先頭が %PDF-・末尾 1 KiB に %%EOF がある(pdf_is_complete)・サイズが 2 秒間変わらない。
+#      PDF は末尾(xref・trailer・%%EOF)を最後に書くので、書きかけ・一時停止中のファイルは %%EOF が無く、完成と見なされない
+#      (隔離出力の PDF 3,554 件すべてが、先頭 %PDF- と末尾の %%EOF を持つことを確認済み)。2 秒の安定は、末尾が書かれた直後の書き込み残りを避ける補助。
+#      印刷スクリプトの完了の合図(専用ファイルなど)は追加していない: スクリプトに LISP 等を足して合図を出す方法は、実際の IJCAD で動作を確認できず、
+#      印刷スクリプトそのものを変えると正常印刷を壊す恐れがあるため。信頼できる合図が無い限界は、末尾の %%EOF + 安定 + (ページの順次印刷で後のページが出れば前のページは終わっている)
+#      という「出力側の証拠」で補う。それでも、完成した PDF が後から書き換えられる場合は検知できない(未確認)。
+#   ③ IJCAD の応答状態(その PID のトップレベルウィンドウが、すべて「応答なし」= IsHungAppWindow か。ウィンドウが無い・取得できなければ不明)
+# 時間(従来の流れと同じ上限。従来: 待ち 35 秒 → 呼び出し側の待機 20 秒 → 検査の再確認 20 秒):
+#   予定 planned = 起動時間 + 枚数 × 1 枚あたりの時間(従来の待ち)。ペース pace = planned + 枚数 × 4(従来の待ち + 呼び出し側の待機)。
+#   この呼び出しが、従来の「待ち + 待機」を担う(呼び出し側の待機は無くした)。したがって、判定までの上限は従来と同じ 75 秒(5 枚)= ペース 55 秒 + 検査の再確認 20 秒。
+#   ・PDF が揃っても、ペースまでは IJCAD の終了を待つ(次の IJCAD を、前の IJCAD の終了前に起動し重ねないため。従来と同じ間隔)。
+#   ・ハングの確認(応答なし 15 秒)ができるよう、監視の最長時間は max(ペース, 予定 + 15 秒 + 1 秒)(1 枚の共通製作仕様書でも確認できる)。
+# 判定(ペースまたは最長時間に達したとき):
 #   - プロセスが終了 → 正常(COMPLETED)。
-#   - 生きていても、期待する PDF がすべて有効 → 正常(PDFS_READY)。プロセスは終了しない(従来どおり残る場合がある)。
-#   - PDF が不足し、予定の待ち(従来の待ち時間)を過ぎ、かつ IJCAD の全ウィンドウが応答なしのまま 15 秒続き、その間に PDF が 1 枚も増えない → ハング。
+#   - 生きていても、PDF がすべて完成 → 正常(PDFS_READY)。**終了しない**。ただし、そのとき IJCAD が応答なしなら、残っていることを固定の文言で警告する
+#     (left_unresponsive)。正常な IJCAD の残存(応答中)と、完了後のハング残存(応答なし)を区別して記録するが、終了は運用側の判断に委ねる(PDF は完成しており、
+#     製番は失敗にしない。ここで終了するかは未決定の方針)。
+#   - PDF が不足し、予定を過ぎ、全ウィンドウが応答なしのまま 15 秒続き、その間に PDF が 1 枚も増えない → ハング。
 #     起動した IJCAD だけを、照合 → 通常終了の要求 → 猶予 → 強制終了の順で終了し、失敗(TIMEOUT_*)にする。
-#   - PDF が不足していても、IJCAD が応答中(または応答状態が不明)なら、終了しない。監視の最長時間(従来の待ち + 従来の流れが印刷後に待つ秒数)まで待ち、
-#     過ぎたら PENDING を返す。呼び出し側は従来どおり、待機と PDF の検査(再確認つき)に進み、欠けていれば「成果物が不足」で失敗にする(IJCAD は終了しない)。
+#   - PDF が不足していても、IJCAD が応答中(または応答状態が不明)なら、終了しない。最長時間まで待ち、PENDING を返す。
+#     呼び出し側は従来どおり PDF の検査(再確認つき)に進み、欠けていれば「成果物が不足」で失敗にする(IJCAD は終了しない)。
 # 記録は固定の文言だけ(ページ名・パス・製番・例外メッセージ・コマンドライン・標準出力/標準エラーを含めない)。
 # 標準出力・標準エラーは収集しない: IJCAD はスクリプトの図面パスや設計側のパスを出力し得て、ログ・履歴・画面へ漏らさずに扱える保証がなく、
 # パイプを接続すると応答しない IJCAD が詰まる恐れもあるため。終了コードだけ(数値)を結果に持つ。
 COMPLETED, PDFS_READY, PENDING, NOT_RUN = "completed", "pdfs_ready", "pending", "not_run"
 TIMEOUT_CLOSED, TIMEOUT_KILLED, TIMEOUT_UNVERIFIED, TIMEOUT_ALIVE = "timeout_closed", "timeout_killed", "timeout_unverified", "timeout_alive"
-PRINT_SETTLE_PER_SHEET = 4      # 従来の流れが印刷後に待つ秒数(1 枚あたり。product_flow の cad_mod.countdown(枚数 × 4))。監視の最長時間に含める
+PRINT_SETTLE_PER_SHEET = 4      # 従来の流れが印刷後に待っていた秒数(1 枚あたり)。ペースに含める(従来は product_flow の cad_mod.countdown(枚数 × 4))
 POLL_SECONDS = 1.0              # 終了・PDF・応答状態の確認間隔
-PDF_STABLE_SECONDS = 2.0        # 期待する PDF が揃ってから、サイズが変わらないことを確認する秒数(書き込み中の判定を避ける)
+PDF_STABLE_SECONDS = 2.0        # 期待する PDF が揃ってから、サイズが変わらないことを確認する秒数
 HANG_CONFIRM_SECONDS = 15.0     # 応答なしが、この秒数続き、その間に PDF が増えなければ、ハングと判定する(重い図面での一時的な無応答を除く)
+PDF_TAIL_BYTES = 1024           # %%EOF を探す末尾の範囲
 CLOSE_GRACE = 10                # 通常終了の要求から、強制終了へ移るまでの猶予[秒]
 KILL_GRACE = 5                  # 強制終了の後、終了を確認するまでの待ち[秒]
 WM_CLOSE = 0x0010
@@ -103,9 +116,11 @@ WM_CLOSE = 0x0010
 
 @dataclass(frozen=True)
 class PrintOutcome:
-    """印刷(IJCAD)の呼び出し結果。timed_out(ハングと判定して終了処理をした)のとき、呼び出し側は後続へ進まず、製番を失敗にする。"""
+    """印刷(IJCAD)の呼び出し結果。timed_out(ハングと判定して終了処理をした)のとき、呼び出し側は後続へ進まず、製番を失敗にする。
+    left_unresponsive: PDF は完成しているが、IJCAD が応答しないまま残っている(失敗にはしない。警告のみ)。"""
     status: str
     exit_code: Optional[int] = None
+    left_unresponsive: bool = False
 
     @property
     def timed_out(self) -> bool:
@@ -123,6 +138,21 @@ _TIMEOUT_DETAIL = {
 def timeout_reason(stage: str, outcome: PrintOutcome) -> str:
     """ハング(PDF が出ず、応答もしない)の失敗理由(画面・履歴用の固定形式。製番・ページ名・パス・例外メッセージを含めない。「 / 」は履歴の連結と衝突するので使わない)。"""
     return f"[Step.2] {stage}の IJCAD が応答せず PDF が出力されませんでした({_TIMEOUT_DETAIL[outcome.status]})(未完了)"
+
+
+def pdf_is_complete(path: str) -> bool:
+    """PDF が完成しているか(ある・空でない・先頭が %PDF-・末尾 1 KiB に %%EOF)。書きかけ・一時停止中のファイルは、末尾が無いので False。"""
+    try:
+        size = os.path.getsize(path)
+        if not os.path.isfile(path) or size <= 0:
+            return False
+        with open(path, "rb") as f:
+            if f.read(5) != b"%PDF-":
+                return False
+            f.seek(max(0, size - PDF_TAIL_BYTES))
+            return b"%%EOF" in f.read()
+    except OSError:
+        return False
 
 
 class WindowsProcessControl:
@@ -203,7 +233,10 @@ def _terminate_hung(proc, launched, expected_exe: str, control, log: Callable[[s
                     close_grace: float, kill_grace: float) -> str:
     """ハングと判定した IJCAD を終了する(この呼び出しが起動した proc だけ)。結果の status を返す。"""
     def same_process() -> bool:
-        now = control.identity(proc.pid)
+        try:
+            now = control.identity(proc.pid)
+        except Exception:  # noqa: BLE001 - 照合できなければ終了しない
+            return False
         return launched is not None and now is not None and now == launched and now[1] == expected_exe
 
     if proc.poll() is not None:                                   # 判定の直後に、自分で終了していた
@@ -212,8 +245,13 @@ def _terminate_hung(proc, launched, expected_exe: str, control, log: Callable[[s
     if not same_process():
         log(" └> [印刷] 起動した IJCAD と照合できないため、終了しません")
         return TIMEOUT_UNVERIFIED
-    sent = control.request_close(proc.pid)
-    log(f" └> [印刷] 通常終了を要求しました(対象ウィンドウ {sent} 件)")
+    try:
+        sent = control.request_close(proc.pid)
+    except Exception as e:  # noqa: BLE001 - 例外メッセージは記録しない(型名だけ)
+        sent = 0
+        log(f" └> [印刷] 通常終了を要求できませんでした({type(e).__name__})")
+    else:
+        log(f" └> [印刷] 通常終了を要求しました(対象ウィンドウ {sent} 件)")
     try:
         proc.wait(close_grace)
         log(" └> [印刷] 通常終了を確認しました")
@@ -248,20 +286,19 @@ def _load_ijcad_settings(sheets_nmb: int):
     return cad, config["launch_time"], config["print_time"], config_loader
 
 
-def _default_pdf_valid(path: str) -> bool:
+def _responding(control, pid, log: Callable[[str], None]):
+    """応答状態(True / False / None=不明)。取得に失敗したら不明として扱う(終了の根拠にしない)。"""
     try:
-        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
-            return False
-        with open(path, "rb") as f:
-            return f.read(5) == b"%PDF-"
-    except OSError:
-        return False
+        return control.responding(pid)
+    except Exception as e:  # noqa: BLE001 - 例外メッセージは記録しない(型名だけ)
+        log(f" └> [印刷] IJCAD の応答状態を取得できませんでした({type(e).__name__})")
+        return None
 
 
 def print_dwg_for_pdf(script_path: str, sheets_nmb: int, expected_pdfs=(), *, log: Optional[Callable[[str], None]] = None,
-                      popen=subprocess.Popen, control=None, clock=time.monotonic, pdf_valid: Callable[[str], bool] = _default_pdf_valid,
+                      popen=subprocess.Popen, control=None, clock=time.monotonic, pdf_valid: Callable[[str], bool] = pdf_is_complete,
                       close_grace: float = CLOSE_GRACE, kill_grace: float = KILL_GRACE) -> PrintOutcome:
-    """IJCAD をバッチ(/b)で起動して印刷スクリプトを実行し、終了・PDF・応答状態を見守る(判定はこのブロックの上の説明)。
+    """IJCAD をバッチ(/b)で起動して印刷スクリプトを実行し、終了・PDF・応答状態を見守る(判定と時間はこのブロックの上の説明)。
     起動できない・設定を読めない場合は、従来の design_mod.print_dwg_for_pdf と同じく例外にせず NOT_RUN を返す(後続の PDF 検査が欠落として失敗にする)。
     expected_pdfs: このスクリプトが出力する PDF のパス(空なら PDF での判定をしない = ハング判定もしない)。"""
     log = log or (lambda _msg: None)
@@ -270,14 +307,18 @@ def print_dwg_for_pdf(script_path: str, sheets_nmb: int, expected_pdfs=(), *, lo
     try:
         cad, launch_time, print_time, config_loader = _load_ijcad_settings(sheets_nmb)
         command = config_loader.convert_win_path(cad) + " /b " + config_loader.convert_win_path(script_path)
-        planned = launch_time + sheets_nmb * print_time             # 従来の待ち時間(予定の完了時刻)
-        monitor_limit = planned + sheets_nmb * PRINT_SETTLE_PER_SHEET   # 監視の最長時間(従来の流れが PDF の検査に入るまでの時間)
+        planned = launch_time + sheets_nmb * print_time                       # 従来の待ち時間(予定の完了時刻)
+        pace = planned + sheets_nmb * PRINT_SETTLE_PER_SHEET                  # 従来の「待ち + 呼び出し側の待機」。PDF が揃っても、ここまでは終了を待つ
+        monitor_limit = max(pace, planned + HANG_CONFIRM_SECONDS + POLL_SECONDS)   # ハング(応答なし 15 秒)を確認できる最長時間
         start = clock()
         proc = popen(command)
     except Exception as e:  # noqa: BLE001 - 従来どおり握りつぶす(メッセージにはパスが入り得るので、型名だけ記録する)
         log(f" └> [印刷] IJCAD を起動できませんでした({type(e).__name__})")
         return PrintOutcome(NOT_RUN)
-    launched = control.identity(proc.pid)
+    try:
+        launched = control.identity(proc.pid)
+    except Exception:  # noqa: BLE001 - 照合できなければ、後で終了しない
+        launched = None
     exe_name = _expected_exe_name(command)
     valid_count = 0
     progress_at = start
@@ -291,27 +332,38 @@ def print_dwg_for_pdf(script_path: str, sheets_nmb: int, expected_pdfs=(), *, lo
             pass
         now = clock()
         elapsed = now - start
+        all_ready = False
         if expected:
             ok = [p for p in expected if pdf_valid(p)]
             if len(ok) > valid_count:
                 valid_count, progress_at, hung_since = len(ok), now, None
             if len(ok) == len(expected):
-                sig = tuple(os.path.getsize(p) for p in expected)
-                if sig != ready_sig:
+                try:
+                    sig = tuple(os.path.getsize(p) for p in expected)
+                except OSError:
+                    sig = None
+                if sig is None:
+                    ready_sig, ready_since = None, None
+                elif sig != ready_sig:
                     ready_sig, ready_since = sig, now
                 elif now - ready_since >= PDF_STABLE_SECONDS:
-                    log(" └> [印刷] 期待する PDF がすべて出力されました(IJCAD は終了していませんが、終了しません)")
-                    return PrintOutcome(PDFS_READY)
+                    all_ready = True
             else:
                 ready_sig, ready_since = None, None
-                if elapsed >= planned:                               # 予定の完了時刻を過ぎても PDF が揃わないときだけ、応答状態を見る
-                    if control.responding(proc.pid) is False:
+                if elapsed >= planned:                                         # 予定の完了時刻を過ぎても PDF が揃わないときだけ、応答状態を見る
+                    if _responding(control, proc.pid, log) is False:
                         hung_since = now if hung_since is None else hung_since
                     else:
                         hung_since = None
                     if hung_since is not None and now - hung_since >= HANG_CONFIRM_SECONDS and progress_at <= hung_since:
-                        log(f" └> [印刷] PDF が揃わず、IJCAD が {int(now - hung_since)} 秒以上応答しません(出力済み {len(ok)}/{len(expected)} 件)")
+                        log(f" └> [印刷] PDF が揃わず、IJCAD が {int(now - hung_since)} 秒以上応答しません(完成済み {len(ok)}/{len(expected)} 件)")
                         return PrintOutcome(_terminate_hung(proc, launched, exe_name, control, log, close_grace, kill_grace))
+        if all_ready and elapsed >= pace:                                      # PDF が完成。ペース(従来の間隔)まで IJCAD の終了を待ったので、正常
+            if _responding(control, proc.pid, log) is False:
+                log(" └> [印刷] PDF はすべて完成していますが、IJCAD が応答しないまま残っています(終了していません。手動で確認してください)")
+                return PrintOutcome(PDFS_READY, left_unresponsive=True)
+            log(" └> [印刷] 期待する PDF がすべて完成しました(IJCAD は終了していませんが、終了しません)")
+            return PrintOutcome(PDFS_READY)
         if elapsed >= monitor_limit:
             break
     if expected:

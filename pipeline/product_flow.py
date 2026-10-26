@@ -340,6 +340,15 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info(f" └> CSV作成: 材料 -> {config_loader.convert_win_path(material_path)}\n")
 
     # 共通製作仕様書印刷 -> あれば焼く_2025/11/28
+    result = _print_spec_sheet(ctx, dir_product)
+    if result is not None:                           # 印刷の IJCAD がハングと判定された。後続へ進まない
+        return result
+    return None
+
+
+def _print_spec_sheet(ctx: ProductContext, dir_product: str) -> Optional[ProductResult]:
+    """共通製作仕様書(あれば)を印刷する。IJCAD がハング(PDF が出ず応答もしない)と判定されたら、製番を失敗にする。"""
+    logger = ctx.logger
     logger.info(f"共通製作仕様書 印刷:")
     spec_sheets = ["1"]  # 共通製作仕様書(一般的な場)
     spec_sheets_name = spec_sheets[0] + ctx.converter_extension
@@ -347,7 +356,7 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     if cad_mod.file_exists(serial_Spec_dir, spec_sheets_name):
         serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product)
         outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, "1.pdf")],
-                                                   log=logger.warning, pdf_valid=_is_valid_pdf)
+                                                   log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         timed_out = print_timeout_result(STAGE_SPEC_PRINT, outcome)
         if timed_out is not None:                    # IJCAD がハング(PDF が出ず応答もしない)と判定され、終了処理まで済んだ。後続へ進まない
             return timed_out
@@ -431,12 +440,12 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
 
         product_script_win = print_support.output_print_script(chunk_5, ctx.dir_design_product, ctx.dir_product)
         outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), [os.path.join(ctx.dir_product, f"{p}.pdf") for p in chunk_5],
-                                                   log=logger.warning, pdf_valid=_is_valid_pdf)
+                                                   log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         logger.info(f" └> Page: {chunk_5}")
         timed_out = print_timeout_result(STAGE_PRINT, outcome)
         if timed_out is not None:                    # IJCAD がハングと判定され、終了処理まで済んだ。欠落の検査・次の塊・後続の変換や推論へ進まない
             return timed_out
-        cad_mod.countdown(len(chunk_5)*4)
+        # 従来ここで待っていた「枚数 × 4 秒」(cad_mod.countdown)は、print_support.print_dwg_for_pdf の見守り(ペース)に含めた(二重に待たない)
         # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む)。欠けていれば次の塊・後続へ進まない
         result = check_stage_artifacts(ctx, STAGE_PRINT, chunk_5, lambda p: f"{p}.pdf", _is_valid_pdf, ARTIFACT_GRACE_PRINT)
         if result is not None:

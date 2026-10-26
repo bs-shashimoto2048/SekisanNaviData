@@ -24,7 +24,8 @@ IDENTITY = (132_000_000_000_000_000, "gcad.exe")
 PAGES = ["mk28", "mk29", "mk30", "mk31", "mk32"]
 SHEETS = len(PAGES)
 PLANNED = 15 + SHEETS * 4                                      # 従来の待ち時間(起動時間 15 + 1 枚 4 秒 × 5)= 35 秒
-LIMIT = PLANNED + SHEETS * ps.PRINT_SETTLE_PER_SHEET           # 監視の最長時間 = 55 秒
+PACE = PLANNED + SHEETS * ps.PRINT_SETTLE_PER_SHEET            # 従来の「待ち + 呼び出し側の待機」= 55 秒。PDF が揃っても、ここまでは IJCAD の終了を待つ
+LIMIT = max(PACE, PLANNED + ps.HANG_CONFIRM_SECONDS + ps.POLL_SECONDS)   # 監視の最長時間 = 55 秒(5 枚)
 
 
 class FakeConfigLoader:
@@ -93,20 +94,27 @@ class PrintWatchTest(unittest.TestCase):
         self.dir = Path(td.name).resolve()
         self.pdfs = [self.dir / f"{p}.pdf" for p in PAGES]
 
-    def write(self, n):
-        for p in self.pdfs[:n]:
-            p.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    COMPLETE = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\nstartxref\n0\n%%EOF\n"
+    PARTIAL = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n"                 # 書きかけ(末尾の xref・trailer・%%EOF が無い)
+
+    def write(self, n, partial_last=False):
+        for i, p in enumerate(self.pdfs[:n]):
+            p.write_bytes(self.PARTIAL if (partial_last and i == n - 1) else self.COMPLETE)
 
     def run_print(self, schedule=None, exit_at=None, responding=lambda t: True, identities=(IDENTITY,), pid=4242,
-                  exits_on_close=False, exits_on_kill=True, popen_error=None, expected=True, pdf_valid=None):
-        """schedule: {経過秒: その時点までに出力済みの PDF 枚数}。"""
+                  exits_on_close=False, exits_on_kill=True, popen_error=None, expected=True, pdf_valid=None,
+                  sheets=SHEETS, partial_window=None, exit_flag_at=None):
+        """schedule: {経過秒: その時点までに出力済みの PDF 枚数}。partial_window: (開始, 終了)の間は、最後の PDF が書きかけ(末尾なし)。
+        exit_flag_at: この時刻に、wait の結果とは無関係にプロセスが終了済みになる(終了処理の直前の競合)。"""
         self.events, self.logs, self.clock = [], [], Clock()
         schedule = schedule or {}
 
         def on_tick(t):
             done = [n for at, n in sorted(schedule.items()) if t >= at]
             if done:
-                self.write(done[-1])
+                self.write(done[-1], partial_last=bool(partial_window and partial_window[0] <= t < partial_window[1]))
+            if exit_flag_at is not None and t >= exit_flag_at:
+                self.control.proc.returncode = 0
 
         def popen(command):
             self.events.append(("popen", command))
@@ -118,7 +126,7 @@ class PrintWatchTest(unittest.TestCase):
         self.control = FakeControl(identities, self.events, self.clock, responding)
         kwargs = {"pdf_valid": pdf_valid} if pdf_valid else {}
         with mock.patch.object(ps, "_load_ijcad_settings", return_value=(CAD, 15, 4, FakeConfigLoader)):
-            return ps.print_dwg_for_pdf(str(self.dir / "WIRING.SCR"), SHEETS, [str(p) for p in self.pdfs] if expected else [],
+            return ps.print_dwg_for_pdf(str(self.dir / "WIRING.SCR"), sheets, [str(p) for p in self.pdfs[:sheets]] if expected else [],
                                         log=self.logs.append, popen=popen, control=self.control, clock=self.clock, **kwargs)
 
     def kinds(self):
@@ -143,14 +151,77 @@ class PrintWatchTest(unittest.TestCase):
         self.assertFalse(out.timed_out)
         for kind in ("request_close", "kill"):
             self.assertNotIn(kind, self.kinds())
-        self.assertLess(self.clock.t, PLANNED)                            # 待ち満了を待たずに判定できる(PDF が安定してから)
+        self.assertEqual(self.clock.t, PACE)                              # ペース(従来の待ち + 待機 = 55 秒)までは、IJCAD の終了を待つ(次の IJCAD と重ねない)
+        self.assertFalse(out.left_unresponsive)
 
-    def test_all_valid_pdfs_after_the_planned_time_are_also_a_success_even_if_unresponsive(self):
-        """予定を過ぎ、応答なしの状態でも、PDF がすべて有効なら正常(終了しない)。"""
-        out = self.run_print(schedule={50: SHEETS}, responding=lambda t: False)
+    def test_all_valid_pdfs_with_an_unresponsive_ijcad_is_a_success_left_running_with_a_warning(self):
+        """PDF が完成していれば、IJCAD が応答なしでも製番は失敗にせず、終了もしない。残っていることだけを固定の文言で警告する。"""
+        out = self.run_print(schedule={20: SHEETS}, responding=lambda t: False)
+        self.assertEqual(out.status, ps.PDFS_READY)
+        self.assertTrue(out.left_unresponsive)
+        self.assertFalse(out.timed_out)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
+        self.assertIn("応答しないまま残っています", "\n".join(self.logs))
+
+    def test_a_responding_or_unknown_leftover_is_not_reported_as_unresponsive(self):
+        for responding in (lambda t: True, lambda t: None):
+            out = self.run_print(schedule={20: SHEETS}, responding=responding)
+            self.assertEqual(out, ps.PrintOutcome(ps.PDFS_READY))
+
+    def test_process_that_exits_after_the_pdfs_are_ready_is_reported_as_completed_at_its_exit(self):
+        out = self.run_print(schedule={20: SHEETS}, exit_at=40)
+        self.assertEqual(out, ps.PrintOutcome(ps.COMPLETED, 0))
+        self.assertEqual(self.clock.t, 40)                                # 終了を待ってから返す(早く返して次の IJCAD と重ねない)
+
+    def test_a_paused_partial_pdf_is_not_complete_even_if_its_size_is_unchanged_for_a_long_time(self):
+        """書き込みが一時停止(サイズ不変が長く続く)しても、末尾(%%EOF)が無い間は完成と見なさない。再開して完成すれば、その後に正常。"""
+        out = self.run_print(schedule={10: SHEETS}, partial_window=(10, 42))       # 10〜42 秒は最後の PDF が書きかけ
+        self.assertEqual(out.status, ps.PDFS_READY)
+        self.assertEqual(self.clock.t, PACE)
+        self.run_print(schedule={10: SHEETS}, partial_window=(10, 100))             # 最後まで書きかけ
+        self.assertNotIn("request_close", self.kinds())                             # 応答中なので終了もしない
+        self.assertEqual(self.clock.t, LIMIT)
+
+    def test_a_paused_partial_pdf_with_a_hung_ijcad_is_a_hang_not_a_success(self):
+        out = self.run_print(schedule={10: SHEETS}, partial_window=(10, 100), responding=lambda t: False)
+        self.assertEqual(out.status, ps.TIMEOUT_KILLED)
+
+    def test_completing_at_the_moment_the_hang_would_be_declared_is_not_a_hang(self):
+        """ハング判定の境界(応答なし 15 秒の時刻)に PDF が揃った場合は、揃った方を優先する(終了しない)。"""
+        out = self.run_print(schedule={15: SHEETS - 1, int(PLANNED + ps.HANG_CONFIRM_SECONDS): SHEETS}, responding=lambda t: False)
         self.assertEqual(out.status, ps.PDFS_READY)
         for kind in ("request_close", "kill"):
             self.assertNotIn(kind, self.kinds())
+
+    def test_process_exit_just_before_the_termination_is_not_killed(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, exit_flag_at=int(PLANNED + ps.HANG_CONFIRM_SECONDS))
+        self.assertTrue(out.timed_out)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
+
+    def test_a_single_sheet_print_can_also_detect_a_hang_within_the_monitoring_time(self):
+        """1 枚(共通製作仕様書)でも、予定 + 応答なし 15 秒を確認できる最長時間がある。"""
+        out = self.run_print(sheets=1, responding=lambda t: False)
+        self.assertEqual(out.status, ps.TIMEOUT_KILLED)
+        self.assertGreaterEqual(self.times("request_close")[0], 15 + 4 + ps.HANG_CONFIRM_SECONDS)
+
+    def test_a_responsiveness_probe_error_is_treated_as_unknown_and_never_terminates(self):
+        def boom(t):
+            raise OSError(str(self.dir) + r"\secret")
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=boom)
+        self.assertEqual(out.status, ps.PENDING)
+        self.assertNotIn("request_close", self.kinds())
+        text = "\n".join(self.logs)
+        self.assertIn("OSError", text)
+        self.assertNotIn("secret", text)
+
+    def test_the_total_time_budget_is_not_longer_than_the_old_flow(self):
+        """従来: 待ち 35 → 呼び出し側の待機 20 → 検査の再確認 20 = 75 秒。見守り(最長 55 秒)+ 検査の再確認 20 秒で、同じ上限。"""
+        old_total = PLANNED + SHEETS * 4 + pf.ARTIFACT_GRACE_PRINT
+        self.assertEqual(LIMIT + pf.ARTIFACT_GRACE_PRINT, old_total)
+        self.run_print(schedule={15: SHEETS - 1})
+        self.assertEqual(self.clock.t + pf.ARTIFACT_GRACE_PRINT, old_total)
 
     def test_pdfs_must_stay_unchanged_before_they_count_as_ready(self):
         """書き込み中(サイズが変わっている間)は、揃ったとは見なさない。"""
@@ -342,7 +413,7 @@ class FlowTest(Base):
         first = self.print_calls[0]
         self.assertEqual(first[0][1], 5)
         self.assertEqual(first[0][2], [str(self.dir_product / f"{p}.pdf") for p in self.PRINT_PAGES[:5]])
-        self.assertIs(first[1]["pdf_valid"], pf._is_valid_pdf)
+        self.assertIs(first[1]["pdf_valid"], ps.pdf_is_complete)
 
     def test_hang_on_the_second_chunk_stops_after_it(self):
         ok = ps.PrintOutcome(ps.COMPLETED, 0)
@@ -403,6 +474,107 @@ class FlowTest(Base):
             self.assertNotIn(forbidden, res.reason)
         warn = " ".join(str(c.args[0]) for c in self.logger.warning.call_args_list)
         self.assertNotIn(str(self.tmp), warn)
+
+
+class PdfCompleteTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(prefix="pdf_complete_")
+        self.addCleanup(td.cleanup)
+        self.dir = Path(td.name)
+
+    def put(self, name, data):
+        path = self.dir / name
+        path.write_bytes(data)
+        return str(path)
+
+    def test_complete_pdf(self):
+        self.assertTrue(ps.pdf_is_complete(self.put("a.pdf", PrintWatchTest.COMPLETE)))
+
+    def test_incomplete_or_invalid_files_are_not_complete(self):
+        self.assertFalse(ps.pdf_is_complete(str(self.dir / "missing.pdf")))                 # 無い
+        self.assertFalse(ps.pdf_is_complete(self.put("empty.pdf", b"")))                    # 空
+        self.assertFalse(ps.pdf_is_complete(self.put("partial.pdf", PrintWatchTest.PARTIAL)))   # 書きかけ(末尾なし)
+        self.assertFalse(ps.pdf_is_complete(self.put("junk.pdf", b"hello%%EOF\n")))         # 先頭が %PDF- でない
+        self.assertFalse(ps.pdf_is_complete(str(self.dir)))                                  # フォルダ
+
+    def test_the_trailer_must_be_near_the_end_of_the_file(self):
+        body = b"%PDF-1.4\n%%EOF\n" + b"x" * (ps.PDF_TAIL_BYTES + 100)                      # %%EOF が先頭側にあるだけ(末尾 1 KiB の外)
+        self.assertFalse(ps.pdf_is_complete(self.put("early.pdf", body)))
+        self.assertTrue(ps.pdf_is_complete(self.put("late.pdf", b"%PDF-1.4\n" + b"x" * 5000 + b"\nstartxref\n0\n%%EOF\r\n")))
+
+    def test_the_default_validator_is_the_trailer_aware_check(self):
+        import inspect
+        self.assertIs(inspect.signature(ps.print_dwg_for_pdf).parameters["pdf_valid"].default, ps.pdf_is_complete)
+
+
+class SpecSheetFlowTest(Base):
+    """Step.1 の共通製作仕様書の印刷(pf._print_spec_sheet)。"""
+    def ctx_for_spec(self):
+        ctx = self.ctx(serial="AY0001", dir_design_serial=str(self.tmp / "serial"))
+        self.dir_product.mkdir(exist_ok=True)
+        return ctx
+
+    def run_spec(self, outcome, pdf_exists=True):
+        ctx = self.ctx_for_spec()
+
+        def fake_print(script, sheets, expected, **kwargs):
+            if pdf_exists:
+                Path(expected[0]).write_bytes(PrintWatchTest.COMPLETE)
+            return outcome
+        with mock.patch.object(pf.cad_mod, "file_exists", return_value=True), \
+                mock.patch.object(pf.print_support, "output_print_script", return_value="s.scr"), \
+                mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=fake_print) as prt, \
+                mock.patch.object(pf.cad_mod, "countdown"):
+            return pf._print_spec_sheet(ctx, str(self.dir_product)), prt
+
+    def test_hang_on_the_spec_sheet_fails_the_product_with_the_fixed_reason(self):
+        out = ps.PrintOutcome(ps.TIMEOUT_KILLED)
+        res, prt = self.run_spec(out, pdf_exists=False)
+        self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
+        self.assertEqual(res.reason, ps.timeout_reason(pf.STAGE_SPEC_PRINT, out))
+        self.assertRegex(res.reason, TimeoutReasonTest.FORMAT)
+        for forbidden in [str(self.tmp), PRODUCT, "AY0001", "1.pdf", "\\"]:
+            self.assertNotIn(forbidden, res.reason)
+        self.assertEqual(prt.call_args.args[1], 1)                                           # 1 枚
+        self.assertEqual(prt.call_args.args[2], [str(self.dir_product / "1.pdf")])           # 期待する PDF は 1.pdf だけ
+
+    def test_normal_spec_sheet_is_renamed_as_before(self):
+        res, _ = self.run_spec(ps.PrintOutcome(ps.PDFS_READY))
+        self.assertIsNone(res)
+        self.assertTrue((self.dir_product / "共通製作仕様書.pdf").is_file())
+        self.assertFalse((self.dir_product / "1.pdf").exists())
+
+    def test_pending_spec_sheet_without_a_pdf_continues_as_before(self):
+        """従来どおり、共通製作仕様書は「あれば焼く」。PDF が無くても(IJCAD が応答中なら)製番は失敗にしない。"""
+        res, _ = self.run_spec(ps.PrintOutcome(ps.PENDING), pdf_exists=False)
+        self.assertIsNone(res)
+
+
+class ChunkPacingTest(Base):
+    def test_the_chunk_flow_no_longer_waits_the_old_countdown_again(self):
+        """従来の「枚数 × 4 秒」の待機は print_support の見守り(ペース)に含めた。呼び出し側で二重に待たない。"""
+        countdown = mock.Mock(name="countdown")
+        results = iter([ps.PrintOutcome(ps.COMPLETED, 0)] * 2)
+        started = []
+        try:
+            for p in self.patches_without_print():
+                p.start()
+                started.append(p)
+            with mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results)), \
+                    mock.patch.object(pf.cad_mod, "countdown", countdown), mock.patch.object(pf, "_select_pages", return_value=None):
+                self.assertIsNone(pf.step2_inference_images(self.ctx()))
+        finally:
+            for p in reversed(started):
+                p.stop()
+        self.assertNotIn(mock.call(20), countdown.call_args_list)
+        self.assertNotIn(mock.call(8), countdown.call_args_list)
+
+    def patches_without_print(self):
+        return [p for p in self.patches() if getattr(p, "attribute", None) not in ("print_dwg_for_pdf", "countdown")]
+
+    def test_a_responding_leftover_or_an_unresponsive_leftover_does_not_fail_the_product(self):
+        for outcome in (ps.PrintOutcome(ps.PDFS_READY), ps.PrintOutcome(ps.PDFS_READY, left_unresponsive=True)):
+            self.assertIsNone(pf.print_timeout_result(pf.STAGE_PRINT, outcome))
 
 
 if __name__ == "__main__":
