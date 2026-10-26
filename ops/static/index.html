@@ -55,7 +55,7 @@
   <div class="left">
     <section id="s1">
       <h2>1. 運用設定</h2>
-      <div class="row"><label for="outroot">出力先</label><input type="text" id="outroot" placeholder="空なら設定ファイルの出力先"><button id="save">保存</button><button id="reload" class="secondary">再読込</button></div>
+      <div class="row"><label for="outroot">出力先</label><input type="text" id="outroot" placeholder="空なら設定ファイルの出力先"><button id="browse" class="secondary">参照…</button><button id="save">保存</button><button id="reload" class="secondary">再読込</button></div>
       <div class="msg" id="msg1"></div>
     </section>
     <section id="s2">
@@ -146,6 +146,14 @@ async function refreshHistory() {
   } catch (e) { /* 次回の更新で再試行 */ }
 }
 $("save").onclick = async () => { try { const r = await api("PUT", "/api/settings", formSettings()); applySettings(r.settings); say("msg1", "保存しました。", "ok"); } catch (e) { say("msg1", e.message, "ng"); } };
+$("browse").onclick = async () => {
+  say("msg1", "フォルダ選択の画面を開いています…(この PC の画面に表示されます)"); $("browse").disabled = true;
+  try {
+    const r = await api("POST", "/api/settings/browse-folder", {});
+    if (r.path) { $("outroot").value = r.path; say("msg1", "選択しました。「保存」で確定します。", "ok"); }
+    else say("msg1", "選択をキャンセルしました。");
+  } catch (e) { say("msg1", e.message, "ng"); } finally { $("browse").disabled = false; }
+};
 $("reload").onclick = async () => { try { const r = await api("POST", "/api/settings/reload", {}); applySettings(r.settings); say("msg1", "再読込しました。", "ok"); } catch (e) { say("msg1", e.message, "ng"); } };
 $("check").onclick = async () => {
   say("msg2", "確認中…"); $("check").disabled = true;
