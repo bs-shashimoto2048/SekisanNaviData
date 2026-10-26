@@ -1,9 +1,12 @@
-# IJCAD の印刷が時間内に終了しないときの、起動プロセスの終了(print_support.print_dwg_for_pdf)と、製番の失敗扱い(pipeline.product_flow)のテスト。
+# IJCAD の印刷の見守り(print_support.print_dwg_for_pdf)と、ハング時の製番の失敗扱い(pipeline.product_flow)のテスト。
 # 背景: bs_pkg の print_dwg_for_pdf は、待ち時間が満了しても IJCAD を終了させず、応答しない IJCAD が図面を開いたまま残った(A1AY4693)。
-# すべてモック・一時フォルダ(IJCAD・実図面・共有先・本番出力・タスクスケジューラ・製番処理には接続しない。実プロセスの終了は行わない)。
+# 一方、通常の実行でも IJCAD は待ち満了(約 35 秒)を超えて生きていた。そこで「生きている」ことでは判定せず、
+# プロセスの終了・期待する PDF の有効性・IJCAD の応答状態を区別する(判定は print_support のコメント)。
+# すべてモック・一時フォルダ(IJCAD・実図面・共有先・本番出力・タスクスケジューラ・製番処理には接続しない。実プロセスの終了は行わない。時計も偽物)。
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,10 +19,12 @@ from pipeline import product_flow as pf  # noqa: E402
 from interim import runs as interim_runs  # noqa: E402
 from tests.test_step2_artifacts import Base, PRODUCT  # noqa: E402
 
-SECRET_DIR = r"C:\Secret Share\A1ZZ9999\drawings"           # ログ・履歴・画面へ出てはいけない(パス・製番・ページ名)
-SECRET_PAGES = ["mk32", "zz77"]
 CAD = r"C:\Fake IJCAD\gcad.exe"
 IDENTITY = (132_000_000_000_000_000, "gcad.exe")
+PAGES = ["mk28", "mk29", "mk30", "mk31", "mk32"]
+SHEETS = len(PAGES)
+PLANNED = 15 + SHEETS * 4                                      # 従来の待ち時間(起動時間 15 + 1 枚 4 秒 × 5)= 35 秒
+LIMIT = PLANNED + SHEETS * ps.PRINT_SETTLE_PER_SHEET           # 監視の最長時間 = 55 秒
 
 
 class FakeConfigLoader:
@@ -28,145 +33,250 @@ class FakeConfigLoader:
         return path if " " not in path else '"' + path + '"'
 
 
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
 class FakeProc:
-    """subprocess.Popen の偽物。wait の結果を順に指定する(数値 = その終了コードで終了 / "timeout" = 時間切れ)。"""
-    def __init__(self, pid, waits, events):
-        self.pid, self.waits, self.events = pid, list(waits), events
-        self.returncode = None
+    """subprocess.Popen の偽物。wait のたびに偽の時計を進め、その時刻の出来事(PDF の出力・終了)を起こす。"""
+    def __init__(self, pid, clock, events, on_tick=None, exit_at=None, exits_on_close=False, exits_on_kill=True):
+        self.pid, self.clock, self.events, self.on_tick = pid, clock, events, on_tick
+        self.exit_at, self.exits_on_close, self.exits_on_kill = exit_at, exits_on_close, exits_on_kill
+        self.returncode, self.closed, self.killed = None, False, False
 
     def wait(self, timeout=None):
-        self.events.append(("wait", self.pid, timeout))
-        step = self.waits.pop(0) if self.waits else "timeout"
-        if step == "timeout":
-            raise subprocess.TimeoutExpired("gcad", timeout)
-        self.returncode = step
-        return step
+        self.clock.t += timeout
+        self.events.append(("wait", self.pid, timeout, self.clock.t))
+        if self.on_tick:
+            self.on_tick(self.clock.t)
+        if (self.exit_at is not None and self.clock.t >= self.exit_at) or (self.closed and self.exits_on_close) or (self.killed and self.exits_on_kill):
+            self.returncode = 0
+            return 0
+        raise subprocess.TimeoutExpired("gcad", timeout)
 
     def poll(self):
         return self.returncode
 
     def kill(self):
-        self.events.append(("kill", self.pid))
+        self.killed = True
+        self.events.append(("kill", self.pid, self.clock.t))
 
 
 class FakeControl:
-    """プロセスの照合と通常終了の要求の偽物。identity は呼ばれるたびに、指定した値を順に返す(最後の値を使い回す)。"""
-    def __init__(self, identities, events):
-        self.identities, self.events = list(identities), events
+    """プロセスの照合・応答状態・通常終了の要求の偽物。responding は時刻の関数(True / False / None)。"""
+    def __init__(self, identities, events, clock, responding=lambda t: True):
+        self.identities, self.events, self.clock, self.resp = list(identities), events, clock, responding
+        self.proc = None
 
     def identity(self, pid):
         self.events.append(("identity", pid))
         return self.identities.pop(0) if len(self.identities) > 1 else self.identities[0]
 
+    def responding(self, pid):
+        self.events.append(("responding", pid, self.clock.t))
+        return self.resp(self.clock.t)
+
     def request_close(self, pid):
-        self.events.append(("request_close", pid))
+        self.events.append(("request_close", pid, self.clock.t))
+        self.proc.closed = True
         return 2
 
 
-class PrintCallTest(unittest.TestCase):
-    def call(self, waits, identities=(IDENTITY,), popen_error=None, sheets=5, pid=4242):
-        self.events, self.logs = [], []
-        procs = []
+class PrintWatchTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(prefix="ijcad_timeout_")
+        self.addCleanup(td.cleanup)
+        self.dir = Path(td.name).resolve()
+        self.pdfs = [self.dir / f"{p}.pdf" for p in PAGES]
+
+    def write(self, n):
+        for p in self.pdfs[:n]:
+            p.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    def run_print(self, schedule=None, exit_at=None, responding=lambda t: True, identities=(IDENTITY,), pid=4242,
+                  exits_on_close=False, exits_on_kill=True, popen_error=None, expected=True, pdf_valid=None):
+        """schedule: {経過秒: その時点までに出力済みの PDF 枚数}。"""
+        self.events, self.logs, self.clock = [], [], Clock()
+        schedule = schedule or {}
+
+        def on_tick(t):
+            done = [n for at, n in sorted(schedule.items()) if t >= at]
+            if done:
+                self.write(done[-1])
 
         def popen(command):
             self.events.append(("popen", command))
             if popen_error:
                 raise popen_error
-            procs.append(FakeProc(pid, waits, self.events))
-            return procs[-1]
-        self.proc_holder = procs
-        control = FakeControl(identities, self.events)
+            proc = FakeProc(pid, self.clock, self.events, on_tick, exit_at, exits_on_close, exits_on_kill)
+            self.control.proc = proc
+            return proc
+        self.control = FakeControl(identities, self.events, self.clock, responding)
+        kwargs = {"pdf_valid": pdf_valid} if pdf_valid else {}
         with mock.patch.object(ps, "_load_ijcad_settings", return_value=(CAD, 15, 4, FakeConfigLoader)):
-            return ps.print_dwg_for_pdf(SECRET_DIR + r"\WIRING.SCR", sheets, log=self.logs.append, popen=popen, control=control,
-                                        close_grace=10, kill_grace=5)
+            return ps.print_dwg_for_pdf(str(self.dir / "WIRING.SCR"), SHEETS, [str(p) for p in self.pdfs] if expected else [],
+                                        log=self.logs.append, popen=popen, control=self.control, clock=self.clock, **kwargs)
 
     def kinds(self):
         return [e[0] for e in self.events]
 
-    def test_normal_exit_within_the_time_limit_is_a_success_and_nothing_is_terminated(self):
-        out = self.call([0])
+    def times(self, kind):
+        return [e[-1] for e in self.events if e[0] == kind]
+
+    # ---- 正常 ----
+    def test_process_exits_within_the_time_is_a_success_and_nothing_else_is_touched(self):
+        out = self.run_print(exit_at=3)
         self.assertEqual(out, ps.PrintOutcome(ps.COMPLETED, 0))
         self.assertFalse(out.timed_out)
+        for kind in ("request_close", "kill", "responding"):
+            self.assertNotIn(kind, self.kinds())
+        self.assertEqual(self.logs, [])
+
+    def test_alive_process_with_all_valid_pdfs_is_a_success_and_never_terminated(self):
+        """生きたままでも(待ち満了より前に PDF が揃っていれば)正常。終了要求・強制終了は一度も呼ばれない。"""
+        out = self.run_print(schedule={20: SHEETS})                       # IJCAD は終了しない(exit_at なし)
+        self.assertEqual(out.status, ps.PDFS_READY)
+        self.assertFalse(out.timed_out)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
+        self.assertLess(self.clock.t, PLANNED)                            # 待ち満了を待たずに判定できる(PDF が安定してから)
+
+    def test_all_valid_pdfs_after_the_planned_time_are_also_a_success_even_if_unresponsive(self):
+        """予定を過ぎ、応答なしの状態でも、PDF がすべて有効なら正常(終了しない)。"""
+        out = self.run_print(schedule={50: SHEETS}, responding=lambda t: False)
+        self.assertEqual(out.status, ps.PDFS_READY)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
+
+    def test_pdfs_must_stay_unchanged_before_they_count_as_ready(self):
+        """書き込み中(サイズが変わっている間)は、揃ったとは見なさない。"""
+        sizes = iter(range(100, 1000))
+
+        def growing(path):
+            Path(path).write_bytes(b"%PDF-1.4\n" + b"x" * next(sizes))
+            return True
+        out = self.run_print(schedule={10: SHEETS}, pdf_valid=growing)      # 毎回サイズが変わる → 安定しない
+        self.assertEqual(out.status, ps.PENDING)
+        self.assertGreaterEqual(self.clock.t, LIMIT)
+
+    def test_launch_command_and_the_monitoring_time_follow_the_existing_flow(self):
+        self.run_print(exit_at=3)
+        popen = [e for e in self.events if e[0] == "popen"][0]
+        self.assertEqual(popen[1], FakeConfigLoader.convert_win_path(CAD) + " /b " + FakeConfigLoader.convert_win_path(str(self.dir / "WIRING.SCR")))       # design_mod と同じ組み立て(/b + スクリプト)
+        self.run_print()                                                    # PDF なし・応答中 → 最長まで見守る
+        self.assertEqual((self.clock.t, LIMIT), (LIMIT, 55))
+
+    # ---- PDF 不足 + 応答あり/不明 ----
+    def test_missing_pdf_but_responding_is_never_terminated_and_returns_pending_after_the_limit(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: True)
+        self.assertEqual(out.status, ps.PENDING)
+        self.assertFalse(out.timed_out)                                   # ここでは失敗にしない(続く既存の検査が「成果物が不足」で失敗にする)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
+        self.assertGreaterEqual(self.clock.t, LIMIT)                      # 既存の待ち時間いっぱいまで待ってから返す
+        self.assertIn("終了しません", "\n".join(self.logs))
+
+    def test_missing_pdf_with_unknown_responsiveness_is_not_terminated(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: None)
+        self.assertEqual(out.status, ps.PENDING)
+        self.assertNotIn("request_close", self.kinds())
+
+    def test_responsiveness_is_not_consulted_before_the_planned_time(self):
+        self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False)
+        self.assertTrue(all(t >= PLANNED for t in self.times("responding")))
+
+    def test_a_busy_but_working_ijcad_is_not_terminated_while_pdfs_keep_appearing(self):
+        """応答なしでも、PDF が増えている間は、重い処理で動いていると見なして終了しない。"""
+        out = self.run_print(schedule={30: 1, 38: 2, 44: 3, 50: 4}, responding=lambda t: False)
         self.assertNotIn("request_close", self.kinds())
         self.assertNotIn("kill", self.kinds())
-        self.assertEqual(self.logs, [])                                      # 通常時は、従来どおり何も記録しない
+        self.assertEqual(out.status, ps.PENDING)
 
-    def test_launch_command_and_wait_limit_follow_the_existing_flow(self):
-        self.call([0], sheets=5)
-        popen = [e for e in self.events if e[0] == "popen"][0]
-        self.assertEqual(popen[1], '"' + CAD + '"' + " /b " + '"' + SECRET_DIR + r"\WIRING.SCR" + '"')   # design_mod と同じ組み立て(/b + スクリプト)
-        wait = [e for e in self.events if e[0] == "wait"][0]
-        # 従来の待ち(15 + 5 × 4 = 35) + 従来の流れが印刷後に待つ秒数(5 × 4) + 欠落の再確認(20)
-        self.assertEqual(wait[2], 35 + 5 * ps.PRINT_SETTLE_PER_SHEET + ps.PRINT_EXIT_GRACE)
+    def test_a_brief_unresponsive_moment_is_not_a_hang(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: not (36 <= t < 44))      # 8 秒だけ応答なし
+        self.assertEqual(out.status, ps.PENDING)
+        self.assertNotIn("request_close", self.kinds())
 
-    def test_timeout_then_graceful_close_does_not_kill(self):
-        out = self.call(["timeout", 0])                                      # 規定時間は満了 → 通常終了の要求後に終了
+    # ---- ハング(PDF 不足 + 応答なしが続く) ----
+    def test_hang_closes_only_the_launched_process_gracefully_first(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, exits_on_close=True)
         self.assertEqual(out.status, ps.TIMEOUT_CLOSED)
         self.assertTrue(out.timed_out)
-        self.assertIn(("request_close", 4242), self.events)
+        self.assertEqual([e[1] for e in self.events if e[0] == "request_close"], [4242])
         self.assertNotIn("kill", self.kinds())
+        self.assertGreaterEqual(self.times("request_close")[0], PLANNED + ps.HANG_CONFIRM_SECONDS - 1)    # 予定を過ぎ、15 秒続いてから
 
-    def test_timeout_then_force_kill_only_after_the_grace_expires(self):
-        out = self.call(["timeout", "timeout", 1])                           # 規定時間・通常終了の猶予とも満了 → 強制終了 → 終了を確認
+    def test_hang_force_kill_only_after_the_close_grace_expires(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False)
         self.assertEqual(out.status, ps.TIMEOUT_KILLED)
-        order = [e for e in self.events if e[0] in ("request_close", "kill")]
-        self.assertEqual(order, [("request_close", 4242), ("kill", 4242)])   # 通常終了の要求が先、強制終了は後(猶予の後だけ)
-        waits = [e[2] for e in self.events if e[0] == "wait"]
-        self.assertEqual(waits[1:], [10, 5])                                 # 猶予 10 秒 → 強制終了後の確認 5 秒
+        order = [e[0] for e in self.events if e[0] in ("request_close", "kill")]
+        self.assertEqual(order, ["request_close", "kill"])
+        close_at, kill_at = self.times("request_close")[0], self.times("kill")[0]
+        self.assertEqual(kill_at - close_at, ps.CLOSE_GRACE)
 
-    def test_still_alive_after_kill_is_reported_not_hidden(self):
-        out = self.call(["timeout", "timeout", "timeout"])
+    def test_hang_where_kill_does_not_end_the_process_is_reported(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, exits_on_kill=False)
         self.assertEqual(out.status, ps.TIMEOUT_ALIVE)
         self.assertTrue(out.timed_out)
 
-    def test_only_the_launched_process_is_targeted(self):
-        out = self.call(["timeout", "timeout", 1], pid=777)
-        self.assertEqual(out.status, ps.TIMEOUT_KILLED)
-        pids = {e[1] for e in self.events if e[0] in ("request_close", "kill", "identity")}
-        self.assertEqual(pids, {777})                                        # 起動した IJCAD の PID だけ(名前で探して終了する処理は無い)
+    def test_only_the_launched_pid_is_targeted(self):
+        self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, pid=777)
+        pids = {e[1] for e in self.events if e[0] in ("request_close", "kill", "identity", "responding")}
+        self.assertEqual(pids, {777})                                       # 起動した IJCAD の PID だけ(名前で探して終了する処理は無い)
 
-    def test_a_different_process_with_the_same_pid_is_not_terminated(self):
-        """PID が別のプロセス(作成時刻が違う)に再利用されていた場合は、終了要求も強制終了もしない。"""
-        reused = (IDENTITY[0] + 1, "gcad.exe")
-        out = self.call(["timeout"], identities=[IDENTITY, reused])
+    def test_a_pid_reused_by_another_process_is_not_terminated(self):
+        reused = (IDENTITY[0] + 1, "gcad.exe")                              # 作成時刻が違う(PID の再利用)
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, identities=[IDENTITY, reused])
         self.assertEqual(out.status, ps.TIMEOUT_UNVERIFIED)
-        self.assertNotIn("request_close", self.kinds())
-        self.assertNotIn("kill", self.kinds())
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
 
-    def test_a_process_with_another_executable_is_not_terminated(self):
-        other = (IDENTITY[0], "notepad.exe")
-        out = self.call(["timeout"], identities=[other])
+    def test_another_executable_is_not_terminated(self):
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, identities=[IDENTITY, (IDENTITY[0], "notepad.exe")])
         self.assertEqual(out.status, ps.TIMEOUT_UNVERIFIED)
         self.assertNotIn("kill", self.kinds())
 
     def test_unreadable_identity_is_not_terminated(self):
-        out = self.call(["timeout"], identities=[None])
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, identities=[None])
         self.assertEqual(out.status, ps.TIMEOUT_UNVERIFIED)
         self.assertNotIn("request_close", self.kinds())
 
     def test_identity_lost_after_the_grace_blocks_the_force_kill(self):
-        out = self.call(["timeout", "timeout"], identities=[IDENTITY, IDENTITY, (IDENTITY[0] + 5, "gcad.exe")])
+        out = self.run_print(schedule={15: SHEETS - 1}, responding=lambda t: False, identities=[IDENTITY, IDENTITY, (IDENTITY[0] + 5, "gcad.exe")])
         self.assertEqual(out.status, ps.TIMEOUT_UNVERIFIED)
         self.assertIn("request_close", self.kinds())
         self.assertNotIn("kill", self.kinds())
 
+    # ---- 起動失敗・非漏えい ----
     def test_launch_failure_is_swallowed_like_before_without_leaking_the_message(self):
-        out = self.call([0], popen_error=OSError(SECRET_DIR + r"\secret.dwg の起動に失敗"))
+        out = self.run_print(popen_error=OSError(str(self.dir) + r"\secret.dwg の起動に失敗"))
         self.assertEqual(out.status, ps.NOT_RUN)
         self.assertFalse(out.timed_out)                                      # 従来どおり。後続の PDF 検査が欠落として失敗にする
         text = "\n".join(self.logs)
         self.assertIn("OSError", text)
         self.assertNotIn("secret", text)
-        self.assertNotIn(SECRET_DIR, text)
+        self.assertNotIn(str(self.dir), text)
 
     def test_logs_never_contain_paths_page_names_or_process_output(self):
-        for waits in (["timeout", 0], ["timeout", "timeout", 1], ["timeout", "timeout", "timeout"]):
-            self.call(waits)
+        for kwargs in (dict(schedule={15: SHEETS - 1}, responding=lambda t: False, exits_on_close=True),
+                       dict(schedule={15: SHEETS - 1}, responding=lambda t: False),
+                       dict(schedule={15: SHEETS - 1}, responding=lambda t: True),
+                       dict(schedule={20: SHEETS})):
+            self.run_print(**kwargs)
             text = "\n".join(self.logs)
-            self.assertTrue(text)                                            # 時間切れ・終了要求・結果は記録される
-            for forbidden in [SECRET_DIR, "Secret", "A1ZZ9999", "WIRING", CAD, *SECRET_PAGES, "stdout", "stderr"]:
+            self.assertTrue(text)
+            for forbidden in [str(self.dir), self.dir.name, "WIRING", CAD, *PAGES, ".pdf", "stdout", "stderr"]:
                 self.assertNotIn(forbidden, text)
-            self.assertRegex(text, r"規定時間\(\d+ 秒\)内に終了しませんでした")
+
+    def test_without_expected_pdfs_no_hang_is_ever_declared(self):
+        out = self.run_print(expected=False, responding=lambda t: False)
+        self.assertEqual(out.status, ps.PENDING)
+        for kind in ("request_close", "kill"):
+            self.assertNotIn(kind, self.kinds())
 
     def test_expected_exe_name_handles_quoted_and_unquoted_commands(self):
         self.assertEqual(ps._expected_exe_name('"C:\\Fake IJCAD\\GCAD.exe" /b "x y.scr"'), "gcad.exe")
@@ -175,7 +285,7 @@ class PrintCallTest(unittest.TestCase):
 
 class TimeoutReasonTest(unittest.TestCase):
     ALL = [ps.TIMEOUT_CLOSED, ps.TIMEOUT_KILLED, ps.TIMEOUT_UNVERIFIED, ps.TIMEOUT_ALIVE]
-    FORMAT = re.compile(r"^\[Step\.2\] (印刷\(PDF\)|共通製作仕様書の印刷)の IJCAD が規定時間内に終了しませんでした\(.+\)\(未完了\)$")
+    FORMAT = re.compile(r"^\[Step\.2\] (印刷\(PDF\)|共通製作仕様書の印刷)の IJCAD が応答せず PDF が出力されませんでした\(.+\)\(未完了\)$")
 
     def test_reason_is_a_fixed_format_without_identifying_information(self):
         for status in self.ALL:
@@ -193,9 +303,13 @@ class TimeoutReasonTest(unittest.TestCase):
         for status in self.ALL:
             for stage in (pf.STAGE_PRINT, pf.STAGE_SPEC_PRINT):
                 label = interim_runs.classify_failure(ps.timeout_reason(stage, ps.PrintOutcome(status)))
-                self.assertEqual(label, f"Step.2 の IJCAD が規定時間内に終了しない({stage})")
+                self.assertEqual(label, f"Step.2 の IJCAD が応答せず PDF が出ない({stage})")
         self.assertEqual(interim_runs.classify_failure("[Step.2] 印刷(PDF)の成果物が不足しています: 対象 5 件中 1 件(欠落 1 件・空または不正 0 件)(未完了)"),
                          "Step.2 の成果物が不足(印刷(PDF))")   # 既存の分類は変わらない
+
+    def test_non_hang_outcomes_are_not_timeouts(self):
+        for status in (ps.COMPLETED, ps.PDFS_READY, ps.PENDING, ps.NOT_RUN):
+            self.assertFalse(ps.PrintOutcome(status).timed_out)
 
 
 class FlowTest(Base):
@@ -203,14 +317,19 @@ class FlowTest(Base):
         """Base の外部処理のモックのうち、印刷の呼び出しだけを、呼び出し結果(self.outcomes を順に返す)に置き換える。
         同じ属性を二重に差し替えると、Base.run_step2 の停止順(開始順)で元に戻らず、他のテストへ漏れるため、置き換える。"""
         results = iter(self.outcomes)
+        self.print_calls = []
+
+        def fake_print(*a, **k):
+            self.print_calls.append((a, k))
+            return next(results)
         base = [p for p in super().patches() if getattr(p, "attribute", None) != "print_dwg_for_pdf"]
-        return base + [mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results))]
+        return base + [mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=fake_print)]
 
     def run_with_print(self, outcomes, runner):
         self.outcomes = outcomes
         return runner()
 
-    def test_timeout_fails_the_product_and_nothing_later_runs(self):
+    def test_hang_fails_the_product_and_nothing_later_runs(self):
         out = ps.PrintOutcome(ps.TIMEOUT_KILLED)
         res = self.run_with_print([out], self.run_step2)
         self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
@@ -218,20 +337,35 @@ class FlowTest(Base):
         self.assertEqual(self.names(), ["print_script"])                     # 次の塊・DWG コピー・DXF 変換・推論用画像へ進まない
         self.assertEqual(self.sleeps, [])                                    # 欠落の再確認(待機)にも入らない
 
-    def test_timeout_on_the_second_chunk_stops_after_it(self):
+    def test_the_expected_pdf_paths_of_the_chunk_are_passed_to_the_watcher(self):
+        self.run_with_print([ps.PrintOutcome(ps.COMPLETED, 0)] * 2, self.run_step2)
+        first = self.print_calls[0]
+        self.assertEqual(first[0][1], 5)
+        self.assertEqual(first[0][2], [str(self.dir_product / f"{p}.pdf") for p in self.PRINT_PAGES[:5]])
+        self.assertIs(first[1]["pdf_valid"], pf._is_valid_pdf)
+
+    def test_hang_on_the_second_chunk_stops_after_it(self):
         ok = ps.PrintOutcome(ps.COMPLETED, 0)
         res = self.run_with_print([ok, ps.PrintOutcome(ps.TIMEOUT_CLOSED)], self.run_step2)
         self.assertEqual(res.status, pf.FAILED)
         self.assertEqual(self.names(), ["print_script", "print_script"])
         self.assertEqual(res.reason, ps.timeout_reason(pf.STAGE_PRINT, ps.PrintOutcome(ps.TIMEOUT_CLOSED)))
 
-    def test_no_timeout_proceeds_exactly_as_before(self):
-        ok = ps.PrintOutcome(ps.COMPLETED, 0)
-        self.assertIsNone(self.run_with_print([ok, ok], self.run_step2))
+    def test_alive_ijcad_with_all_pdfs_present_proceeds_as_normal(self):
+        """プロセスが生きたまま(PDFS_READY)でも、PDF が揃っていれば、従来どおり次へ進む。"""
+        ready = ps.PrintOutcome(ps.PDFS_READY)
+        self.assertIsNone(self.run_with_print([ready, ready], self.run_step2))
         self.assertEqual(self.names(), ["print_script", "print_script", "copy_dwg", "convert_dwg2dxf", "pdf_to_images", "process_images_from_jpeg"])
 
+    def test_pending_with_a_missing_pdf_fails_through_the_existing_artifact_check_not_the_hang_reason(self):
+        """IJCAD が応答中のまま PDF が欠けた(PENDING)場合は、終了せず、既存の検査が「成果物が不足」で失敗にする。"""
+        self.skip["print"] = {"12"}
+        res = self.run_with_print([ps.PrintOutcome(ps.PENDING)], self.run_step2)
+        self.assertRegex(res.reason, r"^\[Step\.2\] 印刷\(PDF\)の成果物が不足しています: 対象 5 件中 1 件")
+        self.assertNotIn("応答せず", res.reason)
+        self.assertEqual(self.names(), ["print_script"])
+
     def test_launch_failure_still_falls_through_to_the_pdf_check(self):
-        """起動できなかった(NOT_RUN)場合は従来どおり。PDF が無ければ、成果物の検査が欠落として失敗にする。"""
         self.skip["print"] = set(self.PRINT_PAGES)
         res = self.run_with_print([ps.PrintOutcome(ps.NOT_RUN)], self.run_step2)
         self.assertRegex(res.reason, r"^\[Step\.2\] 印刷\(PDF\)の成果物が不足しています")
@@ -250,7 +384,8 @@ class FlowTest(Base):
                 for p in self.patches():
                     p.start()
                     started.append(p)
-                with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)),                         mock.patch.object(pf, "_select_pages", return_value=None):
+                with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
+                        mock.patch.object(pf, "_select_pages", return_value=None):
                     pf.run_product(self.ctx(), results)                      # 実の shutil.rmtree(一時フォルダの中だけ)
             finally:
                 for p in reversed(started):
@@ -266,7 +401,6 @@ class FlowTest(Base):
         res = self.run_with_print([ps.PrintOutcome(ps.TIMEOUT_KILLED)], self.run_step2)
         for forbidden in [str(self.tmp), PRODUCT, *self.PRINT_PAGES, "\\"]:
             self.assertNotIn(forbidden, res.reason)
-        # 時間切れの失敗では、製番フォルダの実パスをこの段階のログに足さない(印刷の塊のページ一覧は、従来どおりの記録)
         warn = " ".join(str(c.args[0]) for c in self.logger.warning.call_args_list)
         self.assertNotIn(str(self.tmp), warn)
 

@@ -154,7 +154,8 @@ def check_stage_artifacts(ctx: "ProductContext", stage: str, pages: List[str], n
 
 
 def print_timeout_result(stage: str, outcome: Any) -> Optional["ProductResult"]:
-    """印刷(IJCAD)が時間内に終了せず、終了処理(print_support)まで済んだ場合に、製番を失敗にする結果を返す(そうでなければ None)。
+    """印刷(IJCAD)がハング(PDF が出ず応答もしない)と判定され、終了処理(print_support)まで済んだ場合に、製番を失敗にする結果を返す(そうでなければ None。
+    プロセスが生きているだけ・PDF が不足しているだけでは、ここでは失敗にしない。PDF の不足は、続く既存の検査が「成果物が不足」で失敗にする)。
     理由は固定形式(段階名と終了の結果だけ。製番・ページ名・パス・例外メッセージ・標準出力/標準エラーは含めない)。製番フォルダは run_product が後始末する。"""
     if isinstance(outcome, print_support.PrintOutcome) and outcome.timed_out:
         return ProductResult(FAILED, print_support.timeout_reason(stage, outcome), cleanup=True)
@@ -345,9 +346,10 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     serial_Spec_dir = os.path.join(ctx.dir_design_serial, f"{ctx.serial}S0")
     if cad_mod.file_exists(serial_Spec_dir, spec_sheets_name):
         serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product)
-        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), log=logger.warning)
+        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, "1.pdf")],
+                                                   log=logger.warning, pdf_valid=_is_valid_pdf)
         timed_out = print_timeout_result(STAGE_SPEC_PRINT, outcome)
-        if timed_out is not None:                    # IJCAD が時間内に終了しなかった(終了処理は呼び出しの中で済んでいる)。後続へ進まない
+        if timed_out is not None:                    # IJCAD がハング(PDF が出ず応答もしない)と判定され、終了処理まで済んだ。後続へ進まない
             return timed_out
         cad_mod.countdown(3)
         pdf_name = os.path.join(dir_product, "1.pdf")
@@ -428,10 +430,11 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
             break  # chunk_list を抜ける
 
         product_script_win = print_support.output_print_script(chunk_5, ctx.dir_design_product, ctx.dir_product)
-        outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), log=logger.warning)
+        outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), [os.path.join(ctx.dir_product, f"{p}.pdf") for p in chunk_5],
+                                                   log=logger.warning, pdf_valid=_is_valid_pdf)
         logger.info(f" └> Page: {chunk_5}")
         timed_out = print_timeout_result(STAGE_PRINT, outcome)
-        if timed_out is not None:                    # IJCAD が時間内に終了しなかった。欠落の検査・次の塊・後続の変換や推論へ進まない
+        if timed_out is not None:                    # IJCAD がハングと判定され、終了処理まで済んだ。欠落の検査・次の塊・後続の変換や推論へ進まない
             return timed_out
         cad_mod.countdown(len(chunk_5)*4)
         # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む)。欠けていれば次の塊・後続へ進まない
