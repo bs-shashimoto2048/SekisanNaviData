@@ -98,7 +98,7 @@ class Base(unittest.TestCase):
     def patches(self):
         return [mock.patch.object(pf.cad_mod, "is_file_in_use", return_value=False),
                 mock.patch.object(pf.print_support, "output_print_script", side_effect=self.fake_print_script),
-                mock.patch.object(pf.design_mod, "print_dwg_for_pdf"),
+                mock.patch.object(pf.print_support, "print_dwg_for_pdf", return_value=pf.print_support.PrintOutcome(pf.print_support.COMPLETED, 0)),
                 mock.patch.object(pf.cad_mod, "countdown"),
                 mock.patch.object(pf.cad_mod, "copy_files_from_list", side_effect=lambda *a, **k: self.calls.append(("copy_dwg",))),
                 mock.patch.object(pf.cad_mod, "convert_dwg2dxf", side_effect=self.fake_convert),

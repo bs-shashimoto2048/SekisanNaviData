@@ -296,7 +296,7 @@ class Step2Test(FlowBase):
         ctx.print_pages = ["21", "22"]
         with mock.patch.object(pf.cad_mod, "is_file_in_use", return_value=True), \
                 mock.patch.object(pf.print_support, "output_print_script") as out, \
-                mock.patch.object(pf.design_mod, "print_dwg_for_pdf") as prt, \
+                mock.patch.object(pf.print_support, "print_dwg_for_pdf", return_value=pf.print_support.PrintOutcome(pf.print_support.COMPLETED, 0)) as prt, \
                 mock.patch.object(pf.cad_mod, "countdown"):
             res = pf._print_drawings(ctx)
         self.assertEqual(res, pf.ProductResult(pf.SKIPPED, "図面使用中(未完了)", cleanup=True))
@@ -314,7 +314,7 @@ class Step2Test(FlowBase):
             return "s.scr"
         with mock.patch.object(pf.cad_mod, "is_file_in_use", return_value=False), \
                 mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script) as out, \
-                mock.patch.object(pf.design_mod, "print_dwg_for_pdf") as prt, \
+                mock.patch.object(pf.print_support, "print_dwg_for_pdf", return_value=pf.print_support.PrintOutcome(pf.print_support.COMPLETED, 0)) as prt, \
                 mock.patch.object(pf.cad_mod, "countdown"):
             self.assertIsNone(pf._print_drawings(ctx))
         self.assertEqual([c.args[0] for c in out.call_args_list], [pages[:5], pages[5:]])

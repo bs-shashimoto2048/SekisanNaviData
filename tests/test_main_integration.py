@@ -269,7 +269,7 @@ class MainIntegrationBase(unittest.TestCase):
             st.enter_context(mock.patch.object(app.host_mod, "get_property_data", host_guard("get_property_data", (SERIAL, BOX_TYPE))))
             st.enter_context(mock.patch.object(app.design_mod, "search_server", host_guard("search_server", str(self.design_serial))))
             st.enter_context(mock.patch.object(app.print_support, "output_print_script", self._fake_output_print_script))
-            st.enter_context(mock.patch.object(app.design_mod, "print_dwg_for_pdf", mock.Mock(name="print_dwg_for_pdf")))
+            st.enter_context(mock.patch.object(app.print_support, "print_dwg_for_pdf", mock.Mock(name="print_dwg_for_pdf", return_value=app.print_support.PrintOutcome(app.print_support.COMPLETED, 0))))
             st.enter_context(mock.patch.object(app.cad_mod, "is_file_in_use", fake_in_use))
             st.enter_context(mock.patch.object(app.cad_mod, "countdown", mock.Mock(name="countdown")))
             st.enter_context(mock.patch.object(app.cad_mod, "convert_dwg2dxf", convert))
