@@ -959,6 +959,49 @@ class ServerTest(NoRealSubprocess):
         self.assertIn("ログオン中のみ動作します(ログオフ中は動きません)", html)           # 制約が画面で分かる
         self.assertIn('id="interval"', html)
 
+    def test_browse_folder_returns_the_path_without_saving_or_running_anything(self):
+        d = self.tmp / "picked"
+        d.mkdir()
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=str(d).encode("utf-8"), stderr=b""),
+                                                  drive_type=lambda r: 3)
+        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
+        self.assertEqual((code, body), (200, {"ok": True, "path": str(d), "cancelled": False}))
+        self.assertEqual(self.ctx.store.load().output_root, "")                       # 選んだだけでは保存しない
+        self.assertEqual((self.main_calls, self.sched_calls), ([], []))
+        # 既存の「保存」「再読込」で保存・復元できる
+        self.assertEqual(self.jcall("PUT", "/api/settings", {"output_root": body["path"], "schedule_time": "08:00"})[0], 200)
+        code, again = self.jcall("POST", "/api/settings/reload", {})
+        self.assertEqual(again["settings"]["output_root"], str(d))
+
+    def test_browse_folder_cancel_and_rejections(self):
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"", stderr=b""))
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}), (200, {"ok": True, "path": None, "cancelled": True}))
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"\\\\srv\\share\\x", stderr=b""))
+        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
+        self.assertEqual(code, 400)
+        self.assertIn("ネットワーク上の場所は選べません", body["error"])
+        self.assertNotIn("srv", body["error"])
+
+    def test_browse_folder_is_accepted_only_from_the_local_screen(self):
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: self.fail("ダイアログを開いてはいけない"))
+        h = {"Content-Type": "application/json"}                                      # カスタムヘッダなし(別サイトからの送信相当)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, headers=h)[0], 403)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, host="evil.example.com")[0], 403)
+        self.assertEqual(self.call("GET", "/api/settings/browse-folder", headers={})[0], 404)
+
+    def test_browse_folder_busy_is_409(self):
+        def busy():
+            raise picker_mod.PickerBusy("フォルダ選択の画面がすでに開いています。")
+        self.ctx.picker = SimpleNamespace(pick=busy)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {})[0], 409)
+
+    def test_page_has_the_browse_button_next_to_the_output_root(self):
+        html = self.call("GET", "/", headers={})[1].decode("utf-8")
+        self.assertIn('id="browse"', html)
+        self.assertIn("参照…", html)
+        self.assertLess(html.index('id="outroot"'), html.index('id="browse"'))
+        self.assertLess(html.index('id="browse"'), html.index('id="save"'))
+
     def test_page_structure_matches_the_agreed_spec(self):
         """合意済みの構成(docs/ops_console.md「画面」): 左に 1〜4、右に 5。各項目の入力・操作・履歴の列を、
         見出しの文字列だけでなく HTML の入れ子で確認する。項目の省略・追加(独自変更)を検出する。"""
@@ -1020,49 +1063,6 @@ class ServerTest(NoRealSubprocess):
         for caption in ("参照…", "保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "この製番を1回実行",
                         "出力先", "有効", "開始時刻", "間隔", "日ごと", "製番"):
             self.assertIn(caption, html, caption)
-    def test_browse_folder_returns_the_path_without_saving_or_running_anything(self):
-        d = self.tmp / "picked"
-        d.mkdir()
-        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=str(d).encode("utf-8"), stderr=b""),
-                                                  drive_type=lambda r: 3)
-        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
-        self.assertEqual((code, body), (200, {"ok": True, "path": str(d), "cancelled": False}))
-        self.assertEqual(self.ctx.store.load().output_root, "")                       # 選んだだけでは保存しない
-        self.assertEqual((self.main_calls, self.sched_calls), ([], []))
-        # 既存の「保存」「再読込」で保存・復元できる
-        self.assertEqual(self.jcall("PUT", "/api/settings", {"output_root": body["path"], "schedule_time": "08:00"})[0], 200)
-        code, again = self.jcall("POST", "/api/settings/reload", {})
-        self.assertEqual(again["settings"]["output_root"], str(d))
-
-    def test_browse_folder_cancel_and_rejections(self):
-        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"", stderr=b""))
-        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}), (200, {"ok": True, "path": None, "cancelled": True}))
-        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"\\\\srv\\share\\x", stderr=b""))
-        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
-        self.assertEqual(code, 400)
-        self.assertIn("ネットワーク上の場所は選べません", body["error"])
-        self.assertNotIn("srv", body["error"])
-
-    def test_browse_folder_is_accepted_only_from_the_local_screen(self):
-        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: self.fail("ダイアログを開いてはいけない"))
-        h = {"Content-Type": "application/json"}                                      # カスタムヘッダなし(別サイトからの送信相当)
-        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, headers=h)[0], 403)
-        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, host="evil.example.com")[0], 403)
-        self.assertEqual(self.call("GET", "/api/settings/browse-folder", headers={})[0], 404)
-
-    def test_browse_folder_busy_is_409(self):
-        def busy():
-            raise picker_mod.PickerBusy("フォルダ選択の画面がすでに開いています。")
-        self.ctx.picker = SimpleNamespace(pick=busy)
-        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {})[0], 409)
-
-    def test_page_has_the_browse_button_next_to_the_output_root(self):
-        html = self.call("GET", "/", headers={})[1].decode("utf-8")
-        self.assertIn('id="browse"', html)
-        self.assertIn("参照…", html)
-        self.assertLess(html.index('id="outroot"'), html.index('id="browse"'))
-        self.assertLess(html.index('id="browse"'), html.index('id="save"'))
-
     def test_mutating_requests_need_the_header_and_a_loopback_host(self):
         code, _ = self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_time": "08:00"}, headers={"Content-Type": "application/json"})
         self.assertEqual(code, 403)
