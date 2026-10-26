@@ -2,12 +2,13 @@
 # 画面(static/index.html)と JSON API。状態を変える操作(PUT/POST/DELETE)は、ブラウザの別サイトからの送信を防ぐため
 # カスタムヘッダ X-Ops-Request を要求し、Host ヘッダも 127.0.0.1 / localhost だけを受け付ける。
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
 
 from ops import checks as checks_mod
+from ops.folder_picker import FolderPicker, PickerBusy
 from ops.history import History
 from ops.runner import Busy, RunManager
 from ops.scheduler import SchedulerError, TaskScheduler
@@ -26,6 +27,7 @@ class AppContext:
     scheduler: TaskScheduler
     config_path: str
     run_checks: Callable = checks_mod.run_checks
+    picker: FolderPicker = field(default_factory=FolderPicker)
 
 
 def make_handler(ctx: AppContext):
@@ -117,6 +119,7 @@ def make_handler(ctx: AppContext):
             path = self.path.split("?", 1)[0]
             routes = {
                 "/api/settings/reload": lambda: {"ok": True, "settings": ctx.store.load().as_dict()},
+                "/api/settings/browse-folder": self._do_browse,
                 "/api/checks": self._do_checks,
                 "/api/run": self._do_run,
                 "/api/schedule/register": self._do_register,
@@ -138,7 +141,7 @@ def make_handler(ctx: AppContext):
                 self._json(200, fn())
             except SettingsError as e:
                 self._error(400, str(e))
-            except Busy as e:
+            except (Busy, PickerBusy) as e:
                 self._error(409, str(e))
             except SchedulerError as e:
                 self._error(502, str(e))
@@ -159,6 +162,12 @@ def make_handler(ctx: AppContext):
                 except Exception:  # noqa: BLE001 - 照会に失敗しても画面は出す
                     out["schedule"] = {"registered": None, "enabled": None, "time": None, "interval_days": None}
             return out
+
+        def _do_browse(self):
+            """出力先の「参照…」。この PC の画面にフォルダ選択を出し、選ばれたローカルの既存フォルダの絶対パスを返す
+            (保存はしない。キャンセルは path=None)。ローカル画面からの要求(ループバックの Host とカスタムヘッダ)だけ受け付ける。"""
+            path = ctx.picker.pick()
+            return {"ok": True, "path": path, "cancelled": path is None}
 
         def _do_checks(self):
             settings = ctx.store.load()

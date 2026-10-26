@@ -23,7 +23,7 @@ import requests  # noqa: E402
 import yaml  # noqa: E402
 
 from pipeline import api_preflight  # noqa: E402
-from ops import checks, history as history_mod, runner as runner_mod, scheduler as scheduler_mod, server as server_mod  # noqa: E402
+from ops import checks, folder_picker as picker_mod, history as history_mod, runner as runner_mod, scheduler as scheduler_mod, server as server_mod  # noqa: E402
 from ops.history import COMPLETED, FAILED, History, sanitize_reason  # noqa: E402
 from ops.runner import ALL_PRODUCTS, SKIPPED, Busy, RunLock, RunManager  # noqa: E402
 from ops.settings_store import OpsSettings, SettingsError, SettingsStore  # noqa: E402
@@ -823,6 +823,85 @@ class RunnerTest(NoRealSubprocess):
 
 
 # ------------------------------------------------------------------ HTTP(127.0.0.1 のみ・ヘッダ検証・各操作)
+class FolderPickerTest(NoRealSubprocess):
+    """出力先の「参照…」。実ダイアログ・実プロセスは起動しない(runner / drive_type を差し替える)。"""
+
+    def _picker(self, stdout=b"", returncode=0, drive_type=lambda root: 3, raises=None):
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            if raises:
+                raise raises
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"")
+        return picker_mod.FolderPicker(runner=runner, drive_type=drive_type), calls
+
+    def test_returns_the_chosen_existing_local_folder_as_an_absolute_path(self):
+        d = self.tmp / "出力"
+        d.mkdir()
+        picker, calls = self._picker(stdout=(str(d) + "\r\n").encode("utf-8"))
+        before = sorted(p.name for p in self.tmp.iterdir())
+        self.assertEqual(picker.pick(), str(d))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)          # 何も作成・変更しない
+        self.assertEqual(len(calls), 1)
+        script = calls[0][-1]
+        self.assertIn("ShowNewFolderButton=$false", script)                           # 新規フォルダ作成ボタンなし
+        self.assertIn("RootFolder='MyComputer'", script)                              # ネットワークの場所を起点にしない
+
+    def test_cancel_returns_none(self):
+        picker, _ = self._picker(stdout=b"")
+        self.assertIsNone(picker.pick())
+
+    def test_unc_and_network_drives_are_rejected_with_a_fixed_message(self):
+        for unc in ("\\\\server\\share\\dir", "//server/share/dir"):
+            picker, _ = self._picker(stdout=unc.encode("utf-8"))
+            with self.assertRaises(SettingsError) as cm:
+                picker.pick()
+            self.assertIn("ネットワーク上の場所は選べません", str(cm.exception))
+            self.assertNotIn("server", str(cm.exception))
+        d = self.tmp / "net"
+        d.mkdir()
+        picker, _ = self._picker(stdout=str(d).encode("utf-8"), drive_type=lambda root: picker_mod.DRIVE_REMOTE)   # ネットワークドライブ
+        with self.assertRaises(SettingsError) as cm:
+            picker.pick()
+        self.assertIn("ネットワーク上の場所は選べません", str(cm.exception))
+        self.assertNotIn(str(d), str(cm.exception))
+
+    def test_non_absolute_missing_or_dotdot_paths_are_rejected(self):
+        for bad in ("rel\\dir", "C:rel", str(self.tmp / "none"), str(self.tmp / "a" / ".." / "b")):
+            picker, _ = self._picker(stdout=bad.encode("utf-8"))
+            with self.assertRaises(SettingsError):
+                picker.pick()
+
+    def test_dialog_failures_use_fixed_messages_without_paths(self):
+        picker, _ = self._picker(returncode=1, stdout=str(self.tmp).encode("utf-8"))
+        with self.assertRaises(SettingsError) as cm:
+            picker.pick()
+        self.assertNotIn(str(self.tmp), str(cm.exception))
+        picker, _ = self._picker(raises=OSError(str(self.tmp)))
+        with self.assertRaises(SettingsError) as cm:
+            picker.pick()
+        self.assertIn("OSError", str(cm.exception))
+        self.assertNotIn(str(self.tmp), str(cm.exception))
+
+    def test_only_one_dialog_at_a_time(self):
+        gate, inside = threading.Event(), threading.Event()
+
+        def runner(args):
+            inside.set()
+            gate.wait(5)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        picker = picker_mod.FolderPicker(runner=runner, drive_type=lambda root: 3)
+        th = threading.Thread(target=picker.pick)
+        th.start()
+        self.assertTrue(inside.wait(5))
+        with self.assertRaises(picker_mod.PickerBusy):
+            picker.pick()
+        gate.set()
+        th.join(5)
+        self.assertIsNone(picker.pick())                                              # 終われば再び開ける
+
+
 class ServerTest(NoRealSubprocess):
     def setUp(self):
         super().setUp()
@@ -929,7 +1008,7 @@ class ServerTest(NoRealSubprocess):
         self.assertIn("right", w.section_parent["s5"])
         self.assertEqual(list(w.section_parent), ["s1", "s2", "s3", "s4", "s5"])
         # 各項目の入力・操作(省略も追加もしない)
-        self.assertEqual(w.items["s1"], [("input", "outroot"), ("button", "save"), ("button", "reload")])
+        self.assertEqual(w.items["s1"], [("input", "outroot"), ("button", "browse"), ("button", "save"), ("button", "reload")])
         self.assertEqual(w.items["s2"], [("button", "check"), ("ul", "checks")])
         self.assertEqual(w.items["s3"], [("input", "enabled"), ("input", "time"), ("input", "interval"),
                                          ("button", "register"), ("button", "unregister")])
@@ -938,9 +1017,51 @@ class ServerTest(NoRealSubprocess):
         # 実行履歴の列(日時・種別・製番・状態・理由)
         self.assertEqual(w.th, ["日時", "種別", "製番", "状態", "理由"])
         html = raw.decode("utf-8")
-        for caption in ("保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "この製番を1回実行",
+        for caption in ("参照…", "保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "この製番を1回実行",
                         "出力先", "有効", "開始時刻", "間隔", "日ごと", "製番"):
             self.assertIn(caption, html, caption)
+    def test_browse_folder_returns_the_path_without_saving_or_running_anything(self):
+        d = self.tmp / "picked"
+        d.mkdir()
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=str(d).encode("utf-8"), stderr=b""),
+                                                  drive_type=lambda r: 3)
+        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
+        self.assertEqual((code, body), (200, {"ok": True, "path": str(d), "cancelled": False}))
+        self.assertEqual(self.ctx.store.load().output_root, "")                       # 選んだだけでは保存しない
+        self.assertEqual((self.main_calls, self.sched_calls), ([], []))
+        # 既存の「保存」「再読込」で保存・復元できる
+        self.assertEqual(self.jcall("PUT", "/api/settings", {"output_root": body["path"], "schedule_time": "08:00"})[0], 200)
+        code, again = self.jcall("POST", "/api/settings/reload", {})
+        self.assertEqual(again["settings"]["output_root"], str(d))
+
+    def test_browse_folder_cancel_and_rejections(self):
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"", stderr=b""))
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}), (200, {"ok": True, "path": None, "cancelled": True}))
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: SimpleNamespace(returncode=0, stdout=b"\\\\srv\\share\\x", stderr=b""))
+        code, body = self.jcall("POST", "/api/settings/browse-folder", {})
+        self.assertEqual(code, 400)
+        self.assertIn("ネットワーク上の場所は選べません", body["error"])
+        self.assertNotIn("srv", body["error"])
+
+    def test_browse_folder_is_accepted_only_from_the_local_screen(self):
+        self.ctx.picker = picker_mod.FolderPicker(runner=lambda a: self.fail("ダイアログを開いてはいけない"))
+        h = {"Content-Type": "application/json"}                                      # カスタムヘッダなし(別サイトからの送信相当)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, headers=h)[0], 403)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {}, host="evil.example.com")[0], 403)
+        self.assertEqual(self.call("GET", "/api/settings/browse-folder", headers={})[0], 404)
+
+    def test_browse_folder_busy_is_409(self):
+        def busy():
+            raise picker_mod.PickerBusy("フォルダ選択の画面がすでに開いています。")
+        self.ctx.picker = SimpleNamespace(pick=busy)
+        self.assertEqual(self.jcall("POST", "/api/settings/browse-folder", {})[0], 409)
+
+    def test_page_has_the_browse_button_next_to_the_output_root(self):
+        html = self.call("GET", "/", headers={})[1].decode("utf-8")
+        self.assertIn('id="browse"', html)
+        self.assertIn("参照…", html)
+        self.assertLess(html.index('id="outroot"'), html.index('id="browse"'))
+        self.assertLess(html.index('id="browse"'), html.index('id="save"'))
 
     def test_mutating_requests_need_the_header_and_a_loopback_host(self):
         code, _ = self.jcall("PUT", "/api/settings", {"output_root": "", "schedule_time": "08:00"}, headers={"Content-Type": "application/json"})
