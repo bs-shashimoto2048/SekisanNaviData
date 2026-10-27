@@ -302,10 +302,10 @@ class ReasonHygieneAndCleanupTest(Base):
                 p.stop()
         rmtree.assert_called_once_with(str(self.dir_product), ignore_errors=True)
         self.assertTrue(pf.is_under(str(self.dir_product), str(self.output_dir)))
-        # 削除しきれずにフォルダが残った(ここでは rmtree がモックで、削除されない)ときは、ログで警告する(次回以降「処理済み」扱いになるため)
+        # 削除しきれずにフォルダが残った(ここでは rmtree がモックで、削除されない)ときは、ログで警告する(再処理マーカーを保持し、次回の全件実行で再試行する)
         warned = [str(c.args[0]) for c in self.logger.warning.call_args_list if "削除しきれませんでした" in str(c.args[0])]
         self.assertEqual(len(warned), 1)
-        self.assertIn("処理済みとして扱われます", warned[0])
+        self.assertIn("再処理マーカーを保持し", warned[0])
 
     def test_no_leftover_warning_when_the_cleanup_really_removed_the_folder(self):
         self.skip["jpeg"] = {"10"}
