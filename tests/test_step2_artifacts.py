@@ -113,7 +113,7 @@ class Base(unittest.TestCase):
             for p in self.patches():
                 p.start()
                 started.append(p)
-            with mock.patch.object(pf, "_select_pages", return_value=None):
+            with mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 return pf.step2_inference_images(ctx)
         finally:
             for p in started:
@@ -272,7 +272,7 @@ class ReasonHygieneAndCleanupTest(Base):
                 p.start()
                 started.append(p)
             with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
-                    mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 pf.run_product(self.ctx(), results)                         # 実の shutil.rmtree(一時フォルダの中だけ)
         finally:
             for p in started:
@@ -316,7 +316,7 @@ class ReasonHygieneAndCleanupTest(Base):
                 p.start()
                 started.append(p)
             with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
-                    mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 pf.run_product(self.ctx(), results)                         # 実の削除(一時フォルダの中だけ)
         finally:
             for p in started:

@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import fitz
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -18,6 +20,59 @@ import print_support as ps  # noqa: E402
 from pipeline import product_flow as pf  # noqa: E402
 from interim import runs as interim_runs  # noqa: E402
 from tests.test_step2_artifacts import Base, PRODUCT  # noqa: E402
+
+
+class DisplayPreviewPipelineTest(unittest.TestCase):
+    """PDF-only図面と書類から表示用PNGを作り、推論用PNGを上書きしない。"""
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(prefix="display_preview_pipeline_")
+        self.addCleanup(td.cleanup)
+        self.root = Path(td.name)
+        self.logger = mock.Mock()
+
+    def pdf(self, name, text):
+        path = self.root / name
+        doc = fitz.open()
+        page = doc.new_page(width=1191, height=842)
+        page.insert_text((100, 100), text)
+        doc.save(path)
+        doc.close()
+        return path
+
+    def context(self, *, print_pages, inference_pages):
+        return mock.Mock(
+            dir_product=str(self.root), print_pages=print_pages, baninf_pages=inference_pages,
+            logger=self.logger,
+        )
+
+    def test_pdf_only_pages_and_both_documents_get_separate_previews(self):
+        self.pdf("01.pdf", "PDF-only page")
+        self.pdf("0_S0.pdf", "Spec sheet")
+        self.pdf("0_A1.pdf", "Check sheet")
+        inference_png = self.root / "1.png"
+        inference_png.write_bytes(b"inference-original")
+        ctx = self.context(print_pages=["01", "1"], inference_pages=["1"])
+
+        result = pf._make_display_previews(ctx)
+
+        self.assertIsNone(result)
+        for name in ("01__preview.png", "0_S0__preview.png", "0_A1__preview.png"):
+            self.assertTrue((self.root / name).read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(inference_png.read_bytes(), b"inference-original")
+        self.assertFalse((self.root / "1__preview.png").exists())
+
+    def test_check_sheet_preview_is_created_when_page_zero_is_an_inference_page(self):
+        self.pdf("0_A1.pdf", "Check sheet")
+        zero_png = self.root / "0.png"
+        zero_png.write_bytes(b"inference-zero-original")
+        ctx = self.context(print_pages=["0"], inference_pages=["0"])
+
+        result = pf._make_display_previews(ctx)
+
+        self.assertIsNone(result)
+        self.assertTrue((self.root / "0_A1__preview.png").is_file())
+        self.assertFalse((self.root / "0__preview.png").exists())
+        self.assertEqual(zero_png.read_bytes(), b"inference-zero-original")
 
 CAD = r"C:\Fake IJCAD\gcad.exe"
 IDENTITY = (132_000_000_000_000_000, "gcad.exe")
@@ -456,7 +511,7 @@ class FlowTest(Base):
                     p.start()
                     started.append(p)
                 with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
-                        mock.patch.object(pf, "_select_pages", return_value=None):
+                        mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                     pf.run_product(self.ctx(), results)                      # 実の shutil.rmtree(一時フォルダの中だけ)
             finally:
                 for p in reversed(started):
@@ -579,7 +634,7 @@ class SpecSheetFlowTest(Base):
                     started.append(patcher)
             with mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script), \
                     mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: ps.PrintOutcome(ps.COMPLETED, 0)), \
-                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 return pf.step2_inference_images(self.spec_ctx)
         finally:
             for patcher in reversed(started):
@@ -913,7 +968,7 @@ class SpecSheetFlowTest(Base):
             results = iter([ps.PrintOutcome(ps.COMPLETED, 0)] * 2)
             with mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script), \
                     mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results)) as prt, \
-                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 pf.step2_inference_images(self.spec_ctx)
         finally:
             for patcher in reversed(started):
@@ -1040,7 +1095,7 @@ class ChunkPacingTest(Base):
                 p.start()
                 started.append(p)
             with mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results)), \
-                    mock.patch.object(pf.cad_mod, "countdown", countdown), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown", countdown), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 self.assertIsNone(pf.step2_inference_images(self.ctx()))
         finally:
             for p in reversed(started):

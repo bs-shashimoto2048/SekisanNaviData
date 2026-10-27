@@ -1,6 +1,6 @@
 # データ作成パイプラインの現状(大規改修の出発点)
 
-2026-10-13 時点の `main`(初回コミット b629173)を、コードとテストから読み取って整理したもの。改修中は、ここの「出力契約」を**根拠なく変えない**。
+2026-10-27 時点の `main`(共通製作仕様書・設計作図完了シート対応後)を基準にした出力仕様。変更した出力契約は、対応するテストと合わせて記録する。
 実図面・本番サーバー・SekisanNavi には接続せず、リポジトリ内のコード・テスト・ドキュメントだけで確認した。確認できていないことは「未確認」と書く。
 
 ## 1. 全体像
@@ -12,7 +12,7 @@
 | 対象製番 | 当月 3 番出図済み製番を取得し、処理済みを除外 | `bs_pkg.host_mod` | **ホスト(DB)** |
 | 条件判定 | 整理番号あり・製番頭 2 文字・箱体型式・処理済みでないこと | `host_mod.get_property_data` | **ホスト** |
 | Step.1 | 設計フォルダの `.baninf` から盤情報 DF を作り CSV 出力。共通製作仕様書(`{整理番号}S0\1.dwg`)があれば PDF 化 | `cad_data_process`、`design_mod`、`print_support` | **設計サーバー(共有)**、IJCAD |
-| Step.2 | ページ選別(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないものだけ。読めなければ失敗)→ 全印刷対象を PDF 化 → 推論対象の DWG をコピー → DXF 変換 → PDF→JPEG→前処理 PNG(**各段階の直後に成果物を検査する**。下の「Step.2 の成果物の検査」) | `cad_data_process`、`image_mod`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
+| Step.2 | ページ選別(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないものだけ。読めなければ失敗)→ 全印刷対象を PDF 化 → PDF-only図面・書類の表示用PNG作成 → 推論対象の DWG をコピー → DXF 変換 → 推論PNG作成(**各段階の直後に成果物を検査する**) | `cad_data_process`、`image_mod`、`display_previews`、ODA File Converter、IJCAD | IJCAD、ODA、設計サーバー |
 | Step.3 | DXF の図枠寸法と PNG の図枠寸法から縮尺を算出し、`product_df` に書き戻す | `cad_data_process`(`get_frame_size`、`specified_frame_detection`、`update_frame_info`) | なし |
 | Step.4 | 推論 API へ PNG を送り `*_detected.txt` を得る → CAD 座標へ変換して `detected_df.csv` | `image_mod.slice_prediction_request`、`estimate_code_processer.create_detected_csv` | **推論 API(本番はリモート、検証は loopback)** |
 | Step.5 | 積算コード集計: `estcode_df.csv` を作り、操作パネル・盤内トランスの数量を数える | `estimate_code_processer` | なし |
@@ -29,6 +29,9 @@
 | DXF 変換 | 推論対象ページの `{ページ}{convert_aft}` | 空。欠けているときだけ最大 5 秒再確認 |
 | PDF→JPEG | 推論対象ページの `{ページ}.{image_mod の detect_conversion.extention}` | 空、画像として開けない |
 | JPEG→PNG | 推論対象ページの `{ページ}{original_draw}`(Step.3・推論が読む名前) | 空、画像として開けない |
+| 表示用プレビューPNG | 推論対象外のPDF-only図面と、存在する `0_S0.pdf` / `0_A1.pdf` の `{PDF名}__preview.png` | 空、画像として開けない。作成できなければ製番を失敗にし、部分画像を完了出力として残さない |
+
+表示用プレビューは PyMuPDF でPDFの先頭ページを150dpiで描画する。PDF内の描画・文字の外接範囲に余白を付けて切り出し、範囲を取得できないページは全体を描画する。出力名は推論用の `{ページ}.png` と分け、`{PDF名}__preview.png` とする。推論画像・元PDFは変更しない。共通製作仕様書と設計作図完了シートは、PDFのまま開く機能も維持する。
 
 - 失敗理由は固定形式: `[Step.2] {段階}の成果物が不足しています: 対象 N 件中 M 件(欠落 a 件・空または不正 b 件)(未完了)`。製番・パス・例外メッセージ・設定値は含めない(ページ名はログにだけ残す)。暫定運用の画面では「Step.2 の成果物が不足({段階})」と分類される。
 - **IJCAD が応答しなくなったとき(印刷のハング)**: 印刷は `print_support.print_dwg_for_pdf`(bs_pkg の同名関数と同じ設定・同じコマンドで起動)が行う(Step.1 の共通製作仕様書と、Step.2 の 5 枚ずつの塊の両方)。bs_pkg の関数は、起動して `process.wait(起動時間 + 枚数 × 1 枚あたりの時間)` するだけで、待ち満了(TimeoutExpired)も握りつぶし、IJCAD を終了させない。応答しない IJCAD が図面を開いたまま残った(A1AY4693)ため、置き換えた。
@@ -66,9 +69,10 @@
 | `design.csv` | 設計製番フォルダ直下の `.db`(ページ情報。ファイル名は問わない。ただし Windows の画像キャッシュ `Thumbs.db` だけは除く)から作る、製番単位の設計情報(1 `.db` = 1 行)。24 列(見出しは `blank, 整理番号, 製番, ページ番号, blank, 図名, 図面尺度１, 図面尺度２, 承認設計, 年, 月, 日, 承認照査, 年, 月, 日, 製作設計, 年, 月, 日, 製作照査, 年, 月, 日`。`blank` と重複する年・月・日はそのまま)。**CP932・BOM なし**。`.db` が無い・読めない製番は**失敗**(Step.1 で止まる)。詳細は下の「design.csv」 |
 | `material.csv` | 設計フォルダの `*.boxspec` から作る材料一覧(ページ × 材料シンボル × 構成部)。7 列 `PAGE, SOURCE_FILE, SYMBOL_NAME, CABTYPE, COMPONENT_CODE, COMPONENT_NAME, MATERIAL_SPEC`。**CP932・BOM なし**。`.boxspec` が無い、または解析に失敗した製番は**失敗**(Step.1 で止まり、`material.csv` は作られない)。詳細は下の「material.csv」 |
 | `{ページ}.pdf` | 印刷対象の全ページ(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないもの)。A3・用紙中央(`docs/print_spec.md`)。**例外: 設計作図完了シート(ページ名「0」)は `0_A1.pdf`**(下の行。**常に** `0_A1.pdf`。ページ「0」が推論対象のときだけ、推論用の `0.pdf` が、完成を確認した `0_A1.pdf` のコピーとして別に作られる) |
-| `{ページ}.jpeg` / `.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
+| `{ページ}.jpeg` / `{ページ}.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。推論用PNGは既存の前処理結果で、表示用プレビューとは別物。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
+| `{ページ}__preview.png` | 推論対象外で印刷されたPDF-only図面の表示用画像。150dpi・PDF内容範囲に余白を付けて描画。推論用PNG・オーバーレイには使わない |
 | `dwg/{ページ}.dwg` | 推論対象ページの DWG コピー |
-| `0_S0.pdf`(共通製作仕様書)<br>`0_A1.pdf`(設計作図完了シート) | **`0_S0.pdf`**: 共通製作仕様書があり、PDF の完成を確認でき、かつ同名のファイルが無いときだけ(旧名: `共通製作仕様書.pdf`。#29 の途中案の `0.pdf` ではない)。**`0_A1.pdf`**: 設計図面フォルダのページ「0」(設計作図完了シート)。従来は通常のページとして `0.pdf` に出していたものを、この名前に変更(推論対象のときは、画像変換が `0.pdf` を開くので、推論用の入力として `0.pdf` を `0_A1.pdf` のコピーで用意する。`0_A1.pdf` = 設計作図完了シートの成果物、`0.pdf` = 推論用の入力で、役割は別)。どちらも**数値の図面ページ番号ではなく**、通常の `0.pdf`(従来のページ「0」の出力。既存の出力には残る)とも別のファイル。SekisanNavi は、この 2 つを図面一覧の最上段(仕様書 → 設計作図完了シート)に固定表示し、ページ番号の一覧(`{数字}.pdf`)には含めない。ファイルが無いときは項目を出さない。既存の出力(旧名・`0.pdf`)は、上書き・改名しない |
+| `0_S0.pdf` / `0_A1.pdf` と各 `__preview.png` | PDFは既存の書類契約どおり。対応するPDFが出力されたときは、カード表示用PNG (`0_S0__preview.png` / `0_A1__preview.png`)も生成する。SekisanNaviは書類を図面一覧の最上段(仕様書→設計作図完了シート)に出し、PNGをサムネイル、PDFをクリック時の閲覧に使う。PNG生成に失敗した場合はその製番を成功扱いにしない |
 | `../logs/*.log` | ログ(Git 管理外) |
 
 列の一覧と順序は `tests/test_output_contract.py` を参照(順序も契約として固定している)。
