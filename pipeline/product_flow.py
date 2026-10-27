@@ -384,27 +384,81 @@ def _print_spec_sheet(ctx: ProductContext, dir_product: str) -> Optional[Product
     return None
 
 
-SPEC_PAGE = os.path.splitext(print_support.SPEC_PDF_NAME)[0]      # 最終名 `0.pdf` と同名になる図面ページのページ名
+def page_pdf_name(ctx: ProductContext, page) -> str:
+    """図面ページの出力 PDF の名前。通常は `{ページ名}.pdf`(従来どおり)。設計作図完了シート(ページ名「0」)は、常に `0_A1.pdf`。
+    ページ「0」が推論対象のときも同じ(推論用の `0.pdf` は、ここではなく `_ensure_inference_zero_pdf` が、完成した `0_A1.pdf` から別に用意する)。"""
+    name = str(page)
+    if name == print_support.CHECK_SHEET_PAGE:
+        return print_support.CHECK_SHEET_PDF_NAME
+    return f"{name}.pdf"
+
+
+def _is_inference_zero(ctx: ProductContext) -> bool:
+    """ページ「0」が推論対象か(画像変換 = bs_pkg が `0.pdf` を開く)。"""
+    return print_support.CHECK_SHEET_PAGE in [str(p) for p in ctx.baninf_pages]
+
+
+def _check_zero_outputs_absent(ctx: ProductContext, chunk: List[str]) -> Optional[ProductResult]:
+    """ページ「0」を印刷する前に、その出力(`0_A1.pdf`。推論対象なら推論用の `0.pdf` も)が製番フォルダに無いことを確認する。
+    製番フォルダは処理の開始時に新規に作られる(既にあれば「処理済み」でスキップ)ので、通常は無い。あれば異常(古い PDF の誤使用・上書きを避けるため、
+    印刷せず、固定形式の理由で失敗にする。既存のファイルは変更しない。後始末は run_product が出力ルート配下の対象製番フォルダだけ)。"""
+    if print_support.CHECK_SHEET_PAGE not in [str(p) for p in chunk]:
+        return None
+    names = [print_support.CHECK_SHEET_PDF_NAME] + (["0.pdf"] if _is_inference_zero(ctx) else [])
+    if any(os.path.lexists(os.path.join(ctx.dir_product, n)) for n in names):
+        ctx.logger.warning(" └> [印刷] 設計作図完了シートの出力先に、既存の PDF があります(古い PDF を使わないため、印刷しません)")
+        return ProductResult(FAILED, "[Step.2] 設計作図完了シートの出力先に既存の PDF があるため、印刷しません(未完了)", cleanup=True)
+    return None
+
+
+def _ensure_inference_zero_pdf(ctx: ProductContext) -> Optional[ProductResult]:
+    """ページ「0」が推論対象のとき、推論処理(画像変換)が開く `0.pdf` を、完成を確認した `0_A1.pdf` のコピーとして用意する
+    (`0_A1.pdf` = 設計作図完了シートの成果物、`0.pdf` = 推論用の入力。役割は別で、内容は同じ図面)。
+    一時ファイルにコピーしてから、既存を上書きしない `os.rename` で置く。既に `0.pdf` があれば上書きせず失敗にする。
+    コピーが不完全なら残さない。用意できなければ、固定形式の理由で失敗にする(後続の変換・推論へ進まない)。"""
+    if not _is_inference_zero(ctx):
+        return None
+    src = os.path.join(ctx.dir_product, print_support.CHECK_SHEET_PDF_NAME)
+    dst = os.path.join(ctx.dir_product, "0.pdf")
+    tmp = dst + ".part"
+    made_tmp = False                                 # 自分が作った一時ファイルだけを、失敗時に消す(既存のファイルは消さない)
+    try:
+        if os.path.lexists(dst) or os.path.lexists(tmp):
+            raise FileExistsError
+        if not print_support.pdf_is_complete(src):
+            raise ValueError
+        made_tmp = True
+        shutil.copyfile(src, tmp)
+        if os.path.getsize(tmp) != os.path.getsize(src) or not print_support.pdf_is_complete(tmp):
+            raise ValueError
+        os.rename(tmp, dst)                          # 既存を上書きしない(Windows では既存の宛先があれば失敗する)
+    except (OSError, ValueError) as e:
+        try:
+            if made_tmp and os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        ctx.logger.warning(f" └> [印刷] 推論用の PDF を用意できませんでした({type(e).__name__})")
+        return ProductResult(FAILED, "[Step.2] 推論用の PDF を用意できません(未完了)", cleanup=True)
+    ctx.logger.info(" └> 推論用の PDF を設計作図完了シートのコピーとして用意しました")
+    return None
 
 
 def _finalize_spec_sheet(ctx: ProductContext, dir_product: str) -> None:
-    """作業フォルダの共通製作仕様書 PDF を、最終名(0.pdf)へ移す。Step.2 の図面印刷の最後に 1 回だけ呼ぶ(印刷対象のページが決まり、図面ページの PDF が出揃ったあと)。
+    """作業フォルダの共通製作仕様書 PDF を、最終名(0_S0.pdf)へ移す。Step.2 の図面印刷の最後に 1 回だけ呼ぶ(図面ページの PDF が出揃ったあと)。
     次のどれかなら、移さない(作業フォルダに残し、固定形式の警告だけ。製番は失敗にしない・図面ページの PDF には触れない):
-    ・同名の図面ページ(ページ名「0」)が印刷対象に含まれる ・製番フォルダ直下に既に `0.pdf` がある ・PDF の完成を安全に確認できない(PENDING のあとに遅れて出力される場合を含む)。"""
+    ・製番フォルダ直下に同名のファイルが既にある(上書きしない) ・PDF の完成を安全に確認できない(PENDING のあとに遅れて出力される場合を含む)。"""
     work_pdf = ctx.spec_work_pdf
     if not work_pdf:
         return
     final_pdf = os.path.join(dir_product, print_support.SPEC_PDF_NAME)
-    if SPEC_PAGE in [str(p) for p in ctx.print_pages]:
-        result = print_support.SPEC_PROTECTED
-    else:
-        result = print_support.finalize_spec_pdf(work_pdf, final_pdf, sleep=_artifact_sleep,
-                                                 stable_seconds=0.0 if ctx.spec_settled else print_support.PDF_STABLE_SECONDS, log=ctx.logger.warning)
+    result = print_support.finalize_spec_pdf(work_pdf, final_pdf, sleep=_artifact_sleep,
+                                             stable_seconds=0.0 if ctx.spec_settled else print_support.PDF_STABLE_SECONDS, log=ctx.logger.warning)
     if result == print_support.SPEC_MOVED:
         ctx.spec_work_pdf = None
         ctx.logger.info(f" └> {final_pdf = }\n")
     elif result == print_support.SPEC_PROTECTED:
-        ctx.logger.warning(" └> [印刷] 共通製作仕様書の PDF が図面ページの PDF と同名になるため、最終名へ移していません(図面ページの PDF は保護しました。仕様書は作業フォルダに残しています)")
+        ctx.logger.warning(" └> [印刷] 共通製作仕様書の PDF と同名のファイルが既にあるため、最終名へ移していません(既存のファイルは上書きしていません。仕様書は作業フォルダに残しています)")
     else:
         ctx.logger.warning(" └> [印刷] 共通製作仕様書の PDF の完成を確認できなかったため、最終名へ移していません(図面ページの PDF には影響しません。手動で確認してください)")
 
@@ -476,18 +530,27 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
         if exit_outer:
             break  # chunk_list を抜ける
 
-        product_script_win = print_support.output_print_script(chunk_5, ctx.dir_design_product, ctx.dir_product)
-        outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), [os.path.join(ctx.dir_product, f"{p}.pdf") for p in chunk_5],
+        stale = _check_zero_outputs_absent(ctx, chunk_5)    # ページ「0」の出力先に既存の PDF があれば、印刷せず失敗(古い PDF の誤使用・上書きを避ける)
+        if stale is not None:
+            return stale
+        # 設計作図完了シート(ページ「0」)を含む塊だけ、出力名を指定する(`0_A1.pdf`)。ほかの塊は、従来どおり指定なし(`{ページ}.pdf`)
+        name_kw = {"pdf_name": lambda p: page_pdf_name(ctx, p)} if print_support.CHECK_SHEET_PAGE in [str(p) for p in chunk_5] else {}
+        product_script_win = print_support.output_print_script(chunk_5, ctx.dir_design_product, ctx.dir_product, **name_kw)
+        outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), [os.path.join(ctx.dir_product, page_pdf_name(ctx, p)) for p in chunk_5],
                                                    log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         logger.info(f" └> Page: {chunk_5}")
         timed_out = print_timeout_result(STAGE_PRINT, outcome)
         if timed_out is not None:                    # IJCAD がハングと判定され、終了処理まで済んだ。欠落の検査・次の塊・後続の変換や推論へ進まない
             return timed_out
         # 従来ここで待っていた「枚数 × 4 秒」(cad_mod.countdown)は、print_support.print_dwg_for_pdf の見守り(ペース)に含めた(二重に待たない)
-        # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む)。欠けていれば次の塊・後続へ進まない
-        result = check_stage_artifacts(ctx, STAGE_PRINT, chunk_5, lambda p: f"{p}.pdf", _is_valid_pdf, ARTIFACT_GRACE_PRINT)
+        # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む。設計作図完了シートは 0_A1.pdf)。欠けていれば次の塊・後続へ進まない
+        result = check_stage_artifacts(ctx, STAGE_PRINT, chunk_5, lambda p: page_pdf_name(ctx, p), _is_valid_pdf, ARTIFACT_GRACE_PRINT)
         if result is not None:
             return result
+        if print_support.CHECK_SHEET_PAGE in [str(p) for p in chunk_5]:     # ページ「0」が推論対象なら、推論用の 0.pdf を(完成を確認した 0_A1.pdf から)用意する
+            result = _ensure_inference_zero_pdf(ctx)
+            if result is not None:
+                return result
     if exit_outer:
         logger.warning(f"図面使用中のため製番をスキップします: {ctx.product}")
         return ProductResult(SKIPPED, "図面使用中(未完了)", cleanup=True)
