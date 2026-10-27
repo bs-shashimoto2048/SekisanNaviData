@@ -18,6 +18,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 PLOT_OFFSET = "C"  # 用紙の中央に配置(旧: "5,5")
+# 共通製作仕様書は、図面ページの印刷(WIRING.SCR・`{ページ}.pdf`・製番フォルダ直下)と、スクリプトも出力先も共有しない。
+# 以前は、仕様書の PDF を一度ページ「1」の仮名 `1.pdf` に出して改名していたため、仕様書の IJCAD が見守りの上限(35 秒)を過ぎて後から PDF を出すと、
+# 改名の確認に間に合わず、後続のページ「1」の印刷と同じ名前を取り合って上書きし得た(InterimOps の実行で、仕様書が作られなかった製番がある)。
+# いまは、専用の作業フォルダ(製番フォルダ直下の SPEC_WORK_DIR)に専用のスクリプトと PDF を置く。IJCAD は製番フォルダ直下へ何も書かない。
+# 最終名 SPEC_PDF_NAME(ページ「0」の `0.pdf` とは別名)への移動は、PDF の完成を安全に確認できたときだけ(finalize_spec_pdf)。
+SPEC_SCRIPT_NAME = "SPEC_SHEET.SCR"
+SPEC_PDF_NAME = "0共通製作仕様書.pdf"
+SPEC_WORK_DIR = "spec_sheet_work"
 
 
 def build_script_lines(dwg_path: str, pdf_path: str, plot_offset: str = PLOT_OFFSET) -> list[str]:
@@ -48,19 +56,22 @@ def build_script_lines(dwg_path: str, pdf_path: str, plot_offset: str = PLOT_OFF
     ]
 
 
-def output_print_script(page_list, dir_target: str, dir_product: str, plot_offset: str = PLOT_OFFSET) -> str:
+def output_print_script(page_list, dir_target: str, dir_product: str, plot_offset: str = PLOT_OFFSET, *,
+                        script_name: str = "WIRING.SCR", pdf_name: Optional[Callable[[str], str]] = None) -> str:
     """WIRING.SCR(shift-jis)を dir_product に作成して、そのパスを返す。出力 PDF は `{ページ}.pdf`(従来どおり)。
+    script_name・pdf_name(ページ → PDF のファイル名)は、図面ページの印刷と名前も出力先も共有しない印刷(共通製作仕様書)だけが指定する。
 
     設計図面が読めない場合は FileNotFoundError(従来の sys.exit() ではなく、呼び出し側が製番の失敗として扱えるようにした)。
     """
-    script = os.path.join(dir_product, "WIRING.SCR")
+    script = os.path.join(dir_product, script_name)
     lines: list[str] = []
     for page in page_list:
         name = str(page)
         dwg_path = os.path.join(dir_target, name + ".dwg")
         if not os.access(dwg_path, os.R_OK):
             raise FileNotFoundError(f"印刷図面が存在しません: {dwg_path}")
-        lines += build_script_lines(dwg_path, os.path.join(dir_product, name + ".pdf"), plot_offset)
+        pdf_file = pdf_name(name) if pdf_name else name + ".pdf"
+        lines += build_script_lines(dwg_path, os.path.join(dir_product, pdf_file), plot_offset)
     lines.append("quit y")
     with open(script, "w", encoding="shift-jis") as f:
         f.write("\n".join(lines) + "\n")
@@ -153,6 +164,42 @@ def pdf_is_complete(path: str) -> bool:
             return b"%%EOF" in f.read()
     except OSError:
         return False
+
+
+SPEC_MOVED, SPEC_MISSING, SPEC_INCOMPLETE, SPEC_UNCONFIRMED = "moved", "missing", "incomplete", "unconfirmed"
+
+
+def finalize_spec_pdf(src: str, dst: str, *, sleep: Callable[[float], None] = time.sleep, valid: Callable[[str], bool] = pdf_is_complete,
+                      stable_seconds: float = PDF_STABLE_SECONDS, log: Optional[Callable[[str], None]] = None) -> str:
+    """共通製作仕様書の PDF(作業フォルダの src)を、PDF の完成を安全に確認できたときだけ、最終名(dst)へ移す。
+    完成 = pdf_is_complete(先頭 %PDF-・末尾に %%EOF)で、stable_seconds の間サイズが変わらず、まだ完成のまま。
+    IJCAD がまだ開いている(書き込み中・ロック中)ファイルは、移動(os.replace)が失敗するので、移さない。
+    確認できなければ、何も変えず(src を残す)、結果だけを返す。図面ページの PDF(製番フォルダ直下の `{ページ}.pdf`)には一切触れない。
+    log には固定の文言だけを出す(パス・ページ名・例外メッセージは含めない)。"""
+    log = log or (lambda _msg: None)
+    try:
+        if not os.path.exists(src):
+            return SPEC_MISSING
+        if not valid(src):
+            return SPEC_INCOMPLETE
+        size = os.path.getsize(src)
+        if stable_seconds > 0:
+            sleep(stable_seconds)
+        if not valid(src) or os.path.getsize(src) != size:
+            return SPEC_INCOMPLETE
+        os.replace(src, dst)
+    except OSError as e:  # noqa: BLE001 - 例外メッセージは記録しない(型名だけ)。移せなければ src を残す
+        log(f" └> [印刷] 共通製作仕様書の PDF を最終名へ移せませんでした({type(e).__name__})")
+        return SPEC_UNCONFIRMED
+    work_dir = os.path.dirname(src)
+    try:
+        script = os.path.join(work_dir, SPEC_SCRIPT_NAME)    # 移せたあと、この作業フォルダにある専用のスクリプト(自分が作ったもの)だけを片付ける
+        if os.path.isfile(script):
+            os.remove(script)
+        os.rmdir(work_dir)                                   # 空になったら作業フォルダも片付ける(ほかに残りがあれば、そのまま)
+    except OSError:
+        pass
+    return SPEC_MOVED
 
 
 class WindowsProcessControl:

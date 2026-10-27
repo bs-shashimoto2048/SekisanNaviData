@@ -64,6 +64,7 @@ class ProductContext:
     baninf_pages: List[str] = field(default_factory=list)
     print_pages: List[str] = field(default_factory=list)
     detected_df: Optional[pd.DataFrame] = None
+    spec_work_pdf: Optional[str] = None  # 共通製作仕様書の PDF の作業フォルダでのパス(最終名へ移せていないとき。移せたら None)
 
 
 # ##############################################################################
@@ -354,21 +355,49 @@ def _print_spec_sheet(ctx: ProductContext, dir_product: str) -> Optional[Product
     spec_sheets_name = spec_sheets[0] + ctx.converter_extension
     serial_Spec_dir = os.path.join(ctx.dir_design_serial, f"{ctx.serial}S0")
     if cad_mod.file_exists(serial_Spec_dir, spec_sheets_name):
-        serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product)
-        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, "1.pdf")],
+        # 専用の作業フォルダ・専用のスクリプトで印刷する(図面ページの WIRING.SCR・`{ページ}.pdf`・製番フォルダ直下とは何も共有しない)。
+        # 遅れて出力されても、図面ページの PDF を上書きできない。最終名(0共通製作仕様書.pdf)へは、完成を安全に確認できたときだけ移す。
+        work_dir = os.path.join(dir_product, print_support.SPEC_WORK_DIR)
+        work_pdf = os.path.join(work_dir, print_support.SPEC_PDF_NAME)
+        os.makedirs(work_dir, exist_ok=True)
+        try:
+            if os.path.exists(work_pdf):             # 以前の実行の残り(完成済みに見えて、見守りが即座に終わるのを避ける)
+                os.remove(work_pdf)
+        except OSError:
+            pass
+        serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, work_dir,
+                                                              script_name=print_support.SPEC_SCRIPT_NAME,
+                                                              pdf_name=lambda _page: print_support.SPEC_PDF_NAME)
+        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [work_pdf],
                                                    log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         timed_out = print_timeout_result(STAGE_SPEC_PRINT, outcome)
         if timed_out is not None:                    # IJCAD がハング(PDF が出ず応答もしない)と判定され、終了処理まで済んだ。後続へ進まない
             return timed_out
         cad_mod.countdown(3)
-        pdf_name = os.path.join(dir_product, "1.pdf")
-        pdf_rename = os.path.join(dir_product, "共通製作仕様書.pdf")
-        if os.path.exists(pdf_name):
-            os.rename(pdf_name, pdf_rename)
-            logger.info(f" └> {pdf_rename = }\n")
+        ctx.spec_work_pdf = work_pdf
+        # プロセスが終了済み(COMPLETED)・見守りが完成と安定を確認済み(PDFS_READY)なら、追加の安定待ちは要らない(待ち時間は変えない)。PENDING は書き込み中かもしれない
+        settled = outcome.status in (print_support.COMPLETED, print_support.PDFS_READY)
+        _finalize_spec_sheet(ctx, dir_product, stable_seconds=0.0 if settled else print_support.PDF_STABLE_SECONDS, last=False)
     else:
         logger.warning(f" └> 共通製作仕様書が見つかりませんでした: {serial_Spec_dir}\n")
     return None
+
+
+def _finalize_spec_sheet(ctx: ProductContext, dir_product: str, stable_seconds: float, last: bool) -> None:
+    """作業フォルダの共通製作仕様書 PDF を、完成を安全に確認できたときだけ最終名へ移す。確認できなければ何も変えず、固定形式の警告だけ(失敗にしない)。
+    図面ページの PDF には触れない。PENDING のあとに遅れて出力された場合に備え、Step.2 の印刷の最後にもう一度だけ確認する(last=True)。"""
+    work_pdf = ctx.spec_work_pdf
+    if not work_pdf:
+        return
+    final_pdf = os.path.join(dir_product, print_support.SPEC_PDF_NAME)
+    result = print_support.finalize_spec_pdf(work_pdf, final_pdf, sleep=_artifact_sleep, stable_seconds=stable_seconds, log=ctx.logger.warning)
+    if result == print_support.SPEC_MOVED:
+        ctx.spec_work_pdf = None
+        ctx.logger.info(f" └> {final_pdf = }\n")
+    elif last:
+        ctx.logger.warning(" └> [印刷] 共通製作仕様書の PDF の完成を確認できなかったため、最終名へ移していません(図面ページの PDF には影響しません)。手動で確認してください")
+    else:
+        ctx.logger.warning(" └> [印刷] 共通製作仕様書の PDF はまだ完成を確認できないため、最終名へ移していません(図面ページの PDF には影響しません。印刷の最後にもう一度確認します)")
 
 
 def step2_inference_images(ctx: ProductContext) -> Optional[ProductResult]:
@@ -453,6 +482,7 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
     if exit_outer:
         logger.warning(f"図面使用中のため製番をスキップします: {ctx.product}")
         return ProductResult(SKIPPED, "図面使用中(未完了)", cleanup=True)
+    _finalize_spec_sheet(ctx, ctx.dir_product, stable_seconds=print_support.PDF_STABLE_SECONDS, last=True)   # PENDING のあとに遅れて出力された仕様書 PDF の最終確認
     logger.info(f"印刷完了!\n")
     return None
 
