@@ -511,7 +511,7 @@ class FlowTest(Base):
                     p.start()
                     started.append(p)
                 with mock.patch.object(pf, "process_product", lambda c: pf.step2_inference_images(c)), \
-                        mock.patch.object(pf, "_select_pages", return_value=None):
+                        mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                     pf.run_product(self.ctx(), results)                      # 実の shutil.rmtree(一時フォルダの中だけ)
             finally:
                 for p in reversed(started):
@@ -634,7 +634,7 @@ class SpecSheetFlowTest(Base):
                     started.append(patcher)
             with mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script), \
                     mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: ps.PrintOutcome(ps.COMPLETED, 0)), \
-                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 return pf.step2_inference_images(self.spec_ctx)
         finally:
             for patcher in reversed(started):
@@ -968,7 +968,7 @@ class SpecSheetFlowTest(Base):
             results = iter([ps.PrintOutcome(ps.COMPLETED, 0)] * 2)
             with mock.patch.object(pf.print_support, "output_print_script", side_effect=fake_script), \
                     mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results)) as prt, \
-                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown"), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 pf.step2_inference_images(self.spec_ctx)
         finally:
             for patcher in reversed(started):
@@ -1095,7 +1095,7 @@ class ChunkPacingTest(Base):
                 p.start()
                 started.append(p)
             with mock.patch.object(pf.print_support, "print_dwg_for_pdf", side_effect=lambda *a, **k: next(results)), \
-                    mock.patch.object(pf.cad_mod, "countdown", countdown), mock.patch.object(pf, "_select_pages", return_value=None):
+                    mock.patch.object(pf.cad_mod, "countdown", countdown), mock.patch.object(pf, "_select_pages", return_value=None), mock.patch.object(pf, "_make_display_previews", return_value=None):
                 self.assertIsNone(pf.step2_inference_images(self.ctx()))
         finally:
             for p in reversed(started):
