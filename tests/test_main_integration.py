@@ -414,6 +414,33 @@ class MainFailureTest(MainIntegrationBase):
         self.assert_no_secret_leak()
 
 
+class MainIncompleteRetryTest(MainIntegrationBase):
+    """全件対象の事前フィルター後も、失敗フォルダだけが再処理候補に戻る。"""
+
+    def test_leftover_marked_folder_is_reincluded_and_never_silently_skipped(self):
+        self.product_out.mkdir(parents=True)
+        app.product_flow.mark_incomplete(str(self.output_dir), PRODUCT)
+        with mock.patch.object(app.host_mod, "get_missing_folders", return_value=[]):
+            self.run_main()
+
+        self.assertIn(PRODUCT, self.results["failed"])
+        self.assertNotIn(PRODUCT, self.results["skipped"])
+        self.assertEqual(self.results["failed"][PRODUCT], "前回の未完了フォルダを片付けられません(再処理待ち)")
+        self.assertIn("get_property_data", [name for name, _ in self.host_calls])
+        self.assertTrue(app.product_flow.has_incomplete_marker(str(self.output_dir), PRODUCT))
+        self.assert_no_external_calls()
+
+    def test_legacy_existing_folder_without_marker_remains_excluded(self):
+        self.product_out.mkdir(parents=True)
+        with mock.patch.object(app.host_mod, "get_missing_folders", return_value=[]):
+            self.run_main()
+
+        self.assertEqual(self.results["completed"], [])
+        self.assertEqual(self.results["failed"], {})
+        self.assertEqual(self.results["skipped"], {})
+        self.assertNotIn("get_property_data", [name for name, _ in self.host_calls])
+        self.assert_no_external_calls()
+
 class MainPrintTargetsTest(MainIntegrationBase):
     """印刷対象(X/x始まりを除く全ページ)と、0件・推論対象なしの扱い"""
 
