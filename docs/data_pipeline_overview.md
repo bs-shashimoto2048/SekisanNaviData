@@ -68,7 +68,7 @@
 | `{ページ}.pdf` | 印刷対象の全ページ(`design.csv` の「ページ番号」が 6 文字以内で X/x 始まりでないもの)。A3・用紙中央(`docs/print_spec.md`) |
 | `{ページ}.jpeg` / `.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
 | `dwg/{ページ}.dwg` | 推論対象ページの DWG コピー |
-| `0.pdf`(共通製作仕様書) | 共通製作仕様書があり、PDF の完成を確認でき、かつ図面ページ「0」の PDF と衝突しないときだけ。**名前を変更**(旧: `共通製作仕様書.pdf`)。ページ名「0」が印刷対象の製番、または既に `0.pdf` がある場合は、ページ PDF を保護して作らない(仕様書は `spec_sheet_work/spec_sheet.pdf` に残る)。旧名を読む側(SekisanNavi など)があれば追随が必要(未確認) |
+| `0.pdf`(共通製作仕様書) | 共通製作仕様書があり、PDF の完成を確認でき、かつ図面ページ「0」の PDF と衝突しないときだけ。**名前を変更**(旧: `共通製作仕様書.pdf`)。ページ名「0」が印刷対象の製番、または既に `0.pdf` がある場合は、ページ PDF を保護して作らない(仕様書は `spec_sheet_work/spec_sheet.pdf` に残る)。**互換性(コードの監査、2026-10-27)**: 旧名を参照するコードは、SekisanNaviData・bs_pkg・SekisanNavi のどこにも無い(SekisanNavi の `docs/data-source.md` の構成図だけ)。SekisanNaviData・bs_pkg は、ページ名の一覧から PDF を開く(PDF を列挙して解釈しない)ので、`0.pdf` を図面ページとして誤処理しない。**SekisanNavi** は、製番フォルダ直下の `{数字}.pdf` をすべて図面ページとして一覧化する(`data_source.list_page_numbers`)ため、仕様書の `0.pdf` が、開けない「ページ 0」(ページファイル・サムネイルの解決はページ番号 0 以下を拒否する)として一覧に出る。→ SekisanNavi の PR #57(ページ番号 0 の PDF を図面一覧に出さない)で対応(マージ・反映は別)。外部の他の利用先(設計・運用側の手作業、他のツール)は未確認 |
 | `../logs/*.log` | ログ(Git 管理外) |
 
 列の一覧と順序は `tests/test_output_contract.py` を参照(順序も契約として固定している)。
