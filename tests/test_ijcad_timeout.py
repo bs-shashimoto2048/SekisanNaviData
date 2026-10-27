@@ -686,10 +686,10 @@ class SpecSheetFlowTest(Base):
         self.assertEqual(Path(path), self.dir_product / "WIRING.SCR")
         self.assertEqual([Path(x) for x in self.pdf_targets(path)], [self.dir_product / "0_A1.pdf", self.dir_product / "1.pdf"])
 
-    def test_page_zero_as_an_inference_page_keeps_the_plain_name(self):
-        """ページ「0」が推論対象なら、画像変換(bs_pkg)が 0.pdf を開くので、従来どおり 0.pdf。"""
+    def test_page_zero_is_always_0_A1_even_as_an_inference_page(self):
+        """設計作図完了シートは、推論対象かどうかにかかわらず、常に 0_A1.pdf。推論用の 0.pdf は別に(完成した 0_A1.pdf のコピーとして)用意する。"""
         self.spec_ctx.baninf_pages = ["0", "1"]
-        self.assertEqual(pf.page_pdf_name(self.spec_ctx, "0"), "0.pdf")
+        self.assertEqual(pf.page_pdf_name(self.spec_ctx, "0"), "0_A1.pdf")
         self.assertEqual(pf.page_pdf_name(self.spec_ctx, "1"), "1.pdf")
         self.spec_ctx.baninf_pages = ["1"]
         self.assertEqual(pf.page_pdf_name(self.spec_ctx, "0"), "0_A1.pdf")
@@ -725,6 +725,99 @@ class SpecSheetFlowTest(Base):
         self.assertEqual((self.dir_product / self.SPEC_PDF).read_bytes(), b"created meanwhile")
         self.assertTrue(self.work_pdf.exists())
         self.assert_fixed_warning(self.warnings()[-1], "同名のファイルが既にあるため、最終名へ移していません")
+
+    # ---- 3b. ページ「0」が推論対象: 0_A1.pdf(完了シート)と、推論用の 0.pdf(完成した 0_A1.pdf のコピー)の両方 ----
+    def inference_zero(self):
+        self.spec_ctx.baninf_pages = ["0", "10", "11", "12"]
+        self.INFER_PAGES = ["0", "10", "11", "12"]                                       # 後続の段階(DXF・画像)の偽物も、ページ「0」ぶんの成果物を作る
+
+    def test_inference_page_zero_makes_0_A1_and_the_inference_0_pdf_with_the_same_content(self):
+        self.inference_zero()
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        self.assertIsNone(self.run_step2(["0"] + self.PAGES))
+        check = self.dir_product / "0_A1.pdf"
+        infer = self.dir_product / "0.pdf"
+        self.assertEqual(check.read_bytes(), self.page_bytes("0"))                         # 設計作図完了シート(成果物)
+        self.assertEqual(infer.read_bytes(), self.page_bytes("0"))                         # 推論用の入力(同じ図面のコピー)
+        self.assertEqual((self.dir_product / "0_S0.pdf").read_bytes(), self.SPEC_CONTENT)  # 共通製作仕様書は別のまま
+        self.assertNotEqual(self.dir_product / "0_S0.pdf", check)
+        self.assert_pages(self.PAGES)                                                      # 通常のページは `{ページ}.pdf` のまま
+        self.assertFalse((self.dir_product / "0.pdf.part").exists())                       # 一時ファイルは残らない
+        self.assertEqual(self.warnings(), [])
+
+    def test_inference_zero_pdf_is_prepared_before_the_later_stages_need_it(self):
+        """画像変換(推論)が 0.pdf を開く時点で、0.pdf が既にある。用意できなければ後続へ進まない。"""
+        self.inference_zero()
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        seen = {}
+        original = self.fake_pdf_to_images
+
+        def spy(dir_product, pages):                                                     # 画像変換(bs_pkg)の呼び出しの時点を見る
+            seen["zero_exists"] = (Path(dir_product) / "0.pdf").is_file()
+            seen["pages"] = list(pages)
+            return original(dir_product, pages)
+        self.fake_pdf_to_images = spy                                                    # Base の差し替え点(run_step2 が参照する)
+        self.assertIsNone(self.run_step2(["0"] + self.PAGES))
+        self.assertTrue(seen.get("zero_exists"))
+        self.assertIn("0", seen["pages"])
+
+    def test_a_stale_0_A1_blocks_the_print_and_is_never_overwritten_or_used(self):
+        self.inference_zero()
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        (self.dir_product / "0_A1.pdf").write_bytes(b"stale check sheet")
+        res = self.run_step2(["0"] + self.PAGES)
+        self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
+        self.assertEqual(res.reason, "[Step.2] 設計作図完了シートの出力先に既存の PDF があるため、印刷しません(未完了)")
+        self.assertEqual((self.dir_product / "0_A1.pdf").read_bytes(), b"stale check sheet")   # 既存は変更しない
+        self.assertFalse((self.dir_product / "0.pdf").exists())                             # 古い PDF から推論用を作らない
+        self.assertEqual(self.script_calls, [])                                             # 印刷(スクリプト作成)に進まない
+        for forbidden in [str(self.tmp), PRODUCT, "AY0001", "\\"]:
+            self.assertNotIn(forbidden, res.reason)
+
+    def test_a_stale_inference_0_pdf_blocks_the_print_too(self):
+        self.inference_zero()
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        (self.dir_product / "0.pdf").write_bytes(b"stale inference input")
+        res = self.run_step2(["0"] + self.PAGES)
+        self.assertEqual(res.status, pf.FAILED)
+        self.assertEqual((self.dir_product / "0.pdf").read_bytes(), b"stale inference input")
+        self.assertFalse((self.dir_product / "0_A1.pdf").exists())
+        self.assertEqual(self.script_calls, [])
+
+    def test_an_existing_plain_0_pdf_does_not_block_when_page_zero_is_not_an_inference_page(self):
+        """推論対象でないとき、既存の通常の 0.pdf は、0_A1.pdf とは別のファイルとして触れない(印刷は止まらない)。"""
+        (self.dir_product / "0.pdf").write_bytes(b"legacy plain zero")
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        self.assertIsNone(self.run_step2(["0"] + self.PAGES))
+        self.assertEqual((self.dir_product / "0.pdf").read_bytes(), b"legacy plain zero")
+        self.assertEqual((self.dir_product / "0_A1.pdf").read_bytes(), self.page_bytes("0"))
+
+    def test_a_failed_copy_leaves_no_partial_file_and_fails_with_a_fixed_reason(self):
+        self.inference_zero()
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        with mock.patch.object(pf.os, "rename", side_effect=PermissionError("secret C:/real/path")):
+            res = self.run_step2(["0"] + self.PAGES)
+        self.assertEqual((res.status, res.cleanup), (pf.FAILED, True))
+        self.assertEqual(res.reason, "[Step.2] 推論用の PDF を用意できません(未完了)")
+        self.assertFalse((self.dir_product / "0.pdf").exists())
+        self.assertFalse((self.dir_product / "0.pdf.part").exists())                        # 不完全なコピーを残さない
+        self.assertEqual((self.dir_product / "0_A1.pdf").read_bytes(), self.page_bytes("0"))   # 完了シートは無事
+        self.assertTrue(any("PermissionError" in w for w in self.warnings()))               # 型名だけ
+        self.assertFalse(any("secret" in w or "real" in w for w in self.warnings()))
+        self.assertFalse(any("secret" in res.reason or "real" in res.reason for _ in [0]))
+
+    def test_the_inference_copy_is_not_made_from_an_unfinished_0_A1(self):
+        self.inference_zero()
+        with mock.patch.object(pf.print_support, "pdf_is_complete", return_value=False):
+            res = pf._ensure_inference_zero_pdf(self.spec_ctx)
+        self.assertEqual(res.status, pf.FAILED)
+        self.assertFalse((self.dir_product / "0.pdf").exists())
+
+    def test_non_inference_page_zero_makes_no_inference_copy(self):
+        self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
+        self.assertIsNone(self.run_step2(["0"] + self.PAGES))
+        self.assertTrue((self.dir_product / "0_A1.pdf").is_file())
+        self.assertFalse((self.dir_product / "0.pdf").exists())                             # 推論に要らないので、作らない
 
     def test_without_page_zero_only_the_spec_sheet_is_added(self):
         self.run_spec(ps.PrintOutcome(ps.COMPLETED, 0), on_print=self.write_like_ijcad)
