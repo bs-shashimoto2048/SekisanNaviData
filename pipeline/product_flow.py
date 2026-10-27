@@ -94,6 +94,7 @@ def safe_rmtree(target: str, allowed_root: str, **kwargs):
 # 全ページの印刷・変換を終えてから、段階も分からない形で失敗する。そこで、各段階の直後に「期待する成果物が、あるか・空でないか・読めるか」を検査する。
 # 失敗理由は固定形式(段階名と件数だけ。製番・パス・例外メッセージ・設定値は含めない)。ページ名はログにだけ残す。
 STAGE_PRINT, STAGE_DXF, STAGE_JPEG, STAGE_PNG = "印刷(PDF)", "DXF 変換", "JPEG 変換", "PNG 前処理"
+STAGE_SPEC_PRINT = "共通製作仕様書の印刷"
 ARTIFACT_GRACE_PRINT = 20      # 印刷は IJCAD が非同期に PDF を書き終えることがあるため、欠けているときだけ、最大この秒数(1 秒ごとに再確認)待つ
 ARTIFACT_GRACE_DXF = 5         # 変換ソフトの終了直後の書き込み遅れ用(同上)。画像変換は同じプロセス内で完了するので待たない
 _artifact_sleep = time.sleep   # テストが差し替える(実際には待たない)
@@ -150,6 +151,15 @@ def check_stage_artifacts(ctx: "ProductContext", stage: str, pages: List[str], n
     # 固定形式(「 / 」は使わない: 履歴は失敗した製番を「 / 」で連結するため、理由の中にあると画面の集計が分かれてしまう)
     return ProductResult(FAILED, f"[Step.2] {stage}の成果物が不足しています: 対象 {len(pages)} 件中 {bad} 件"
                                  f"(欠落 {len(missing)} 件・空または不正 {len(invalid)} 件)(未完了)", cleanup=True)
+
+
+def print_timeout_result(stage: str, outcome: Any) -> Optional["ProductResult"]:
+    """印刷(IJCAD)がハング(PDF が出ず応答もしない)と判定され、終了処理(print_support)まで済んだ場合に、製番を失敗にする結果を返す(そうでなければ None。
+    プロセスが生きているだけ・PDF が不足しているだけでは、ここでは失敗にしない。PDF の不足は、続く既存の検査が「成果物が不足」で失敗にする)。
+    理由は固定形式(段階名と終了の結果だけ。製番・ページ名・パス・例外メッセージ・標準出力/標準エラーは含めない)。製番フォルダは run_product が後始末する。"""
+    if isinstance(outcome, print_support.PrintOutcome) and outcome.timed_out:
+        return ProductResult(FAILED, print_support.timeout_reason(stage, outcome), cleanup=True)
+    return None
 
 
 def _jpeg_extension() -> str:
@@ -330,13 +340,26 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info(f" └> CSV作成: 材料 -> {config_loader.convert_win_path(material_path)}\n")
 
     # 共通製作仕様書印刷 -> あれば焼く_2025/11/28
+    result = _print_spec_sheet(ctx, dir_product)
+    if result is not None:                           # 印刷の IJCAD がハングと判定された。後続へ進まない
+        return result
+    return None
+
+
+def _print_spec_sheet(ctx: ProductContext, dir_product: str) -> Optional[ProductResult]:
+    """共通製作仕様書(あれば)を印刷する。IJCAD がハング(PDF が出ず応答もしない)と判定されたら、製番を失敗にする。"""
+    logger = ctx.logger
     logger.info(f"共通製作仕様書 印刷:")
     spec_sheets = ["1"]  # 共通製作仕様書(一般的な場)
     spec_sheets_name = spec_sheets[0] + ctx.converter_extension
     serial_Spec_dir = os.path.join(ctx.dir_design_serial, f"{ctx.serial}S0")
     if cad_mod.file_exists(serial_Spec_dir, spec_sheets_name):
         serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product)
-        design_mod.print_dwg_for_pdf(serial_script_win, len(spec_sheets))
+        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, "1.pdf")],
+                                                   log=logger.warning, pdf_valid=print_support.pdf_is_complete)
+        timed_out = print_timeout_result(STAGE_SPEC_PRINT, outcome)
+        if timed_out is not None:                    # IJCAD がハング(PDF が出ず応答もしない)と判定され、終了処理まで済んだ。後続へ進まない
+            return timed_out
         cad_mod.countdown(3)
         pdf_name = os.path.join(dir_product, "1.pdf")
         pdf_rename = os.path.join(dir_product, "共通製作仕様書.pdf")
@@ -416,9 +439,13 @@ def _print_drawings(ctx: ProductContext) -> Optional[ProductResult]:
             break  # chunk_list を抜ける
 
         product_script_win = print_support.output_print_script(chunk_5, ctx.dir_design_product, ctx.dir_product)
-        design_mod.print_dwg_for_pdf(product_script_win, len(chunk_5))
+        outcome = print_support.print_dwg_for_pdf(product_script_win, len(chunk_5), [os.path.join(ctx.dir_product, f"{p}.pdf") for p in chunk_5],
+                                                   log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         logger.info(f" └> Page: {chunk_5}")
-        cad_mod.countdown(len(chunk_5)*4)
+        timed_out = print_timeout_result(STAGE_PRINT, outcome)
+        if timed_out is not None:                    # IJCAD がハングと判定され、終了処理まで済んだ。欠落の検査・次の塊・後続の変換や推論へ進まない
+            return timed_out
+        # 従来ここで待っていた「枚数 × 4 秒」(cad_mod.countdown)は、print_support.print_dwg_for_pdf の見守り(ペース)に含めた(二重に待たない)
         # 印刷の直後(この塊の分): 印刷対象ページの <ページ>.pdf(推論対象でない PDF だけのページも含む)。欠けていれば次の塊・後続へ進まない
         result = check_stage_artifacts(ctx, STAGE_PRINT, chunk_5, lambda p: f"{p}.pdf", _is_valid_pdf, ARTIFACT_GRACE_PRINT)
         if result is not None:
