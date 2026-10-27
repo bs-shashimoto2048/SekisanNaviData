@@ -354,17 +354,18 @@ def _print_spec_sheet(ctx: ProductContext, dir_product: str) -> Optional[Product
     spec_sheets_name = spec_sheets[0] + ctx.converter_extension
     serial_Spec_dir = os.path.join(ctx.dir_design_serial, f"{ctx.serial}S0")
     if cad_mod.file_exists(serial_Spec_dir, spec_sheets_name):
-        serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product)
-        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, "1.pdf")],
+        # 専用のスクリプト名で、PDF は「共通製作仕様書.pdf」へ直接出力する(ページ「1」の `1.pdf`・WIRING.SCR と名前を共有しない)
+        serial_script_win = print_support.output_print_script(spec_sheets, serial_Spec_dir, dir_product,
+                                                              script_name=print_support.SPEC_SCRIPT_NAME,
+                                                              pdf_name=lambda _page: print_support.SPEC_PDF_NAME)
+        outcome = print_support.print_dwg_for_pdf(serial_script_win, len(spec_sheets), [os.path.join(dir_product, print_support.SPEC_PDF_NAME)],
                                                    log=logger.warning, pdf_valid=print_support.pdf_is_complete)
         timed_out = print_timeout_result(STAGE_SPEC_PRINT, outcome)
         if timed_out is not None:                    # IJCAD がハング(PDF が出ず応答もしない)と判定され、終了処理まで済んだ。後続へ進まない
             return timed_out
         cad_mod.countdown(3)
-        pdf_name = os.path.join(dir_product, "1.pdf")
-        pdf_rename = os.path.join(dir_product, "共通製作仕様書.pdf")
-        if os.path.exists(pdf_name):
-            os.rename(pdf_name, pdf_rename)
+        pdf_rename = os.path.join(dir_product, print_support.SPEC_PDF_NAME)      # 直接この名前で出力済み(改名しない。従来のログ項目は維持)
+        if os.path.exists(pdf_rename):
             logger.info(f" └> {pdf_rename = }\n")
     else:
         logger.warning(f" └> 共通製作仕様書が見つかりませんでした: {serial_Spec_dir}\n")

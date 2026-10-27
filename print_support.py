@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 PLOT_OFFSET = "C"  # 用紙の中央に配置(旧: "5,5")
+# 共通製作仕様書だけは、図面ページの印刷(WIRING.SCR・`{ページ}.pdf`)と、スクリプトも PDF 名も共有しない。
+# 仕様書の PDF を一度ページ「1」の仮名 `1.pdf` で出すと、仕様書の IJCAD が見守りの上限(35 秒)を過ぎて後から PDF を出したときに、
+# 改名の確認に間に合わず、後続のページ「1」の印刷と同じ名前を取り合って上書きし得た(InterimOps の実行で、仕様書が作られなかった製番がある)。
+SPEC_SCRIPT_NAME = "SPEC_SHEET.SCR"
+SPEC_PDF_NAME = "共通製作仕様書.pdf"
 
 
 def build_script_lines(dwg_path: str, pdf_path: str, plot_offset: str = PLOT_OFFSET) -> list[str]:
@@ -48,19 +53,22 @@ def build_script_lines(dwg_path: str, pdf_path: str, plot_offset: str = PLOT_OFF
     ]
 
 
-def output_print_script(page_list, dir_target: str, dir_product: str, plot_offset: str = PLOT_OFFSET) -> str:
+def output_print_script(page_list, dir_target: str, dir_product: str, plot_offset: str = PLOT_OFFSET, *,
+                        script_name: str = "WIRING.SCR", pdf_name: Optional[Callable[[str], str]] = None) -> str:
     """WIRING.SCR(shift-jis)を dir_product に作成して、そのパスを返す。出力 PDF は `{ページ}.pdf`(従来どおり)。
+    script_name・pdf_name(ページ → PDF のファイル名)は、図面ページの印刷と名前を共有しない印刷(共通製作仕様書)だけが指定する。
 
     設計図面が読めない場合は FileNotFoundError(従来の sys.exit() ではなく、呼び出し側が製番の失敗として扱えるようにした)。
     """
-    script = os.path.join(dir_product, "WIRING.SCR")
+    script = os.path.join(dir_product, script_name)
     lines: list[str] = []
     for page in page_list:
         name = str(page)
         dwg_path = os.path.join(dir_target, name + ".dwg")
         if not os.access(dwg_path, os.R_OK):
             raise FileNotFoundError(f"印刷図面が存在しません: {dwg_path}")
-        lines += build_script_lines(dwg_path, os.path.join(dir_product, name + ".pdf"), plot_offset)
+        pdf_file = pdf_name(name) if pdf_name else name + ".pdf"
+        lines += build_script_lines(dwg_path, os.path.join(dir_product, pdf_file), plot_offset)
     lines.append("quit y")
     with open(script, "w", encoding="shift-jis") as f:
         f.write("\n".join(lines) + "\n")
