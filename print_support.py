@@ -22,12 +22,14 @@ PLOT_OFFSET = "C"  # 用紙の中央に配置(旧: "5,5")
 # 以前は、仕様書の PDF を一度ページ「1」の仮名 `1.pdf` に出して改名していたため、仕様書の IJCAD が見守りの上限(35 秒)を過ぎて後から PDF を出すと、
 # 改名の確認に間に合わず、後続のページ「1」の印刷と同じ名前を取り合って上書きし得た(InterimOps の実行で、仕様書が作られなかった製番がある)。
 # いまは、専用の作業フォルダ(製番フォルダ直下の SPEC_WORK_DIR)に専用のスクリプトと PDF を置く。IJCAD は製番フォルダ直下へ何も書かない。
-# IJCAD に渡す PDF 名は ASCII の固定名 SPEC_WORK_PDF_NAME(日本語名をスクリプト経由で渡さない)。最終名 SPEC_PDF_NAME(`0.pdf`)へは、
-# PDF の完成を安全に確認できたときだけ、Python 側で移す(finalize_spec_pdf)。`0.pdf` は図面ページ「0」の PDF と同名なので、
-# ページ「0」が印刷対象に含まれる場合・製番フォルダ直下に既に `0.pdf` がある場合は、移さない(図面ページの PDF を保護し、作業フォルダに残す)。
+# IJCAD に渡す PDF 名は ASCII の固定名 SPEC_WORK_PDF_NAME(日本語名をスクリプト経由で渡さない)。最終名 SPEC_PDF_NAME(`0_S0.pdf`。数値の図面ページ番号としても、通常の `0.pdf` としても読まれない名前)へは、
+# PDF の完成を安全に確認できたときだけ、Python 側で移す(finalize_spec_pdf)。製番フォルダ直下に同名のファイルが既にある場合は、上書きせず、作業フォルダに残す。
+# 設計作図完了シート(設計図面フォルダのページ「0」。従来は通常のページとして `0.pdf`)は、`0_A1.pdf` に出力する(CHECK_SHEET_PDF_NAME)。
 SPEC_SCRIPT_NAME = "SPEC_SHEET.SCR"
 SPEC_WORK_PDF_NAME = "spec_sheet.pdf"
-SPEC_PDF_NAME = "0.pdf"
+SPEC_PDF_NAME = "0_S0.pdf"                  # 共通製作仕様書の最終名
+CHECK_SHEET_PAGE = "0"                      # 設計作図完了シートのページ名(設計図面フォルダの 0.dwg)
+CHECK_SHEET_PDF_NAME = "0_A1.pdf"           # 設計作図完了シートの出力名(通常のページの `{ページ}.pdf` とは別名)
 SPEC_WORK_DIR = "spec_sheet_work"
 
 
