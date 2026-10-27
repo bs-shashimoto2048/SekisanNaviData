@@ -347,9 +347,12 @@ class MainSuccessTest(MainIntegrationBase):
             self.assertTrue((out / "dwg" / f"{p}.dwg").is_file())
         self.assertTrue(list((self.out_root / "a_product" / "logs").glob("*.log")))
 
-        # --- 推論対象以外はPDFだけ。X/x始まりは何も出力されない ---
+        # --- 推論対象外はPDFと別名の表示用PNG。推論成果物は出さず、X/x始まりは何も出力しない ---
         for p in PDF_ONLY_PAGES:
             self.assertTrue((out / f"{p}.pdf").is_file(), p)
+            preview = out / f"{p}__preview.png"
+            self.assertTrue(preview.is_file(), p)
+            self.assertEqual(preview.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             for ext in (".jpeg", ".png", ".dxf", "_detected.txt", "_detected.png"):
                 self.assertFalse((out / f"{p}{ext}").exists(), f"{p}{ext}")
             self.assertFalse((out / "dwg" / f"{p}.dwg").exists())

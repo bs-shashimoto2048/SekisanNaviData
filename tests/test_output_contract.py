@@ -53,7 +53,7 @@ class OutputContractTest(MainIntegrationBase):
         for p in PAGES:
             expected |= {f"{p}.pdf", f"{p}.jpeg", f"{p}.png", f"{p}.dxf", f"{p}_detected.txt"}
         for p in PDF_ONLY_PAGES:
-            expected.add(f"{p}.pdf")  # 推論対象外は PDF だけ
+            expected |= {f"{p}.pdf", f"{p}__preview.png"}  # 推論対象外はPDFと別名の表示用PNG
         self.assertEqual({f.name for f in self.out.iterdir()}, expected)
         self.assertEqual(sorted(f.stem for f in self.out.glob("*.pdf")), PRINT_PAGES)
         self.assertEqual(sorted(f.name for f in (self.out / "dwg").iterdir()), [f"{p}.dwg" for p in PAGES])

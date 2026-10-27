@@ -21,6 +21,7 @@ import cad_data_process as cad_mod        # CAD/設計データ・画像解析�
 import estimate_code_processer as est_mod # 積算コード集計・算出用
 import inference_support                  # 推論サーバー(別プロセス)との作業フォルダ共有確認
 import print_support                      # 印刷スクリプト(WIRING.SCR)作成: 印刷位置を用紙中央に配置
+import display_previews                   # PDF-only図面・書類の表示用PNG(推論PNGとは別名)
 from pipeline import inference_client       # 推論 API クライアント層(推論に関する image_mod への依存はここだけ)
 from pipeline import page_plan as page_plan_mod
 
@@ -96,6 +97,7 @@ def safe_rmtree(target: str, allowed_root: str, **kwargs):
 # 全ページの印刷・変換を終えてから、段階も分からない形で失敗する。そこで、各段階の直後に「期待する成果物が、あるか・空でないか・読めるか」を検査する。
 # 失敗理由は固定形式(段階名と件数だけ。製番・パス・例外メッセージ・設定値は含めない)。ページ名はログにだけ残す。
 STAGE_PRINT, STAGE_DXF, STAGE_JPEG, STAGE_PNG = "印刷(PDF)", "DXF 変換", "JPEG 変換", "PNG 前処理"
+STAGE_DISPLAY_PREVIEW = "表示用PNG"
 STAGE_SPEC_PRINT = "共通製作仕様書の印刷"
 ARTIFACT_GRACE_PRINT = 20      # 印刷は IJCAD が非同期に PDF を書き終えることがあるため、欠けているときだけ、最大この秒数(1 秒ごとに再確認)待つ
 ARTIFACT_GRACE_DXF = 5         # 変換ソフトの終了直後の書き込み遅れ用(同上)。画像変換は同じプロセス内で完了するので待たない
@@ -476,6 +478,9 @@ def step2_inference_images(ctx: ProductContext) -> Optional[ProductResult]:
     result = _print_drawings(ctx)
     if result is not None:
         return result
+    result = _make_display_previews(ctx)
+    if result is not None:
+        return result
     return _make_inference_images(ctx)         # 成果物が欠けていれば、その段階の失敗(ProductResult)。揃っていれば None(Step.3 へ)
 
 
@@ -597,6 +602,33 @@ def _make_inference_images(ctx: ProductContext) -> Optional[ProductResult]:
     result = check_stage_artifacts(ctx, STAGE_PNG, ctx.baninf_pages, lambda p: f"{p}{png_ext}", _is_valid_image)
     if result is not None:
         return result
+    return None
+
+
+def _make_display_previews(ctx: ProductContext) -> Optional[ProductResult]:
+    """推論対象外の印刷図面と最上段の書類に、PDF由来の表示用PNGを作る。
+
+    ファイル名は`{PDF名}__preview.png`。推論対象の`{ページ}.png`は触らず、
+    書類PDF(0_S0/0_A1)はPDFのまま閲覧できるように保つ。失敗時は、画像なしの
+    完了データを作らないよう製番を失敗にする。
+    """
+    try:
+        expected = display_previews.create_product_previews(
+            ctx.dir_product,
+            ctx.print_pages,
+            ctx.baninf_pages,
+            lambda page: page_pdf_name(ctx, page),
+            print_support.SPEC_PDF_NAME,
+            print_support.CHECK_SHEET_PDF_NAME,
+        )
+    except display_previews.DisplayPreviewError as exc:
+        ctx.logger.error(" └> [表示用PNG] PDFから表示用画像を作成できませんでした(%s)" % type(exc).__name__)
+        return ProductResult(FAILED, "[Step.2] 表示用PNGを作成できません(未完了)", cleanup=True)
+
+    result = check_stage_artifacts(ctx, STAGE_DISPLAY_PREVIEW, expected, lambda name: name, _is_valid_image)
+    if result is not None:
+        return result
+    ctx.logger.info(f" └> PDF-only図面・書類の表示用PNGを作成しました({len(expected)}件)")
     return None
 
 
