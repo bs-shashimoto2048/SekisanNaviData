@@ -79,7 +79,10 @@ class ProdBase(unittest.TestCase):
             "model": {"id": "test_model_20260101", "dir": str(self.model_dir), "weights": "best.pt", "yaml": "model.yaml",
                       "expected": {"weights_sha256": sha(WEIGHTS_BYTES), "weights_size": len(WEIGHTS_BYTES),
                                    "yaml_sha256": sha(MODEL_YAML_TEXT.encode("utf-8"))}},
-            "timeout_probe_sec": 1.0,
+            "timeout_probe_sec": 3.0,
+            "server": {"threads": 6, "max_pending_predict": 3, "queue_wait_sec": 5, "backlog": 16, "connection_limit": 16,
+                       "channel_timeout_sec": 10, "shutdown_grace_sec": 5},
+            "logging": {"file": str(self.root / "logs" / "prod_api.log"), "max_bytes": 65536, "backup_count": 3, "level": "INFO"},
         }
         d.update(over)
         return d
