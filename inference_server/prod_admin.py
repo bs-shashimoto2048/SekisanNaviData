@@ -343,8 +343,10 @@ def replace_model_section(text: str, block: str, nl: str) -> str:
 
 class ModelAdmin:
     def __init__(self, config_path=DEFAULT_CONFIG, picker=None, local_dir=None, drive_type=default_drive_type):
-        self.config_path = Path(config_path)
-        self.local_dir = Path(local_dir) if local_dir else self.config_path.parent / LOCAL_DIR_NAME
+        # 絶対パスにそろえる(相対の --config で起動すると、設定用コピーの場所 yaml_dir も相対になり、設定の規則「絶対パス」で保存を拒否されるため。
+        # 起動時の作業フォルダ基準で一度だけ解決し、以後は変わらない)。UNC はそのまま(書き込み先の検査 require_local_dir が拒否する)
+        self.config_path = Path(os.path.abspath(os.fspath(config_path)))
+        self.local_dir = Path(os.path.abspath(os.fspath(local_dir))) if local_dir else self.config_path.parent / LOCAL_DIR_NAME
         self.picker = picker or FilePicker()
         self._drive_type = drive_type
         self._lock = threading.Lock()

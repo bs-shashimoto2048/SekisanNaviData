@@ -153,9 +153,16 @@ class WaitressContractTest(ProdBase):
     def test_oversized_body_and_headers_are_rejected(self):
         run = Running(self, self.cfg()).start()
         try:
-            self.assertIn(run.post({**self.form(), "pad": "x" * 40000}).status_code, (400, 413))
-            r = run.get("/health", headers={"X-Big": "y" * 20000})
-            self.assertIn(r.status_code, (400, 431, 413))
+            try:                    # 上限超過の本文は、サーバーが応答を返す前に接続を閉じることがある(Windows の接続中断)。どちらも「拒否された」
+                self.assertIn(run.post({**self.form(), "pad": "x" * 40000}).status_code, (400, 413))
+            except requests.ConnectionError:
+                pass
+            try:
+                r = run.get("/health", headers={"X-Big": "y" * 20000})
+                self.assertIn(r.status_code, (400, 431, 413))
+            except requests.ConnectionError:
+                pass
+            self.assertEqual(run.get("/health").status_code, 200)       # 拒否の後も、サーバーは正常に応答する
         finally:
             run.stop()
 

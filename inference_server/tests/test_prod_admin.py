@@ -943,5 +943,27 @@ class StorageGuardTest(RemapBase):
         self.assertNotIn("share", json.dumps(st, ensure_ascii=False).replace("shared", ""))
 
 
+class RelativeConfigPathTest(RemapBase):
+    def test_a_relative_config_path_is_resolved_once_and_saves_with_absolute_paths(self):
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.root)
+        admin = prod_admin.ModelAdmin("prod_server.local.yaml")                      # 相対の --config(起動時の作業フォルダ基準)
+        self.assertTrue(admin.config_path.is_absolute() and admin.local_dir.is_absolute())
+        os.chdir(self.root / "share_model")                                           # 後で作業フォルダが変わっても、保存先は変わらない
+        res = admin.save(self.rbody())
+        self.assertTrue(res["saved"], res)
+        d = yaml.safe_load(self.cfg_path.read_text(encoding="utf-8"))["model"]
+        self.assertTrue(os.path.isabs(d["yaml_dir"]) and os.path.isabs(d["dir"]))
+        self.assertEqual(os.path.normcase(d["yaml_dir"]), os.path.normcase(str(self.root / "local_config")))
+        prod_config.load_config(str(self.cfg_path))                                   # 設定として読める
+
+    def test_unc_paths_are_kept_as_is_and_still_refused_for_writing(self):
+        admin = prod_admin.ModelAdmin("\\\\server\\share\\prod_server.local.yaml", local_dir="\\\\server\\share\\cfg")
+        self.assertTrue(str(admin.config_path).startswith("\\\\"))
+        with self.assertRaises(prod_admin.AdminError):
+            admin.save(self.rbody())
+
+
 if __name__ == "__main__":
     unittest.main()
