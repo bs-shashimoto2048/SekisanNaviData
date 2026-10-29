@@ -7,6 +7,9 @@
   一致しないときだけ、**元の model.yaml の `my_model` の参照名だけ**を選んだ重みのファイル名に置き換えた「設定用コピー」を、ローカルの Git 管理外領域(`*.local.yaml`)に作って使える
   (利用者が明示的に選ぶ。差分を画面に示し、ほかの推論設定値が変わらないことを検証する。元の model.yaml・重みは変更・複製・改名しない)。
 - 保存先は Git 管理外の `prod_server.local.yaml` の `model:` 節だけ。保存前に同じフォルダへバックアップを作り、検証してから原子的に置換する。共有 server.yaml は触らない。
+- **書き込み先(設定ファイル・バックアップ・一時ファイル・設定用コピー)は、実体としてローカルディスクの中に限る**(`require_local_dir`)。UNC・ネットワークドライブ・取り外し可能/不明なドライブ・
+  SUBST 等で別の場所へ解決されるドライブ・パスの途中にシンボリックリンク/ジャンクション等がある場所は、書き込みの前に固定文で拒否する(パス文字列だけで判定しない)。
+  読み取り元(重み・元の model.yaml)は UNC も選べる(読み取りと書き込みは別)。
 - 保存しても API の起動・再起動・公開はしない。保存後に、読み取り専用の `check`(prod_server.run_check)を実行できる。
 - 応答・画面にはファイル名だけを出す。ハッシュは先頭 12 桁だけ(全文は設定ファイルにだけ書く)。パスを返すのは「参照…」で選んだ値を入力欄へ入れるときだけ(ローカル画面のみ)。アクセスログは出さない。
 """
@@ -14,11 +17,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -55,6 +61,56 @@ class AdminError(RuntimeError):
 
 class PickerBusy(RuntimeError):
     pass
+
+
+# ----------------------------------------------------------------------------- 書き込み先の検査(読み取り元とは別。書き込みはローカルディスク内に限る)
+STORAGE_MESSAGE = ("保存先(設定ファイル・バックアップ・設定用コピー)は、この PC のローカルディスク内に限ります。"
+                   "ネットワーク上の場所・ネットワークドライブ・リンクやジャンクションを経由する場所は使えません。起動時の設定(--config)を確認してください。")
+DRIVE_FIXED = 3                          # GetDriveTypeW: 固定ディスク(ネットワーク = 4、取り外し可能 = 2、不明 = 0、RAM ディスク = 6 は不可)
+_REPARSE_POINT = 0x400                   # FILE_ATTRIBUTE_REPARSE_POINT(シンボリックリンク・ジャンクション・マウントポイント等)
+
+
+def default_drive_type(root: str) -> int:
+    return ctypes.windll.kernel32.GetDriveTypeW(root)
+
+
+def _is_reparse_or_link(path: str) -> bool:
+    st = os.lstat(path)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def require_local_dir(path, drive_type=default_drive_type) -> str:
+    """書き込み先のフォルダが、実体としてローカルディスクの中にあることを確認して返す。証明できなければ AdminError(固定文。パス・例外メッセージを含めない)。
+    - UNC(`\\\\`・`//`・`\\\\?\\`)は拒否。ドライブ文字つきの絶対パスだけ。
+    - ドライブの種類(GetDriveTypeW)が「固定ディスク」でなければ拒否(ネットワーク・取り外し可能・不明・RAM ディスク)。
+    - パスの各階層(存在するもの)が、シンボリックリンク・ジャンクション等の再解析ポイントなら拒否(パス文字列だけで判定しない)。
+    - 実体(realpath)が UNC、または別のドライブへ解決される(SUBST・マップ)場合も拒否する(解決先のドライブの種類も確認する)。
+    - まだ無い階層は、作成した後でもう一度この関数で確認すること。Windows 以外では確認できないため拒否する。"""
+    try:
+        text = os.fspath(path)
+        if os.name != "nt" or not isinstance(text, str) or text.startswith(("\\\\", "//")):
+            raise AdminError(STORAGE_MESSAGE)
+        full = os.path.abspath(text)
+        drive, rest = os.path.splitdrive(full)
+        if not re.fullmatch(r"[A-Za-z]:", drive) or drive_type(drive + "\\") != DRIVE_FIXED:
+            raise AdminError(STORAGE_MESSAGE)
+        cur = deepest = drive + "\\"
+        for part in [x for x in rest.split("\\") if x]:
+            cur = os.path.join(cur, part)
+            if not os.path.lexists(cur):
+                break
+            if _is_reparse_or_link(cur):
+                raise AdminError(STORAGE_MESSAGE)
+            deepest = cur
+        real = os.path.realpath(deepest)
+        rdrive = os.path.splitdrive(real)[0]
+        if real.startswith(("\\\\", "//")) or rdrive.lower() != drive.lower() or drive_type(rdrive + "\\") != DRIVE_FIXED:
+            raise AdminError(STORAGE_MESSAGE)
+        return full
+    except AdminError:
+        raise
+    except Exception:  # noqa: BLE001 - 確認できない = 証明できない(例外メッセージ・パスは出さない)
+        raise AdminError(STORAGE_MESSAGE) from None
 
 
 # ----------------------------------------------------------------------------- パスの検査
@@ -286,11 +342,25 @@ def replace_model_section(text: str, block: str, nl: str) -> str:
 
 
 class ModelAdmin:
-    def __init__(self, config_path=DEFAULT_CONFIG, picker=None, local_dir=None):
+    def __init__(self, config_path=DEFAULT_CONFIG, picker=None, local_dir=None, drive_type=default_drive_type):
         self.config_path = Path(config_path)
         self.local_dir = Path(local_dir) if local_dir else self.config_path.parent / LOCAL_DIR_NAME
         self.picker = picker or FilePicker()
+        self._drive_type = drive_type
         self._lock = threading.Lock()
+
+    def require_local_storage(self):
+        """設定ファイル・バックアップ・一時ファイル(設定ファイルのフォルダ)と、設定用コピーのフォルダが、実体としてローカルディスク内であることを確認する。
+        書き込みの前に毎回呼ぶ。証明できなければ AdminError(固定文)。設定ファイル自体がリンクなら拒否する。"""
+        require_local_dir(self.config_path.parent, self._drive_type)
+        try:
+            if os.path.lexists(self.config_path) and _is_reparse_or_link(str(self.config_path)):
+                raise AdminError(STORAGE_MESSAGE)
+        except AdminError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise AdminError(STORAGE_MESSAGE) from None
+        require_local_dir(self.local_dir, self._drive_type)
 
     # ---- 検査・状態
     def inspect(self, body: dict) -> dict:
@@ -298,7 +368,12 @@ class ModelAdmin:
         return {"ok": True, "inspection": res}
 
     def state(self) -> dict:
-        cur = {"config_file": self.config_path.name, "exists": self.config_path.is_file(), "model": None}
+        cur = {"config_file": self.config_path.name, "exists": False, "model": None, "storage_error": None}
+        try:
+            self.require_local_storage()
+            cur["exists"] = self.config_path.is_file()
+        except AdminError as e:                                  # 保存先がローカルと証明できない: 内容は読まず、固定文だけ返す
+            cur["storage_error"] = str(e)
         if cur["exists"]:
             try:
                 data = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
@@ -334,11 +409,10 @@ class ModelAdmin:
         path = self.config_path
         if not path.name.endswith(".local.yaml") or path.name.endswith(".sample.yaml"):
             raise AdminError("保存先は Git 管理外の *.local.yaml だけです。")
+        self.require_local_storage()                              # 設定の読み書き・バックアップ・設定用コピーの前に、保存先がローカルであることを確認する
         generated = internal.get("yaml_generated")
         copy_path = None
         if generated is not None:
-            if str(self.local_dir).startswith(("\\\\", "//")):
-                raise AdminError("設定用コピーの保存先は、この PC のローカルのフォルダだけです(共有上には作りません)。")
             copy_path = self.local_dir / internal["yaml_name"]
             if not copy_path.name.endswith(".local.yaml"):
                 raise AdminError("設定用コピーは Git 管理外の *.local.yaml だけです。")
@@ -364,6 +438,7 @@ class ModelAdmin:
                 raise AdminError("保存する内容の検証に失敗したため、保存しませんでした(設定ファイルは変更していません)。") from None
             stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"{time.time_ns() % 10**9:09d}"      # 同じ秒の連続保存でも衝突しない
             backup = path.with_name(f"{path.name[:-len('.local.yaml')]}.bak-{stamp}-{os.getpid()}.local.yaml")
+            self.require_local_storage()                      # バックアップ・一時ファイルの作成の直前にも確認する
             with open(backup, "xb") as f:                     # 既存の設定のバックアップ(同じフォルダ。上書きしない)
                 f.write(raw)
             copy_before = None                                 # 設定用コピーの、保存前の状態(失敗時に戻す)
@@ -371,7 +446,17 @@ class ModelAdmin:
                 if copy_path is not None:
                     copy_before = copy_path.read_bytes() if copy_path.is_file() else None
                     if copy_before != generated:
+                        made_dir = not self.local_dir.exists()
                         self.local_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            self.require_local_storage()      # 作成した後で、もう一度、実体を確認する(未作成の階層も含めて)
+                        except AdminError:
+                            if made_dir:
+                                try:
+                                    self.local_dir.rmdir()
+                                except OSError:
+                                    pass
+                            raise
                         if copy_before is not None:           # 既存のコピーが違う内容なら、退避してから置換
                             with open(copy_path.with_name(f"{copy_path.name[:-len('.local.yaml')]}.bak-{stamp}-{os.getpid()}.local.yaml"), "xb") as f:
                                 f.write(copy_before)
@@ -605,7 +690,13 @@ def main(argv=None) -> int:
     p.add_argument("--config", default=str(DEFAULT_CONFIG), help="保存先(Git 管理外の prod_server.local.yaml)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = p.parse_args(argv)
-    server = make_server(ModelAdmin(args.config), port=args.port)
+    admin = ModelAdmin(args.config)
+    try:
+        admin.require_local_storage()                        # 起動設定が不正(保存先がローカルと証明できない)なら、待ち受ける前に固定文で終了する
+    except AdminError as e:
+        print(f"起動を拒否: {e}", file=sys.stderr)
+        return 2
+    server = make_server(admin, port=args.port)
     print(f"モデル管理画面: http://127.0.0.1:{args.port}/  (Ctrl+C で終了。API の起動・公開はしません)")
     try:
         server.serve_forever()

@@ -108,6 +108,7 @@
 
   function renderCurrent(cur) {
     var box = $("current"); clear(box);
+    if (cur.storage_error) { box.appendChild(el("span", cur.storage_error, "ng")); return; }
     if (!cur.exists) { box.appendChild(el("span", "prod_server.local.yaml がありません(sample を写して作成してください)。", "ng")); return; }
     if (cur.error) { box.appendChild(el("span", cur.error, "ng")); return; }
     if (!cur.model) { box.appendChild(el("span", "モデルは未設定です。", "note")); return; }

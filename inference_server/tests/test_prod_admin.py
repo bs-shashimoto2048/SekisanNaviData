@@ -732,5 +732,216 @@ class RemapHttpTest(RemapBase):
         self.assertNotIn(str(self.root), json.dumps(sv))
 
 
+# ----------------------------------------------------------------------------- 書き込み先はローカルディスク内に限る(読み取り元の UNC とは別)
+def make_junction(link: Path, target: Path) -> bool:
+    import subprocess
+    if os.name != "nt":
+        return False
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+    return r.returncode == 0 and link.exists()
+
+
+def real_drive_types():
+    """A〜Z の各ドライブの種類を、実際の GetDriveTypeW で調べる(モックを使わない)。"""
+    import ctypes
+    return {c: ctypes.windll.kernel32.GetDriveTypeW(c + ":\\") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+
+
+class StorageGuardTest(RemapBase):
+    def tree(self):
+        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
+
+    def assertFixed(self, fn, *a, **kw):
+        with self.assertRaises(prod_admin.AdminError) as cm:
+            fn(*a, **kw)
+        self.assertEqual(str(cm.exception), prod_admin.STORAGE_MESSAGE)                 # 固定文(パス・例外メッセージを含めない)
+        return cm.exception
+
+    @unittest.skipUnless(os.name == "nt", "Windows のドライブ判定")
+    def test_a_normal_local_folder_is_accepted_with_the_real_drive_type(self):
+        d = self.root / "plain"
+        d.mkdir()
+        if real_drive_types()[os.path.splitdrive(str(d))[0][0].upper()] != prod_admin.DRIVE_FIXED:
+            self.skipTest("一時フォルダが固定ディスクではない環境")
+        self.assertEqual(os.path.normcase(prod_admin.require_local_dir(d)), os.path.normcase(str(d)))
+        self.assertEqual(os.path.normcase(prod_admin.require_local_dir(d / "not" / "yet" / "created")), os.path.normcase(str(d / "not" / "yet" / "created")))
+
+    def test_unc_forms_are_rejected(self):
+        for p in ("\\\\server\\share\\cfg", "//server/share/cfg", "\\\\?\\UNC\\server\\share\\cfg", "\\\\?\\C:\\cfg", "\\\\127.0.0.1\\C$\\x", "relative\\x" if os.name != "nt" else "\\\\x"):
+            with self.subTest(p=p):
+                self.assertFixed(prod_admin.require_local_dir, p)
+
+    def test_network_and_other_non_fixed_drives_are_rejected_by_drive_type(self):
+        for kind in (0, 1, 2, 4, 5, 6):                                                 # 不明・なし・取り外し可能・ネットワーク・CD・RAM
+            with self.subTest(kind=kind):
+                self.assertFixed(prod_admin.require_local_dir, self.root / "x", lambda r, k=kind: k)
+
+    @unittest.skipUnless(os.name == "nt", "Windows のドライブ判定")
+    def test_real_non_fixed_drives_are_rejected_without_mocks(self):
+        types = real_drive_types()
+        others = [c for c, t in types.items() if t in (2, 4)]                           # 実在する取り外し可能・ネットワークドライブ
+        if not others:
+            self.skipTest("取り外し可能・ネットワークのドライブがない環境")
+        for c in others:
+            with self.subTest(drive=c, kind=types[c]):
+                self.assertFixed(prod_admin.require_local_dir, f"{c}:\\prod_admin_test\\cfg")
+        missing = [c for c, t in types.items() if t == 1]                               # 存在しないドライブ文字
+        self.assertFixed(prod_admin.require_local_dir, f"{missing[0]}:\\cfg")
+
+    @unittest.skipUnless(os.name == "nt", "Windows のジャンクション")
+    def test_a_junction_in_the_path_is_rejected_even_when_it_points_to_a_local_folder(self):
+        target = self.root / "elsewhere"
+        target.mkdir()
+        link = self.root / "link"
+        if not make_junction(link, target):
+            self.skipTest("ジャンクションを作れない環境")
+        self.assertFixed(prod_admin.require_local_dir, link)
+        self.assertFixed(prod_admin.require_local_dir, link / "sub")                  # まだ無い階層でも、親がジャンクションなら拒否
+        self.assertFixed(prod_admin.require_local_dir, link / "a" / "b")
+        (target / "real_sub").mkdir()
+        self.assertFixed(prod_admin.require_local_dir, link / "real_sub")             # 解決先に実在する下位フォルダでも拒否
+
+    def test_a_symlink_in_the_path_is_rejected(self):
+        target = self.root / "elsewhere2"
+        target.mkdir()
+        link = self.root / "symlink"
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("シンボリックリンクを作る権限がない環境")
+        self.assertFixed(prod_admin.require_local_dir, link)
+        self.assertFixed(prod_admin.require_local_dir, link / "sub")
+
+    @unittest.skipUnless(os.name == "nt", "Windows のジャンクション")
+    def test_a_directory_that_resolves_to_another_drive_or_a_share_is_rejected(self):
+        # realpath が UNC / 別ドライブへ解決される場合(SUBST・マップ)を、実体の判定で拒否する(realpath と GetDriveTypeW を差し替えて再現)
+        d = self.root / "plain2"
+        d.mkdir()
+        with mock.patch("os.path.realpath", return_value="\\\\server\\share\\x"):
+            self.assertFixed(prod_admin.require_local_dir, d)
+        other = "Z:\\x" if not str(d).upper().startswith("Z:") else "Y:\\x"
+        with mock.patch("os.path.realpath", return_value=other):
+            self.assertFixed(prod_admin.require_local_dir, d, lambda r: 3)
+        with mock.patch("os.path.realpath", side_effect=OSError("secret")):             # 確認できない = 証明できない(例外メッセージを出さない)
+            exc = self.assertFixed(prod_admin.require_local_dir, d)
+        self.assertNotIn("secret", str(exc))
+
+    # ---- 管理画面(ModelAdmin)の動作: 書き込みの前に固定文で拒否し、何も作らない
+    def test_unc_config_path_is_refused_before_anything_is_written(self):
+        unc = prod_admin.ModelAdmin("\\\\server\\share\\prod_server.local.yaml", local_dir=self.local_dir)
+        before = self.tree()
+        self.assertFixed(unc.save, self.rbody())
+        self.assertEqual(self.tree(), before)
+        st = unc.state()
+        self.assertEqual(st["current"]["storage_error"], prod_admin.STORAGE_MESSAGE)
+        self.assertFalse(st["current"]["exists"])
+        self.assertIsNone(st["current"]["model"])
+        unc2 = prod_admin.ModelAdmin(self.cfg_path, local_dir="\\\\server\\share\\local_config")
+        self.assertFixed(unc2.save, self.rbody())
+
+    def test_network_drive_config_is_refused_before_backup_or_copy(self):
+        net = prod_admin.ModelAdmin(self.cfg_path, local_dir=self.local_dir, drive_type=lambda r: 4)
+        cfg_before, before = self.cfg_path.read_bytes(), self.tree()
+        self.assertFixed(net.save, self.rbody())
+        self.assertEqual(self.cfg_path.read_bytes(), cfg_before)
+        self.assertEqual(self.tree(), before)                                          # バックアップ・一時ファイル・設定用コピーのフォルダを作らない
+        self.assertEqual(net.state()["current"]["storage_error"], prod_admin.STORAGE_MESSAGE)
+
+    @unittest.skipUnless(os.name == "nt", "Windows のジャンクション")
+    def test_junction_local_config_is_refused_and_nothing_is_written_through_it(self):
+        target = self.root / "elsewhere3"
+        target.mkdir()
+        link = self.root / "local_config_link"
+        if not make_junction(link, target):
+            self.skipTest("ジャンクションを作れない環境")
+        admin = prod_admin.ModelAdmin(self.cfg_path, local_dir=link)
+        cfg_before = self.cfg_path.read_bytes()
+        self.assertFixed(admin.save, self.rbody())
+        self.assertEqual(self.cfg_path.read_bytes(), cfg_before)
+        self.assertEqual(list(target.iterdir()), [])                                   # 解決先へ何も書いていない
+        self.assertEqual(list(self.root.glob("prod_server.bak-*")), [])
+        admin2 = prod_admin.ModelAdmin(self.cfg_path, local_dir=link / "sub")          # まだ無い下位フォルダ
+        self.assertFixed(admin2.save, self.rbody())
+        self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows のジャンクション")
+    def test_config_folder_through_a_junction_is_refused(self):
+        real_cfg_dir = self.root / "real_cfg"
+        real_cfg_dir.mkdir()
+        (real_cfg_dir / "prod_server.local.yaml").write_bytes(self.cfg_path.read_bytes())
+        link = self.root / "cfg_link"
+        if not make_junction(link, real_cfg_dir):
+            self.skipTest("ジャンクションを作れない環境")
+        admin = prod_admin.ModelAdmin(link / "prod_server.local.yaml", local_dir=self.local_dir)
+        before = (real_cfg_dir / "prod_server.local.yaml").read_bytes()
+        self.assertFixed(admin.save, self.rbody())
+        self.assertEqual((real_cfg_dir / "prod_server.local.yaml").read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in real_cfg_dir.iterdir()), ["prod_server.local.yaml"])
+
+    def test_a_config_file_that_is_itself_a_link_is_refused(self):
+        real = self.root / "real_file.local.yaml"
+        real.write_bytes(self.cfg_path.read_bytes())
+        link = self.root / "linked.local.yaml"
+        try:
+            os.symlink(str(real), str(link))
+        except (OSError, NotImplementedError):
+            self.skipTest("シンボリックリンクを作る権限がない環境")
+        before = real.read_bytes()
+        self.assertFixed(prod_admin.ModelAdmin(link, local_dir=self.local_dir).save, self.rbody())
+        self.assertEqual(real.read_bytes(), before)
+
+    def test_recheck_after_creating_the_copy_folder_removes_it_and_keeps_the_config(self):
+        cfg_before = self.cfg_path.read_bytes()
+        real = prod_admin.require_local_dir
+        calls = []
+
+        def flaky(path, drive_type=prod_admin.default_drive_type):
+            calls.append(str(path))
+            if Path(path) == self.local_dir and self.local_dir.exists():              # 作成した後の再確認で、実体が別の場所だと分かった想定
+                raise prod_admin.AdminError(prod_admin.STORAGE_MESSAGE)
+            return real(path, drive_type)
+        with mock.patch.object(prod_admin, "require_local_dir", flaky):
+            self.assertFixed(self.admin.save, self.rbody())
+        self.assertFalse(self.local_dir.exists())                                      # 作ったフォルダを残さない
+        self.assertEqual(self.cfg_path.read_bytes(), cfg_before)
+
+    def test_reading_from_a_unc_path_is_still_allowed_while_writing_is_local_only(self):
+        self.assertTrue(prod_admin.validate_model_path(prod_admin.DEFAULT_WEIGHTS_PATH, prod_admin.WEIGHTS_EXTS, "x").endswith("estimatic_a_20250826.pt"))
+        if os.name != "nt":
+            self.skipTest("Windows の管理共有")
+        drive, rest = os.path.splitdrive(str(self.dw))
+        unc_w = "\\\\127.0.0.1\\" + drive[0] + "$" + rest
+        drive, rest = os.path.splitdrive(str(self.src))
+        unc_y = "\\\\127.0.0.1\\" + drive[0] + "$" + rest
+        if not os.path.isfile(unc_w):
+            self.skipTest("管理共有(C$)にアクセスできない環境")
+        res = self.admin.save({"weights_path": unc_w, "yaml_path": unc_y, "remap": True})   # 読み取り元は UNC、書き込み先はローカル
+        self.assertTrue(res["saved"], res)
+        self.assertTrue((self.local_dir / COPY_NAME).is_file())
+        self.assertTrue(yaml.safe_load(self.cfg_path.read_text(encoding="utf-8"))["model"]["dir"].startswith("\\\\"))
+
+    def test_startup_with_an_invalid_save_location_is_refused_with_a_fixed_message(self):
+        err = io.StringIO()
+        with mock.patch.object(prod_admin, "make_server", side_effect=AssertionError("待ち受けない")), contextlib.redirect_stderr(err):
+            code = prod_admin.main(["--config", "\\\\server\\share\\secret_dir\\prod_server.local.yaml", "--port", "0"])
+        self.assertEqual(code, 2)
+        self.assertIn(prod_admin.STORAGE_MESSAGE, err.getvalue())
+        for leak in ("secret_dir", "server", "share"):
+            self.assertNotIn(leak, err.getvalue().replace("サーバー", ""))
+
+    def test_http_save_is_refused_with_the_fixed_message_for_a_bad_location(self):
+        unc = prod_admin.ModelAdmin("\\\\server\\share\\prod_server.local.yaml", local_dir=self.local_dir)
+        server = prod_admin.make_server(unc, port=0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        hdr = {"X-Admin-Request": "1", "Content-Type": "application/json"}
+        r = requests.post(base + "/api/model/save", data=json.dumps(self.rbody()), headers=hdr, timeout=30, proxies=NO_PROXY)
+        self.assertEqual((r.status_code, r.json()["error"]), (400, prod_admin.STORAGE_MESSAGE))
+        st = requests.get(base + "/api/state", timeout=5, proxies=NO_PROXY).json()
+        self.assertEqual(st["current"]["storage_error"], prod_admin.STORAGE_MESSAGE)
+        self.assertNotIn("share", json.dumps(st, ensure_ascii=False).replace("shared", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
