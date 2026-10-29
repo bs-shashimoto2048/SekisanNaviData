@@ -1,10 +1,13 @@
 # Real YOLO backend (NOT installed in the verification venv; not exercised by the automated tests).
+# torch is pinned to 2.5.1+cu124 on purpose: with torch 2.6.0+cu124 and ultralytics 8.2.2 the real model (best.pt) FAILS to load
+# (UnpicklingError: torch 2.6 made torch.load weights_only=True the default). Verified in isolated venvs (see docs/production_inference_api.md).
+# Install with: pip install -r requirements-real.txt --extra-index-url https://download.pytorch.org/whl/cu124
 # Pins copied from the provenance copy's requirements.txt (UTF-16 there). Install on the machine that has the GPU/model.
 -r requirements.txt
 sahi==0.11.15
 ultralytics==8.2.2
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
 numpy==1.24.4
 opencv-python==4.7.0.72
 pillow==10.3.0

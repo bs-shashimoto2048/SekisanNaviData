@@ -286,9 +286,9 @@ def _read_token(path: str) -> bytes:
 def _check_model_in_place(cfg: prod_config.ProdConfig):
     """`check` 用: 元のフォルダを読み取って識別・照合する(ステージングしない)。(識別情報, 要約)。"""
     m = cfg.model
-    ident = prod_model.identify(m.id, m.dir, m.weights, m.yaml_name)
+    ident = prod_model.identify(m.id, m.dir, m.weights, m.yaml_name, m.yaml_dir or None)
     prod_model.verify(ident, m.weights_sha256, m.weights_size, m.yaml_sha256)
-    return ident, prod_model.check_yaml_matches_weights(m.dir, m.yaml_name, m.weights)
+    return ident, prod_model.check_yaml_matches_weights(m.yaml_dir or m.dir, m.yaml_name, m.weights)
 
 
 def _port_busy(host: str, port: int) -> bool:
@@ -482,7 +482,8 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
     m = cfg.model
     log.info("モデルの検証を開始します(id=%s)", m.id)
     try:
-        identity, staged = prod_model.stage_and_verify(m.id, m.dir, m.weights, m.yaml_name, m.weights_sha256, m.weights_size, m.yaml_sha256)
+        identity, staged = prod_model.stage_and_verify(m.id, m.dir, m.weights, m.yaml_name, m.weights_sha256, m.weights_size, m.yaml_sha256,
+                                                          yaml_dir=m.yaml_dir or None)
     except prod_model.ModelVerificationError as e:
         log.error("起動を拒否(モデルの検証に失敗): %s", e)
         return EXIT_MODEL

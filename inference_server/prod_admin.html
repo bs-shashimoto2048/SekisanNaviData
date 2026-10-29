@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>図面解析 AI モデル管理</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1d2733; --muted:#5b6776; --card:#fff; --line:#d5dbe3; --ok:#14733a; --ng:#b3261e; --accent:#1c5fb8; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14181d; --fg:#e6ebf1; --muted:#9aa6b4; --card:#1c2229; --line:#323b46; --ok:#59c07f; --ng:#ff7b72; --accent:#6aa7f5; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 "Yu Gothic UI","Meiryo",sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; } .sub { color:var(--muted); margin:0 0 18px; font-size:13px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  label { display:block; font-weight:600; margin:10px 0 4px; }
+  .row { display:flex; gap:8px; } .row input { flex:1; min-width:0; }
+  input[type=text] { padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  button { padding:7px 14px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); } button:disabled { opacity:.5; cursor:default; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .note { color:var(--muted); font-size:13px; } .ok { color:var(--ok); font-weight:600; } .ng { color:var(--ng); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+  th { width:11em; color:var(--muted); font-weight:600; } ul { margin:6px 0 0 1.2em; padding:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>図面解析 AI モデル管理</h1>
+  <p class="sub">この PC(API ホスト)でだけ使えます。モデルは複製・アップロードせず、選んだ場所のまま参照します。保存しても API の起動・再起動・接続設定の公開は行いません。</p>
+
+  <section>
+    <h2>現在の設定(prod_server.local.yaml)</h2>
+    <div id="current" class="note">読み込み中…</div>
+  </section>
+
+  <section>
+    <h2>モデルの指定</h2>
+    <label for="weights">モデルファイル(.pt)</label>
+    <div class="row"><input id="weights" type="text" spellcheck="false" autocomplete="off"><button id="browseW" type="button">参照…</button></div>
+    <label for="yaml">model.yaml(元の設定。初期値は現行サーバーの model.yaml)</label>
+    <div class="row"><input id="yaml" type="text" spellcheck="false" autocomplete="off" placeholder="空欄なら、重みと同じフォルダの model.yaml を探します"><button id="browseY" type="button">参照…</button></div>
+    <div id="remapBox" hidden style="margin-top:8px;padding:8px 10px;border:1px dashed var(--line);border-radius:6px">
+      <label style="margin:0;font-weight:600"><input id="remap" type="checkbox"> my_model の参照名だけを、選んだ重みの名前に置き換えた設定用コピーを作って使う</label>
+      <div class="note">元の model.yaml と重みは変更・複製・改名しません。コピーは、この PC の Git 管理外の設定領域(local_config)にだけ作ります。モデル構造・閾値・デバイス・スライス条件は変わりません。</div>
+    </div>
+    <label for="mid">モデル ID(識別名。英数字と . _ -)</label>
+    <input id="mid" type="text" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box" placeholder="空欄なら重みのファイル名(拡張子なし)">
+    <div class="actions">
+      <button id="inspect" type="button">検証(サイズ・SHA-256 を算出)</button>
+      <button id="save" type="button" class="primary" disabled>この内容で保存</button>
+      <button id="check" type="button">check を実行(読み取り専用)</button>
+    </div>
+    <p class="note">「検証」は、選んだファイルを読み取るだけです(数秒〜数十秒かかることがあります)。期待値(サイズ・SHA-256)は手入力せず、選んだ実ファイルから設定します。画面にはハッシュの先頭 12 桁だけを表示します。</p>
+  </section>
+
+  <section id="resultBox" hidden>
+    <h2>検証結果</h2>
+    <div id="result"></div>
+  </section>
+
+  <section id="checkBox" hidden>
+    <h2>check の結果(読み取り専用。待ち受け・書き込み・公開はしません)</h2>
+    <div id="checkResult"></div>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var busy = false;
+
+  function api(method, path, body) {
+    var opt = { method: method, headers: { "X-Admin-Request": "1", "Content-Type": "application/json" } };
+    if (body !== undefined) opt.body = JSON.stringify(body);
+    return fetch(path, opt).then(function (r) { return r.json().then(function (j) { j.__status = r.status; return j; }); });
+  }
+  function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+  function kv(table, k, v, cls) { var tr = el("tr"); tr.appendChild(el("th", k)); tr.appendChild(el("td", v, cls)); table.appendChild(tr); }
+  function setBusy(b) { busy = b; ["browseW", "browseY", "inspect", "check"].forEach(function (i) { $(i).disabled = b; }); if (b) $("save").disabled = true; }
+  function form() { return { weights_path: $("weights").value, yaml_path: $("yaml").value, model_id: $("mid").value, remap: $("remap").checked }; }
+  function invalidate() { $("save").disabled = true; }
+
+  function renderInspection(ins) {
+    var box = $("result"); clear(box); $("resultBox").hidden = false;
+    var t = el("table");
+    kv(t, "重みファイル", ins.weights ? ins.weights.name : "(未指定)");
+    if (ins.weights && ins.weights.size) { kv(t, "サイズ", ins.weights.size.toLocaleString() + " バイト"); kv(t, "SHA-256(先頭 12 桁)", ins.weights.sha256_12); }
+    kv(t, "model.yaml", ins.yaml ? ins.yaml.name : "(見つかりません)", ins.yaml ? "" : "ng");
+    if (ins.yaml_source) kv(t, "model.yaml の参照元", ins.yaml_source);
+    if (ins.yaml && ins.yaml.sha256_12) kv(t, "model.yaml SHA-256(先頭 12 桁)", ins.yaml.sha256_12);
+    if (ins.yaml && ins.yaml.my_model) kv(t, "model.yaml の my_model / device", ins.yaml.my_model + " / " + (ins.yaml.device || "-"));
+    kv(t, "重みと model.yaml の組", ins.pair.message, ins.pair.ok ? "ok" : "ng");
+    kv(t, "判定", ins.ok ? "保存できます" : "保存できません", ins.ok ? "ok" : "ng");
+    box.appendChild(t);
+    var rb = $("remapBox"); rb.hidden = !(ins.remap && ins.remap.available);
+    if (ins.remap && ins.remap.available) {
+      var h = el("h2", "保存前の変更差分(model.yaml → 設定用コピー " + ins.remap.copy_name + ")"); h.style.marginTop = "14px"; box.appendChild(h);
+      var pre = el("pre"); pre.style.cssText = "margin:0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:auto";
+      pre.textContent = ["- " + ins.remap.diff.before, "+ " + ins.remap.diff.after].join("\n"); box.appendChild(pre);
+      box.appendChild(el("p", "変更は上の 1 行だけです。ほかの設定値は変わらないことを検証済み: " + ins.remap.unchanged.join(" / "), "note"));
+      if (!ins.remap.selected) box.appendChild(el("p", "コピーを使うには、上の「設定用コピーを作って使う」にチェックを入れて、もう一度「検証」を押してください。", "note"));
+    }
+    if (ins.remap_error) box.appendChild(el("p", ins.remap_error, "ng"));
+    if (ins.problems && ins.problems.length) { var ul = el("ul"); ins.problems.forEach(function (p) { ul.appendChild(el("li", p, "ng")); }); box.appendChild(ul); }
+    $("save").disabled = !ins.ok;
+  }
+
+  function renderCurrent(cur) {
+    var box = $("current"); clear(box);
+    if (cur.storage_error) { box.appendChild(el("span", cur.storage_error, "ng")); return; }
+    if (!cur.exists) { box.appendChild(el("span", "prod_server.local.yaml がありません(sample を写して作成してください)。", "ng")); return; }
+    if (cur.error) { box.appendChild(el("span", cur.error, "ng")); return; }
+    if (!cur.model) { box.appendChild(el("span", "モデルは未設定です。", "note")); return; }
+    var t = el("table"), m = cur.model;
+    kv(t, "モデル ID", m.id || "(未設定)"); kv(t, "重みファイル", m.weights); kv(t, "model.yaml", m.yaml + (m.yaml_in_other_folder ? "(重みと別のフォルダ)" : ""));
+    kv(t, "期待 SHA-256(先頭 12 桁)", m.weights_sha256_12 || "-"); kv(t, "期待サイズ", m.weights_size ? m.weights_size.toLocaleString() + " バイト" : "-");
+    box.appendChild(t);
+  }
+
+  function loadState() { return api("GET", "/api/state").then(function (s) { if (s.ok) { renderCurrent(s.current); if (!$("weights").value) $("weights").value = s.default_weights_path; if (!$("yaml").value && s.default_yaml_path) $("yaml").value = s.default_yaml_path; } }); }
+
+  function browse(kind, inputId) {
+    if (busy) return; setBusy(true);
+    api("POST", "/api/model/browse", { kind: kind, current: $(inputId).value }).then(function (r) {
+      if (!r.ok) { alert(r.error || "ファイル選択に失敗しました。"); }
+      else if (!r.cancelled) { $(inputId).value = r.path; invalidate(); }
+    }).catch(function () { alert("ファイル選択に失敗しました。"); }).then(function () { setBusy(false); });
+  }
+
+  $("browseW").onclick = function () { browse("weights", "weights"); };
+  $("browseY").onclick = function () { browse("yaml", "yaml"); };
+  ["weights", "yaml", "mid"].forEach(function (i) { $(i).oninput = invalidate; });
+  $("remap").onchange = function () { $("inspect").click(); };
+
+  $("inspect").onclick = function () {
+    if (busy) return; setBusy(true); $("result").textContent = "読み取り中…"; $("resultBox").hidden = false;
+    api("POST", "/api/model/inspect", form()).then(function (r) {
+      if (r.ok) renderInspection(r.inspection); else { clear($("result")); $("result").appendChild(el("span", r.error, "ng")); }
+    }).catch(function () { $("result").textContent = "検証に失敗しました。"; }).then(function () { setBusy(false); });
+  };
+
+  $("save").onclick = function () {
+    if (busy) return; setBusy(true);
+    api("POST", "/api/model/save", form()).then(function (r) {
+      if (r.inspection) renderInspection(r.inspection);
+      var box = $("result");
+      if (r.saved) { box.appendChild(el("p", "保存しました(バックアップ: " + r.backup_file + (r.yaml_copy_file ? " / 設定用コピー: " + r.yaml_copy_file : "") + ")。" + r.note, "ok")); loadState(); }
+      else { box.appendChild(el("p", r.error || "保存できませんでした。", "ng")); }
+    }).catch(function () { $("result").appendChild(el("p", "保存に失敗しました。", "ng")); }).then(function () { setBusy(false); $("save").disabled = true; });
+  };
+
+  $("check").onclick = function () {
+    if (busy) return; setBusy(true); $("checkBox").hidden = false; $("checkResult").textContent = "実行中…";
+    api("POST", "/api/check", {}).then(function (r) {
+      var box = $("checkResult"); clear(box);
+      if (!r.ok) { box.appendChild(el("span", r.error || "check に失敗しました。", "ng")); return; }
+      if (r.stage === "config") { box.appendChild(el("p", "設定が未完了のため、check の前に止まりました: " + r.error, "ng")); return; }
+      var res = r.result, t = el("table");
+      kv(t, "判定", r.check_ok ? "OK" : "要確認", r.check_ok ? "ok" : "ng");
+      if (res.model) kv(t, "モデルの検証", res.model.verified ? "一致(" + res.model.weights_sha256_12 + ")" : "不一致・未検証", res.model.verified ? "ok" : "ng");
+      if (res.bind) kv(t, "待受(確認のみ)", (res.bind.scope || "-") + (res.bind.port_in_use ? " / ポート使用中" : ""));
+      if (res.server) kv(t, "Waitress", res.server.waitress_importable ? "利用可" : "未導入", res.server.waitress_importable ? "ok" : "ng");
+      if (res.output_root) kv(t, "出力ルート", res.output_root.exists ? "存在します" : "見つかりません", res.output_root.exists ? "ok" : "ng");
+      box.appendChild(t);
+    }).catch(function () { $("checkResult").textContent = "check に失敗しました。"; }).then(function () { setBusy(false); });
+  };
+
+  loadState();
+})();
+</script>
+</body>
+</html>
