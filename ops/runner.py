@@ -108,7 +108,10 @@ class RunLock:
 class RunManager:
     def __init__(self, state_dir, store: SettingsStore, history: History, main_func: Callable,
                  config_path: Optional[str] = None,
-                 com_init: Callable = com_mod.co_initialize, com_uninit: Callable = com_mod.co_uninitialize):
+                 com_init: Callable = com_mod.co_initialize, com_uninit: Callable = com_mod.co_uninitialize,
+                 output_guard: Optional[Callable] = None):
+        # output_guard(root, source): 手動実行の出力先を、実行を始める前に確認する(違えば SettingsError)。None なら確認しない(従来どおり。暫定運用など)
+        self.output_guard = output_guard
         self.com_init = com_init              # app.main(ホスト DB は COM)を呼ぶスレッドで、呼ぶ前に初期化する
         self.com_uninit = com_uninit
         self.store = store
@@ -169,10 +172,13 @@ class RunManager:
     def start_manual(self, product, output_root: Optional[str] = None) -> Tuple[str, threading.Thread]:
         """指定した 1 製番を、別スレッドで 1 回処理する。二重起動は Busy。入力が不正なら SettingsError。"""
         product = validate_product_no(product)
+        from_field = bool((output_root or "").strip())
         root = (output_root or "").strip() or self.store.load().output_root
         if root:
             from ops.settings_store import validate_output_root
             root = validate_output_root(root)
+        if self.output_guard is not None:       # 製番フォルダの作成・印刷・API 呼び出しの前(ロック・履歴・スレッドの前)に、出力先を確認する
+            self.output_guard(root, "field" if from_field else "ops_setting")
         self.lock.acquire("manual")
         try:
             run_id = self.history.start(KIND_MANUAL, product)
