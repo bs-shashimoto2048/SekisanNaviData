@@ -160,6 +160,62 @@ class PreflightUnitTest(unittest.TestCase):
         self.assertLess(len(reason), 100)
 
 
+class PreflightModelCheckTest(unittest.TestCase):
+    """api.expected_model_sha256_12(任意)があるときだけ、/health の model.weights_sha256_12 と照合する。"""
+
+    # PreflightUnitTest の部品だけを借りる(継承すると、元のテストを重ねて実行してしまう)
+    setUp = PreflightUnitTest.setUp
+    write_yaml = PreflightUnitTest.write_yaml
+    cfg = PreflightUnitTest.cfg
+    check = PreflightUnitTest.check
+    assert_clean = PreflightUnitTest.assert_clean
+
+    EXPECTED = "a1b2c3d4e5f6"
+
+    def resp(self, body, status=200):
+        return lambda u, **kw: SimpleNamespace(status_code=status, json=lambda: body)
+
+    def test_not_configured_means_no_model_check_and_old_servers_still_pass(self):
+        reason, _ = self.check(lambda u, **kw: SimpleNamespace(status_code=200))     # json を持たない旧サーバーでも通る
+        self.assertIsNone(reason)
+
+    def test_matching_model_is_ok(self):
+        body = {"status": "ok", "model": {"id": "m", "weights_sha256_12": self.EXPECTED.upper()}}
+        reason, calls = self.check(self.resp(body), expected_model_sha256_12=self.EXPECTED)
+        self.assertIsNone(reason)
+        self.assertEqual(len(calls), 1)                                              # /health 1 回だけ
+
+    def test_different_model_is_refused_without_values(self):
+        body = {"status": "ok", "model": {"weights_sha256_12": "ffffffffffff"}}
+        reason, _ = self.check(self.resp(body), expected_model_sha256_12=self.EXPECTED)
+        self.assertIn("モデルが想定の版と一致しません", reason)
+        self.assertNotIn("ffffffffffff", reason)
+        self.assertNotIn(self.EXPECTED, reason)
+        self.assert_clean(reason)
+
+    def test_missing_model_info_is_refused(self):
+        for body in ({"status": "ok"}, {"model": {}}, {"model": "x"}, []):
+            with self.subTest(body=body):
+                reason, _ = self.check(self.resp(body), expected_model_sha256_12=self.EXPECTED)
+                self.assertIn("モデルの識別情報を確認できません", reason)
+
+    def test_non_json_body_is_refused(self):
+        def bad_json():
+            raise ValueError("no json")
+        reason, _ = self.check(lambda u, **kw: SimpleNamespace(status_code=200, json=bad_json), expected_model_sha256_12=self.EXPECTED)
+        self.assertIn("モデルの識別情報を確認できません", reason)
+
+    def test_malformed_expected_value_is_a_configuration_error(self):
+        for bad in ("short", "zzzzzzzzzzzz", "a1b2c3d4e5f6a", 123):
+            with self.subTest(bad=bad):
+                reason, _ = self.check(self.resp({"model": {"weights_sha256_12": self.EXPECTED}}), expected_model_sha256_12=bad)
+                self.assertIn("api.expected_model_sha256_12 の形式が不正です", reason)
+
+    def test_status_check_still_comes_first(self):
+        reason, _ = self.check(self.resp({"model": {"weights_sha256_12": self.EXPECTED}}, status=503), expected_model_sha256_12=self.EXPECTED)
+        self.assertIn("HTTP 503", reason)
+
+
 class PreflightInMainTest(MainIntegrationBase):
     """app.main: 推論 API が使えないとき、重い処理(ホスト照会・設計データ・印刷・変換・画像作成)に入らず、失敗として記録して終了する"""
     UNAVAILABLE = "推論 API を利用できないため、製番処理を開始しませんでした(接続が拒否されました)"

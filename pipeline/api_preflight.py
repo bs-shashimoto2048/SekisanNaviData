@@ -3,7 +3,10 @@
 # - 接続先(URL・ホスト名・ポート)・パス・例外メッセージは、返す理由にも、ログにも含めない(例外型と HTTP 応答コードだけ)。
 # - プロキシは、実際の /predict と同じ決め方(api.use_proxy、server.yaml の proxy.host / proxy.port)にそろえる。
 # - 統合モード(検証用の推論サーバーを app が起動する設定)では呼ばない。そちらは起動時に /health の準備完了を確認する。
+# - 任意: 設定 api.expected_model_sha256_12(重みファイルの SHA-256 の先頭 12 桁)があるときだけ、/health の model.weights_sha256_12 と照合する
+#   (本番推論 API inference_server/prod_server.py が返す。想定と違う版のモデルで製番処理を始めないため)。未設定なら従来どおり照合しない。
 import os
+import re
 from typing import Callable, Optional
 
 import requests
@@ -64,4 +67,21 @@ def unavailable_reason(config_data: dict, *, get: Callable = requests.get) -> Op
         return _reason(f"/health に接続できません: {type(e).__name__}")
     if res.status_code != 200:
         return _reason(f"/health の応答が正常ではありません: HTTP {res.status_code}")
+    expected = api.get("expected_model_sha256_12")
+    if expected is not None:
+        return _check_model(res, str(expected))
+    return None
+
+
+def _check_model(res, expected: str) -> Optional[str]:
+    """/health の model.weights_sha256_12 が想定(api.expected_model_sha256_12)と一致するか。値は理由に含めない。"""
+    expected = expected.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{12}", expected):
+        return _reason("api.expected_model_sha256_12 の形式が不正です(16 進 12 桁)")
+    try:
+        got = str(res.json()["model"]["weights_sha256_12"]).lower()
+    except Exception:  # noqa: BLE001 - JSON でない・model が無い(旧サーバーなど)
+        return _reason("/health からモデルの識別情報を確認できません")
+    if got != expected:
+        return _reason("推論 API のモデルが想定の版と一致しません")
     return None

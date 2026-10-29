@@ -1,0 +1,36 @@
+# 本番推論 API(inference_server/prod_server.py)の設定のサンプル。docs/production_inference_api.md
+# - これはサンプル(Git 管理)。**実際の設定は `prod_server.local.yaml` に写して書く**(`*.local.yaml` は Git 管理外)。実値(アドレス・共有パス・ハッシュ)は書き込まない。
+# - 安全に関わる項目はすべて明示が必須。既定値はない(書き忘れ・不正な値は起動を拒否する)。
+mode: production                        # production 固定(明示が必須)
+
+bind:
+  host: "192.0.2.10"                    # 待ち受ける IPv4 アドレス 1 つ(例は文書用の予約アドレス)。0.0.0.0・IPv6・ホスト名は不可。この PC だけなら 127.0.0.1
+  port: 18080                           # 固定ポート(1024〜65535)。起動のたびに変わらない
+
+allowed_clients:                        # 接続を許可する IP / CIDR(1 つ以上必須)。/24 より広い範囲・全許可は不可
+  - "192.0.2.10/32"                     # 例: この PC 自身
+  # - "192.0.2.20/32"                   # 例: プロキシ経由で接続する場合は、サーバーから見える接続元(プロキシ)の IP
+
+output_root: '\\fileserver.example\share\estimatic\a_product\out'   # 製番フォルダの親。/predict はこの直下の製番フォルダだけ受け付ける(共有直下・ドライブ直下は不可)
+
+publish:                                # 接続設定(server.yaml)の公開。--publish-config を付けて起動したときだけ書く
+  server_yaml: '\\fileserver.example\share\estimatic\a_product\server.yaml'   # ファイル名は server.yaml のみ
+  backup_dir: 'C:\ProgramData\SekisanNaviData\server_yaml_backup'              # 上書きの前に既存のファイルをコピーする先
+  # proxy:                              # 既存の server.yaml に proxy が無いときだけ使う(省略可。既存の値は引き継ぐ)
+  #   host: proxy.example
+  #   port: 80
+
+model:
+  id: estimatic_a_20250826              # 識別名(/health と server.yaml に出る。英数字・._-)
+  dir: 'D:\inference\model'             # モデルフォルダ(絶対パス)
+  weights: best.pt                      # 重みのファイル名(パスは不可)。model.yaml の model.my_model と一致すること
+  yaml: model.yaml
+  expected:                             # 期待値。一致しなければ起動しない(値は管理担当が控えた版の記録から転記する)
+    weights_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    weights_size: 52047755
+    yaml_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+# auth:                                 # 任意。指定すると /predict に Authorization: Bearer <token> を要求する(24 文字以上)。
+#   token_file: 'C:\ProgramData\SekisanNaviData\prod_api.token'   # ※現在のクライアント(bs_pkg)は送れないため、対応するまで使わない
+
+timeout_probe_sec: 3.0                  # 公開前に既存 server.yaml の接続先へ /health を送るときの待ち時間(省略可)
