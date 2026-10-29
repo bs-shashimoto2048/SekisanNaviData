@@ -37,8 +37,12 @@
     <h2>モデルの指定</h2>
     <label for="weights">モデルファイル(.pt)</label>
     <div class="row"><input id="weights" type="text" spellcheck="false" autocomplete="off"><button id="browseW" type="button">参照…</button></div>
-    <label for="yaml">model.yaml(重みと組になるもの)</label>
+    <label for="yaml">model.yaml(元の設定。初期値は現行サーバーの model.yaml)</label>
     <div class="row"><input id="yaml" type="text" spellcheck="false" autocomplete="off" placeholder="空欄なら、重みと同じフォルダの model.yaml を探します"><button id="browseY" type="button">参照…</button></div>
+    <div id="remapBox" hidden style="margin-top:8px;padding:8px 10px;border:1px dashed var(--line);border-radius:6px">
+      <label style="margin:0;font-weight:600"><input id="remap" type="checkbox"> my_model の参照名だけを、選んだ重みの名前に置き換えた設定用コピーを作って使う</label>
+      <div class="note">元の model.yaml と重みは変更・複製・改名しません。コピーは、この PC の Git 管理外の設定領域(local_config)にだけ作ります。モデル構造・閾値・デバイス・スライス条件は変わりません。</div>
+    </div>
     <label for="mid">モデル ID(識別名。英数字と . _ -)</label>
     <input id="mid" type="text" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box" placeholder="空欄なら重みのファイル名(拡張子なし)">
     <div class="actions">
@@ -74,7 +78,7 @@
   function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
   function kv(table, k, v, cls) { var tr = el("tr"); tr.appendChild(el("th", k)); tr.appendChild(el("td", v, cls)); table.appendChild(tr); }
   function setBusy(b) { busy = b; ["browseW", "browseY", "inspect", "check"].forEach(function (i) { $(i).disabled = b; }); if (b) $("save").disabled = true; }
-  function form() { return { weights_path: $("weights").value, yaml_path: $("yaml").value, model_id: $("mid").value }; }
+  function form() { return { weights_path: $("weights").value, yaml_path: $("yaml").value, model_id: $("mid").value, remap: $("remap").checked }; }
   function invalidate() { $("save").disabled = true; }
 
   function renderInspection(ins) {
@@ -89,6 +93,15 @@
     kv(t, "重みと model.yaml の組", ins.pair.message, ins.pair.ok ? "ok" : "ng");
     kv(t, "判定", ins.ok ? "保存できます" : "保存できません", ins.ok ? "ok" : "ng");
     box.appendChild(t);
+    var rb = $("remapBox"); rb.hidden = !(ins.remap && ins.remap.available);
+    if (ins.remap && ins.remap.available) {
+      var h = el("h2", "保存前の変更差分(model.yaml → 設定用コピー " + ins.remap.copy_name + ")"); h.style.marginTop = "14px"; box.appendChild(h);
+      var pre = el("pre"); pre.style.cssText = "margin:0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:auto";
+      pre.textContent = ["- " + ins.remap.diff.before, "+ " + ins.remap.diff.after].join("\n"); box.appendChild(pre);
+      box.appendChild(el("p", "変更は上の 1 行だけです。ほかの設定値は変わらないことを検証済み: " + ins.remap.unchanged.join(" / "), "note"));
+      if (!ins.remap.selected) box.appendChild(el("p", "コピーを使うには、上の「設定用コピーを作って使う」にチェックを入れて、もう一度「検証」を押してください。", "note"));
+    }
+    if (ins.remap_error) box.appendChild(el("p", ins.remap_error, "ng"));
     if (ins.problems && ins.problems.length) { var ul = el("ul"); ins.problems.forEach(function (p) { ul.appendChild(el("li", p, "ng")); }); box.appendChild(ul); }
     $("save").disabled = !ins.ok;
   }
@@ -104,7 +117,7 @@
     box.appendChild(t);
   }
 
-  function loadState() { return api("GET", "/api/state").then(function (s) { if (s.ok) { renderCurrent(s.current); if (!$("weights").value) $("weights").value = s.default_weights_path; } }); }
+  function loadState() { return api("GET", "/api/state").then(function (s) { if (s.ok) { renderCurrent(s.current); if (!$("weights").value) $("weights").value = s.default_weights_path; if (!$("yaml").value && s.default_yaml_path) $("yaml").value = s.default_yaml_path; } }); }
 
   function browse(kind, inputId) {
     if (busy) return; setBusy(true);
@@ -117,6 +130,7 @@
   $("browseW").onclick = function () { browse("weights", "weights"); };
   $("browseY").onclick = function () { browse("yaml", "yaml"); };
   ["weights", "yaml", "mid"].forEach(function (i) { $(i).oninput = invalidate; });
+  $("remap").onchange = function () { $("inspect").click(); };
 
   $("inspect").onclick = function () {
     if (busy) return; setBusy(true); $("result").textContent = "読み取り中…"; $("resultBox").hidden = false;
@@ -130,7 +144,7 @@
     api("POST", "/api/model/save", form()).then(function (r) {
       if (r.inspection) renderInspection(r.inspection);
       var box = $("result");
-      if (r.saved) { box.appendChild(el("p", "保存しました(バックアップ: " + r.backup_file + ")。" + r.note, "ok")); loadState(); }
+      if (r.saved) { box.appendChild(el("p", "保存しました(バックアップ: " + r.backup_file + (r.yaml_copy_file ? " / 設定用コピー: " + r.yaml_copy_file : "") + ")。" + r.note, "ok")); loadState(); }
       else { box.appendChild(el("p", r.error || "保存できませんでした。", "ng")); }
     }).catch(function () { $("result").appendChild(el("p", "保存に失敗しました。", "ng")); }).then(function () { setBusy(false); $("save").disabled = true; });
   };

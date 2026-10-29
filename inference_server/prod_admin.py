@@ -4,6 +4,8 @@
 - モデルは**アップロードも別フォルダへのコピーもしない**。API ホストのローカル画面で「参照…」から選んだ `.pt`(UNC 可)と、組になる `model.yaml` を、**その場所のまま**参照する。
   サイズと SHA-256 は、選んだ実ファイルを読み取って算出し、期待値として設定へ書く(手入力しない)。
 - 重みだけでは保存できない: `model.yaml`(SahiBackend が必要とする)が見つからない・読めない・`model.my_model` が重みのファイル名と一致しない場合は、保存を拒否する。
+  一致しないときだけ、**元の model.yaml の `my_model` の参照名だけ**を選んだ重みのファイル名に置き換えた「設定用コピー」を、ローカルの Git 管理外領域(`*.local.yaml`)に作って使える
+  (利用者が明示的に選ぶ。差分を画面に示し、ほかの推論設定値が変わらないことを検証する。元の model.yaml・重みは変更・複製・改名しない)。
 - 保存先は Git 管理外の `prod_server.local.yaml` の `model:` 節だけ。保存前に同じフォルダへバックアップを作り、検証してから原子的に置換する。共有 server.yaml は触らない。
 - 保存しても API の起動・再起動・公開はしない。保存後に、読み取り専用の `check`(prod_server.run_check)を実行できる。
 - 応答・画面にはファイル名だけを出す。ハッシュは先頭 12 桁だけ(全文は設定ファイルにだけ書く)。パスを返すのは「参照…」で選んだ値を入力欄へ入れるときだけ(ローカル画面のみ)。アクセスログは出さない。
@@ -11,6 +13,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import os
 import re
@@ -33,6 +37,9 @@ DEFAULT_CONFIG = HERE / "prod_server.local.yaml"
 HTML_PATH = HERE / "prod_admin.html"
 # 本番モデル(運用担当が指定した重みファイル)。入力欄の初期値。model.yaml はこの値からは決めない(推測しない)
 DEFAULT_WEIGHTS_PATH = r"\\beans-f1\ShareData\estimatic\a_product\model\estimatic_a_20250826.pt"
+# 現行の model.yaml(旧サーバー `estimate\server\model`。モデル構造・閾値・デバイス・スライス条件の元)。入力欄の初期値。共有の重みと同じフォルダには model.yaml が無い
+DEFAULT_YAML_PATH = r"C:\Users\shashimoto\project\workspace_vsc\estimate\server\model\model.yaml"
+LOCAL_DIR_NAME = "local_config"          # 設定用コピーの置き場(prod_server.local.yaml と同じ場所の下。*.local.yaml だけを置く = Git 管理外)
 MAX_BODY = 16 * 1024
 MAX_WEIGHTS_BYTES = 4 * 1024 ** 3
 MAX_YAML_BYTES = 64 * 1024
@@ -90,10 +97,53 @@ def _regular_file(path: str) -> bool:
     return os.path.isfile(path) and not os.path.islink(path)
 
 
+# ----------------------------------------------------------------------------- model.yaml の参照名の対応付け(my_model だけ)
+_MY_MODEL_RE = re.compile(r"""^(?P<pre>[ \t]+my_model:[ \t]*)(?P<q>["']?)(?P<val>[^\s"'#]+)(?P=q)(?P<post>[ \t]*(#.*)?)$""")
+
+
+def remap_yaml(text: str, new_name: str) -> dict:
+    """model.yaml の `model.my_model` の値だけを new_name に置き換えた本文を作る(ほかの行・コメント・改行コードは 1 バイトも変えない)。
+    変更が my_model の 1 行だけであること、ほかのすべての値(`my_model` 以外)が同一であることを検証する。失敗は AdminError。"""
+    lines = text.splitlines(keepends=True)
+    hits, in_model = [], False
+    for i, ln in enumerate(lines):
+        body = ln.rstrip("\r\n")
+        if re.fullmatch(r"model:[ \t]*(#.*)?", body):
+            in_model = True
+            continue
+        if body and body[0] not in " \t#":
+            in_model = False
+        if in_model:
+            m = _MY_MODEL_RE.match(body)
+            if m:
+                hits.append((i, m))
+    if len(hits) != 1:
+        raise AdminError("model.yaml の model.my_model の行を 1 つに特定できないため、対応付けできません。")
+    i, m = hits[0]
+    eol = lines[i][len(lines[i].rstrip("\r\n")):]
+    old_line = lines[i].rstrip("\r\n")
+    lines[i] = m["pre"] + m["q"] + new_name + m["q"] + m["post"] + eol
+    new_text = "".join(lines)
+    try:
+        a, b = yaml.safe_load(text), yaml.safe_load(new_text)
+        ok = b["model"]["my_model"] == new_name
+        a2, b2 = copy.deepcopy(a), copy.deepcopy(b)
+        a2["model"].pop("my_model"), b2["model"].pop("my_model")
+        ok = ok and a2 == b2 and sum(1 for x, y in zip(text.splitlines(), new_text.splitlines()) if x != y) == 1 \
+            and len(text.splitlines()) == len(new_text.splitlines())
+    except Exception:  # noqa: BLE001
+        ok = False
+    if not ok:
+        raise AdminError("my_model 以外の設定値が変わらないことを確認できなかったため、対応付けを中止しました。")
+    flat = [f"{sec}.{k} = {str(v)[:40]}" for sec in ("model", "sahi") for k, v in (a.get(sec) or {}).items() if not (sec == "model" and k == "my_model")]
+    return {"text": new_text, "diff": {"before": old_line.strip(), "after": lines[i].rstrip("\r\n").strip()}, "unchanged": flat}
+
+
 # ----------------------------------------------------------------------------- モデルの検査
-def inspect_model(weights_path, yaml_path="") -> tuple[dict, dict | None]:
+def inspect_model(weights_path, yaml_path="", remap: bool = False, local_dir=None) -> tuple[dict, dict | None]:
     """選んだ実ファイルを読み取り専用で検査する。(画面用の結果, 保存用の内部情報)。内部情報は問題がなければだけ返す(それ以外は None)。
-    画面用の結果にはパス・ハッシュ全文を含めない。"""
+    画面用の結果にはパス・ハッシュ全文を含めない。remap=True(利用者が明示)のときは、my_model が重みと一致しない model.yaml について、
+    my_model だけを対応付けた設定用コピー(local_dir に保存する予定の内容)を内部情報に入れる(ここでは何も書かない)。"""
     problems: list[str] = []
     out = {"weights": None, "yaml": None, "pair": {"ok": False, "message": "未確認"}, "problems": problems, "ok": False}
     internal: dict = {}
@@ -164,14 +214,35 @@ def inspect_model(weights_path, yaml_path="") -> tuple[dict, dict | None]:
                     raise AdminError(f"{yname} を読み込めません(model / sahi の節が必要な YAML です)。") from None
                 yinfo.update(my_model=_safe_name(my_model), device=str(m.get("use_device", ""))[:20],
                              model_type=str(m.get("use_model_type", ""))[:20])
+                internal.update(yaml_dir=os.path.dirname(ypath), yaml_name=yname, yaml_sha256=ysha)
                 if str(my_model) != wname:
-                    out["pair"] = {"ok": False, "message": f"組になっていません: {yname} の my_model は「{_safe_name(my_model)}」で、"
-                                   f"選んだ重み「{wname}」と一致しません。この model.yaml は編集・コピーしません。重みと同名の my_model を持つ "
-                                   "model.yaml を用意して選んでください。"}
-                    problems.append(out["pair"]["message"])
+                    plan = None
+                    try:
+                        plan = remap_yaml(Path(ypath).read_bytes().decode("utf-8"), wname) if _filename_ok(wname) else None
+                    except AdminError as e:
+                        out["remap_error"] = str(e)
+                    except (OSError, UnicodeDecodeError):
+                        plan = None
+                    copy_name = f"{os.path.splitext(wname)[0]}.model.local.yaml"
+                    if plan is not None:
+                        out["remap"] = {"available": True, "selected": bool(remap), "from": _safe_name(my_model), "to": wname,
+                                        "source_name": yname, "copy_name": copy_name, "diff": plan["diff"], "unchanged": plan["unchanged"]}
+                    if plan is not None and remap and local_dir is not None:
+                        data = plan["text"].encode("utf-8")
+                        yinfo.update(name=copy_name, generated_from=yname, sha256_12=hashlib.sha256(data).hexdigest()[:prod_model.PREFIX_LEN],
+                                     my_model=wname)
+                        out["pair"] = {"ok": True, "message": f"元の {yname} の my_model(「{_safe_name(my_model)}」)だけを、選んだ重みの名前(「{wname}」)に置き換えた"
+                                       f"設定用コピー({copy_name})を使います。ほかの設定値は変わりません。"}
+                        internal.update(yaml_dir=str(local_dir), yaml_name=copy_name, yaml_sha256=hashlib.sha256(data).hexdigest(),
+                                        yaml_generated=data, yaml_source_name=yname)
+                    else:
+                        hint = (" 「my_model だけを対応付けた設定用コピーを作る」を選ぶと、ほかの設定値を変えずに使えます。" if plan is not None
+                                else " 重みと同名の my_model を持つ model.yaml を用意して選んでください。")
+                        out["pair"] = {"ok": False, "message": f"組になっていません: {yname} の my_model は「{_safe_name(my_model)}」で、"
+                                       f"選んだ重み「{wname}」と一致しません。元の model.yaml は編集・コピーしません。" + hint}
+                        problems.append(out["pair"]["message"])
                 else:
                     out["pair"] = {"ok": True, "message": f"組になっています(my_model = {wname})。"}
-                internal.update(yaml_dir=os.path.dirname(ypath), yaml_name=yname, yaml_sha256=ysha)
             except AdminError as e:
                 problems.append(str(e))
             except OSError:
@@ -186,9 +257,12 @@ def _q(s: str) -> str:
 
 
 def build_model_block(model_id: str, internal: dict, nl: str) -> str:
+    generated = bool(internal.get("yaml_generated"))
     lines = ["model:", f"  id: {model_id}", f"  dir: {_q(internal['weights_dir'])}"]
     if os.path.normcase(os.path.normpath(internal["yaml_dir"])) != os.path.normcase(os.path.normpath(internal["weights_dir"])):
-        lines.append(f"  yaml_dir: {_q(internal['yaml_dir'])}      # model.yaml は重みと別のフォルダ(コピーせず、この場所を参照する)")
+        note = ("model.yaml は、元の my_model の参照名だけを対応付けたローカルの設定用コピー(Git 管理外)" if generated
+                else "model.yaml は重みと別のフォルダ(コピーせず、この場所を参照する)")
+        lines.append(f"  yaml_dir: {_q(internal['yaml_dir'])}      # {note}")
     lines += [f"  weights: {internal['weights_name']}", f"  yaml: {internal['yaml_name']}",
               "  expected:                             # 管理画面が、選んだ実ファイルから算出して書いた値(手で書き換えない)",
               f"    weights_sha256: \"{internal['weights_sha256']}\"", f"    weights_size: {internal['weights_size']}",
@@ -212,14 +286,15 @@ def replace_model_section(text: str, block: str, nl: str) -> str:
 
 
 class ModelAdmin:
-    def __init__(self, config_path=DEFAULT_CONFIG, picker=None):
+    def __init__(self, config_path=DEFAULT_CONFIG, picker=None, local_dir=None):
         self.config_path = Path(config_path)
+        self.local_dir = Path(local_dir) if local_dir else self.config_path.parent / LOCAL_DIR_NAME
         self.picker = picker or FilePicker()
         self._lock = threading.Lock()
 
     # ---- 検査・状態
     def inspect(self, body: dict) -> dict:
-        res, _ = inspect_model(body.get("weights_path"), body.get("yaml_path", ""))
+        res, _ = inspect_model(body.get("weights_path"), body.get("yaml_path", ""), bool(body.get("remap")), self.local_dir)
         return {"ok": True, "inspection": res}
 
     def state(self) -> dict:
@@ -237,7 +312,7 @@ class ModelAdmin:
                                     "yaml_in_other_folder": bool(m.get("yaml_dir"))}
             except Exception:  # noqa: BLE001
                 cur["error"] = "設定ファイルの YAML を読み込めません。"
-        return {"ok": True, "default_weights_path": DEFAULT_WEIGHTS_PATH, "current": cur}
+        return {"ok": True, "default_weights_path": DEFAULT_WEIGHTS_PATH, "default_yaml_path": DEFAULT_YAML_PATH, "current": cur}
 
     # ---- 参照…
     def browse(self, body: dict) -> dict:
@@ -250,7 +325,7 @@ class ModelAdmin:
 
     # ---- 保存
     def save(self, body: dict) -> dict:
-        res, internal = inspect_model(body.get("weights_path"), body.get("yaml_path", ""))
+        res, internal = inspect_model(body.get("weights_path"), body.get("yaml_path", ""), bool(body.get("remap")), self.local_dir)
         if internal is None:
             return {"ok": False, "saved": False, "error": "検証に通らないため保存しませんでした。", "inspection": res}
         model_id = str(body.get("model_id") or "").strip() or os.path.splitext(internal["weights_name"])[0]
@@ -259,6 +334,14 @@ class ModelAdmin:
         path = self.config_path
         if not path.name.endswith(".local.yaml") or path.name.endswith(".sample.yaml"):
             raise AdminError("保存先は Git 管理外の *.local.yaml だけです。")
+        generated = internal.get("yaml_generated")
+        copy_path = None
+        if generated is not None:
+            if str(self.local_dir).startswith(("\\\\", "//")):
+                raise AdminError("設定用コピーの保存先は、この PC のローカルのフォルダだけです(共有上には作りません)。")
+            copy_path = self.local_dir / internal["yaml_name"]
+            if not copy_path.name.endswith(".local.yaml"):
+                raise AdminError("設定用コピーは Git 管理外の *.local.yaml だけです。")
         with self._lock:
             if not path.is_file():
                 raise AdminError("prod_server.local.yaml がありません。sample を写して作ってから保存してください。")
@@ -279,22 +362,31 @@ class ModelAdmin:
                     internal["yaml_sha256"])
             except Exception:  # noqa: BLE001
                 raise AdminError("保存する内容の検証に失敗したため、保存しませんでした(設定ファイルは変更していません)。") from None
-            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"{time.time_ns() % 10**9:09d}"      # 同じ秒の連続保存でも衝突しない
             backup = path.with_name(f"{path.name[:-len('.local.yaml')]}.bak-{stamp}-{os.getpid()}.local.yaml")
             with open(backup, "xb") as f:                     # 既存の設定のバックアップ(同じフォルダ。上書きしない)
                 f.write(raw)
-            fd, tmp = tempfile.mkstemp(prefix=".prod_server_", suffix=".local.yaml.tmp", dir=str(path.parent))
+            copy_before = None                                 # 設定用コピーの、保存前の状態(失敗時に戻す)
             try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(new_text.encode("utf-8"))
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)                          # 原子的に置換
+                if copy_path is not None:
+                    copy_before = copy_path.read_bytes() if copy_path.is_file() else None
+                    if copy_before != generated:
+                        self.local_dir.mkdir(parents=True, exist_ok=True)
+                        if copy_before is not None:           # 既存のコピーが違う内容なら、退避してから置換
+                            with open(copy_path.with_name(f"{copy_path.name[:-len('.local.yaml')]}.bak-{stamp}-{os.getpid()}.local.yaml"), "xb") as f:
+                                f.write(copy_before)
+                        self._atomic_write(copy_path, generated)
+                self._atomic_write(path, new_text.encode("utf-8"))      # 原子的に置換
             except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                if copy_path is not None:                      # 設定の置換に失敗したら、コピーも保存前の状態へ戻す(既存の設定は壊さない)
+                    try:
+                        if copy_before is None:
+                            if copy_path.exists():
+                                copy_path.unlink()
+                        elif copy_path.read_bytes() != copy_before:
+                            self._atomic_write(copy_path, copy_before)
+                    except OSError:
+                        pass
                 raise
         complete = True
         try:
@@ -302,9 +394,26 @@ class ModelAdmin:
         except prod_config.ConfigError:
             complete = False
         return {"ok": True, "saved": True, "backup_file": backup.name, "model_id": model_id, "inspection": res,
+                "yaml_copy_file": copy_path.name if copy_path is not None else None,
                 "config_complete": complete,
                 "note": "モデル設定だけを保存しました。API の起動・再起動・接続設定の公開は行っていません。"
                         + ("" if complete else "(設定全体は未完了です。check で未設定の項目を確認してください)")}
+
+    @staticmethod
+    def _atomic_write(path: Path, data: bytes):
+        fd, tmp = tempfile.mkstemp(prefix=".prod_admin_", suffix=".local.yaml.tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # ---- check(読み取り専用)
     def check(self) -> dict:
