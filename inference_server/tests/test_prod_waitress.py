@@ -7,11 +7,13 @@ import signal
 import socket
 import subprocess
 import sys
+import io
 import textwrap
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import waitress  # noqa: F401
@@ -25,6 +27,7 @@ import yaml
 from prod_helpers import HOST, ProdBase, SCRIPT, WEIGHTS_BYTES, free_port, make_png  # noqa: F401
 import prod_config
 import prod_logging
+import prod_publish
 import prod_server
 from backends import FakeBackend
 
@@ -72,6 +75,16 @@ class Running:
         self.thread.join(timeout)
         self.test.assertFalse(self.thread.is_alive(), "serve() が停止しませんでした")
         return self.code["v"]
+
+
+def wait_inflight(run, n=1, timeout=10):
+    """実行中の推論が n 件に達するまで待つ(sleep の固定時間に頼らない)。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if run.info["s"].inflight >= n:
+            return
+        time.sleep(0.02)
+    raise AssertionError("推論が始まりませんでした")
 
 
 @unittest.skipUnless(HAVE_WAITRESS, "waitress が無い環境")
@@ -150,16 +163,15 @@ class WaitressContractTest(ProdBase):
 @unittest.skipUnless(HAVE_WAITRESS, "waitress が無い環境")
 class WaitressLimitsTest(ProdBase):
     def test_health_stays_responsive_while_an_inference_is_running(self):
-        run = Running(self, self.cfg(), backend=fake(delay=2.0)).start()
+        run = Running(self, self.cfg(), backend=fake(delay=4.0)).start()
         try:
             out = {}
             t = threading.Thread(target=lambda: out.setdefault("r", run.post(self.form())), daemon=True)
             t.start()
-            time.sleep(0.5)
-            started = time.monotonic()
+            wait_inflight(run)
             self.assertEqual(run.get("/health").status_code, 200)             # 推論中でも /health に答える(スレッドを残している)
-            self.assertLess(time.monotonic() - started, 1.5)
-            t.join(10)
+            self.assertTrue(t.is_alive(), "/health に答えた時点で、推論はまだ実行中のはず")
+            t.join(15)
             self.assertEqual(out["r"].status_code, 200)
         finally:
             run.stop()
@@ -172,7 +184,7 @@ class WaitressLimitsTest(ProdBase):
             out = {}
             t = threading.Thread(target=lambda: out.setdefault("first", run.post(self.form())), daemon=True)
             t.start()
-            time.sleep(0.4)
+            wait_inflight(run)
             second = run.post(self.form(page="22"))
             self.assertEqual(second.status_code, 503)                          # 実行中 1 件だけ受け付ける設定
             t.join(10)
@@ -189,7 +201,7 @@ class WaitressLimitsTest(ProdBase):
             out = {}
             t = threading.Thread(target=lambda: out.setdefault("first", run.post(self.form())), daemon=True)
             t.start()
-            time.sleep(0.5)
+            wait_inflight(run)
             started = time.monotonic()
             waiting = run.post(self.form(page="22"))
             self.assertEqual(waiting.status_code, 503)
@@ -209,7 +221,7 @@ class WaitressShutdownTest(ProdBase):
         out = {}
         t = threading.Thread(target=lambda: out.setdefault("r", run.post(self.form())), daemon=True)
         t.start()
-        time.sleep(0.5)
+        wait_inflight(run)
         run.info["h"].shutdown()                                               # 推論の実行中に停止を要求する
         end = time.time() + 5
         refused = False
@@ -233,13 +245,85 @@ class WaitressShutdownTest(ProdBase):
         run = Running(self, prod_config.parse_config(d), backend=fake(delay=6.0)).start()
         t = threading.Thread(target=lambda: run.post(self.form(), timeout=15), daemon=True)
         t.start()
-        time.sleep(0.5)
+        wait_inflight(run)
         began = time.monotonic()
-        with self.assertLogs("prod_inference_server", level="INFO") as cm:
-            code = run.stop(timeout=20)
+        code = run.stop(timeout=20)
         self.assertEqual(code, 0)
         self.assertLess(time.monotonic() - began, 12)                          # 実行中の推論を待ち続けない(猶予 1 秒 + 後始末)
-        self.assertTrue(any("猶予時間内に完了しなかった" in line for line in cm.output))
+        self.assertIn("猶予時間内に完了しなかった", (self.root / "logs" / "prod_api.log").read_text(encoding="utf-8"))
+
+    def test_second_signal_stops_without_waiting_for_the_running_inference(self):
+        d = self.data()
+        d["server"] = {**d["server"], "shutdown_grace_sec": 120}
+        run = Running(self, prod_config.parse_config(d), backend=fake(delay=10.0)).start()
+        t = threading.Thread(target=lambda: run.post(self.form(), timeout=20), daemon=True)
+        t.start()
+        wait_inflight(run)
+        began = time.monotonic()
+        run.info["h"].signal()
+        time.sleep(0.3)
+        self.assertTrue(run.thread.is_alive(), "1 回目は猶予まで待つ")
+        run.info["h"].signal()                                                  # 2 回目: 猶予が長くても、待たずに止まる
+        run.thread.join(8)
+        self.assertFalse(run.thread.is_alive())
+        self.assertLess(time.monotonic() - began, 8)
+        self.assertEqual(run.code["v"], 0)
+        self.assertIn("2 回目の停止要求", (self.root / "logs" / "prod_api.log").read_text(encoding="utf-8"))
+
+    def test_keep_alive_health_reports_stopping_while_draining(self):
+        run = Running(self, self.cfg(), backend=fake(delay=3.0)).start()
+        session = requests.Session()
+        session.trust_env = False
+        self.addCleanup(session.close)
+        self.assertEqual(session.get(run.url("/health"), timeout=5).status_code, 200)    # keep-alive の接続を確立する
+        t = threading.Thread(target=lambda: run.post(self.form()), daemon=True)
+        t.start()
+        wait_inflight(run)
+        run.info["h"].shutdown()
+        status, end = None, time.time() + 5
+        while time.time() < end and status != "stopping":                      # 既存の接続には、停止中であることを返す(新規の接続は拒否される)
+            try:
+                r = session.get(run.url("/health"), timeout=2)
+                status = r.json()["status"] if r.status_code == 503 else None
+            except requests.RequestException:
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, "stopping")
+        t.join(10)
+        run.thread.join(10)
+        self.assertEqual(run.code["v"], 0)
+
+    def test_stop_while_loading_does_not_publish_or_become_ready(self):
+        gate = threading.Event()
+        cfg = self.cfg()
+
+        def slow_factory(c, d):
+            gate.wait(10)
+            return fake()
+        info, code = {}, {}
+        th = threading.Thread(target=lambda: code.setdefault("v", prod_server.serve(
+            cfg, publish_config=True, backend_factory=slow_factory, on_started=lambda h, s: info.update(h=h, s=s))), daemon=True)
+        th.start()
+        end = time.time() + 20
+        while time.time() < end and not info:
+            time.sleep(0.02)
+        self.assertTrue(info, "起動しませんでした")
+        info["h"].shutdown()                                                    # モデルの読み込み中に停止を要求する
+        gate.set()                                                              # その後で、読み込みが終わる
+        th.join(20)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(code["v"], 0)
+        self.assertFalse(info["s"].ready)
+        self.assertFalse(self.server_yaml.exists())                             # 停止要求の後で、接続設定を公開しない
+        self.assertIn("公開と ready を行いません", (self.root / "logs" / "prod_api.log").read_text(encoding="utf-8"))
+
+    def test_try_begin_is_refused_once_stopping(self):
+        import types
+        st = prod_server.ProdState(self.cfg(), "x" * 32, types.SimpleNamespace(public=lambda: {}))
+        self.assertTrue(st.try_begin())
+        st.begin_stop()
+        self.assertFalse(st.try_begin())                                        # 停止処理の後に、新しい推論を登録しない
+        self.assertEqual(st.inflight, 1)
 
     def test_published_server_yaml_follows_the_current_safety_rules_across_a_stop(self):
         cfg = self.cfg()
@@ -268,7 +352,12 @@ class WaitressShutdownTest(ProdBase):
         def boom(c, d):
             raise RuntimeError("CUDA failed")
         self.assertEqual(prod_server.serve(self.cfg(), backend_factory=boom), prod_server.EXIT_LOAD)
-        self.assertEqual(prod_server.serve(self.cfg(), backend_factory=lambda c, d: fake()) if False else prod_server.EXIT_LOAD, prod_server.EXIT_LOAD)
+        with mock.patch.object(prod_publish, "publish", side_effect=prod_publish.PublishRefused("changed", "固定文")):
+            self.assertEqual(prod_server.serve(self.cfg(), publish_config=True, backend_factory=lambda c, d: fake()), prod_server.EXIT_PUBLISH)
+        with mock.patch.object(prod_publish, "publish", side_effect=RuntimeError(r"\\secret-host\share")):
+            self.assertEqual(prod_server.serve(self.cfg(), publish_config=True, backend_factory=lambda c, d: fake()), prod_server.EXIT_PUBLISH)
+        self.assertNotIn("secret-host", (self.root / "logs" / "prod_api.log").read_text(encoding="utf-8"))
+        self.assertFalse(self.server_yaml.exists())
 
 
 @unittest.skipUnless(HAVE_WAITRESS, "waitress が無い環境")
@@ -359,6 +448,18 @@ class LogRedactionTest(ProdBase):
             self.assertNotIn(secret, out)
         self.assertIn("failed to read", out)
 
+    def test_control_characters_are_replaced_and_long_lines_are_truncated(self):
+        out = prod_logging.redact("GET /x\r\n2026-01-01 00:00:00 INFO forged line\x00\x1b[31m")
+        for ch in ("\r", "\n", "\x00", "\x1b"):
+            self.assertNotIn(ch, out)
+        long = prod_logging.redact("a" * 5000)
+        self.assertLessEqual(len(long), prod_logging.MAX_LINE + 20)
+
+    def test_hex_and_addresses_next_to_underscores_are_hidden(self):
+        out = prod_logging.redact("sha_" + "ab" * 20 + "_x peer_192.0.2.7_y D:\\x\\y")
+        self.assertNotIn("ab" * 20, out)
+        self.assertNotIn("192.0.2.7", out)
+
     def test_filter_survives_a_broken_format(self):
         import logging
         rec = logging.LogRecord("x", logging.INFO, __file__, 1, "bad %d", ("not-a-number",), None)
@@ -391,11 +492,10 @@ class LogFileTest(ProdBase):
         for secret in ("secret-host", "A1TEST0001", "21.png", "192.0.2.99", "topsecrettoken123", str(self.root), str(self.out), str(self.model_dir),
                        HOST, str(self.port), "Traceback", "best.pt"):
             self.assertNotIn(secret, text, secret)
-        full = prod_logging  # noqa: F841
         self.assertNotIn(__import__("hashlib").sha256(WEIGHTS_BYTES).hexdigest(), text)           # ハッシュ全文は出さない
 
     def test_rotation_respects_size_and_generation_limits(self):
-        handle = prod_logging.configure_logging(str(self.root / "rot" / "r.log"), 65536, 2, "INFO", stream=open(os.devnull, "w"))
+        handle = prod_logging.configure_logging(str(self.root / "rot" / "r.log"), 65536, 2, "INFO", stream=io.StringIO())
         try:
             lg = prod_server.log
             for i in range(4000):
@@ -406,6 +506,57 @@ class LogFileTest(ProdBase):
         self.assertEqual(files, ["r.log", "r.log.1", "r.log.2"])               # 世代数(2)を超えて残らない
         for p in (self.root / "rot").iterdir():
             self.assertLessEqual(p.stat().st_size, 65536 + 512)                # サイズ上限を(1 行ぶんの余裕で)守る
+
+    def test_rotation_failure_prints_one_fixed_line_without_the_path(self):
+        import contextlib
+        target = self.root / "rotfail" / "r.log"
+        handle = prod_logging.configure_logging(str(target), 65536, 2, "INFO", stream=io.StringIO())
+        err = io.StringIO()
+        try:
+            with mock.patch("os.rename", side_effect=PermissionError(13, "locked", str(target))), contextlib.redirect_stderr(err):
+                for i in range(1500):
+                    prod_server.log.info("rotation failure line %05d %s", i, "x" * 60)
+        finally:
+            handle.close()
+        text = err.getvalue()
+        self.assertIn(prod_logging.LOG_ERROR_NOTICE, text)
+        self.assertEqual(text.count(prod_logging.LOG_ERROR_NOTICE), 1)             # 洪水にしない(一定間隔に 1 回)
+        for secret in (str(self.root), "rotfail", "Traceback", "PermissionError"):
+            self.assertNotIn(secret, text)
+
+    def test_denied_clients_cannot_forge_or_flood_the_log(self):
+        cfg = self.cfg(allowed_clients=["203.0.113.0/24"])                       # loopback を許可しない
+        run = Running(self, cfg).start(want=403)
+        try:
+            for i in range(30):
+                s = socket.create_connection((HOST, cfg.port), timeout=3)
+                s.sendall(b"GET /%0d%0a2026-01-01%2000:00:00%20INFO%20forged%20line%20" + b"A" * 3000 + b" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                s.recv(4096)
+                s.close()
+            for i in range(30):
+                run.get("/health")
+        finally:
+            run.stop()
+        text = self.log_text()
+        self.assertNotIn("forged", text)
+        self.assertNotIn("AAAA", text)
+        denied = [ln for ln in text.splitlines() if "許可リストに無いため拒否" in ln]
+        self.assertLessEqual(len(denied), 2)                                      # 60 件の拒否が、数行にまとまる
+        self.assertGreaterEqual(len(denied), 1)
+        for ln in text.splitlines():
+            self.assertRegex(ln, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} (INFO|WARNING|ERROR) ")     # 偽造された行・分断された行がない
+            self.assertLessEqual(len(ln), 700)
+
+    def test_unhandled_flask_error_goes_to_the_log_without_traceback_or_values(self):
+        run = Running(self, self.cfg()).start()
+        try:
+            with mock.patch.object(prod_config, "client_allowed", side_effect=RuntimeError(r"\\secret-host\share\A1TEST0001")):
+                self.assertEqual(run.get("/health").status_code, 500)
+        finally:
+            run.stop()
+        text = self.log_text()
+        for secret in ("secret-host", "A1TEST0001", "Traceback"):
+            self.assertNotIn(secret, text)
 
     def test_unwritable_log_location_refuses_to_start_without_leaking_the_path(self):
         blocker = self.root / "afile"
@@ -422,10 +573,11 @@ class LogFileTest(ProdBase):
 
     def test_handlers_are_removed_when_serve_returns(self):
         import logging
-        before = list(logging.getLogger("prod_inference_server").handlers)
         run = Running(self, self.cfg()).start()
         run.stop()
-        self.assertEqual(list(logging.getLogger("prod_inference_server").handlers), before)
+        for name in ("prod_inference_server", "waitress", "prod_server", "werkzeug"):
+            ours = [h for h in logging.getLogger(name).handlers if any(isinstance(f, prod_logging.RedactingFilter) for f in h.filters)]
+            self.assertEqual(ours, [], name)
 
 
 class ServerConfigTest(ProdBase):
@@ -460,13 +612,17 @@ class ServerConfigTest(ProdBase):
             with self.subTest(bad=bad):
                 self.err(server=self.srv(**bad))
 
-    def test_connection_limit_must_cover_the_threads(self):
+    def test_connection_limit_must_cover_the_threads_and_waitress_internal_sockets(self):
         self.err(server=self.srv(threads=8, max_pending_predict=2, connection_limit=6))
+        self.err(server=self.srv(threads=8, max_pending_predict=4, connection_limit=8))     # /health が飢える構成(実効は 8-2)
+        self.err(server=self.srv(threads=8, max_pending_predict=4, connection_limit=9))
+        self.assertEqual(self.cfg(server=self.srv(threads=8, max_pending_predict=4, connection_limit=10)).limits.connection_limit, 10)
 
     def test_logging_section_is_strict(self):
         base = self.data()["logging"]
         for bad in ({"file": "relative.log"}, {"file": "\\\\fileserver\\share\\x.log"}, {"file": str(self.out / "x.log")},
-                    {"file": str(self.server_yaml)}, {"file": str(self.root / ".." / "x.log")}, {"level": "DEBUG"}, {"level": "TRACE"},
+                    {"file": str(self.server_yaml)}, {"file": str(self.root / ".." / "x.log")},
+                    {"file": str(self.backup_dir / "x.log")}, {"file": str(self.model_dir / "x.log")}, {"level": "DEBUG"}, {"level": "TRACE"},
                     {"max_bytes": 100}, {"max_bytes": 2 * 1024 ** 3}, {"backup_count": 0}, {"backup_count": 101}):
             with self.subTest(bad=bad):
                 self.err(logging={**base, **bad})
@@ -476,7 +632,12 @@ class ServerConfigTest(ProdBase):
             prod_config.parse_config(d)
         self.assertEqual(self.cfg(logging={**base, "level": "warning"}).log.level, "WARNING")
 
+    @unittest.skipUnless(os.name == "nt", "Windows のドライブ無しの絶対パス")
+    def test_logging_file_must_have_a_drive_on_windows(self):
+        self.err(logging={**self.data()["logging"], "file": "\\logs\\x.log"})
+
     def test_probe_timeout_must_be_long_enough_for_windows_refusals(self):
+        # 判定不能(タイムアウト)を「古い設定(接続拒否)」と誤らないため、下限は 3 秒(§6.5 の運用ログ・停止とは別の、Windows の接続拒否の遅延への対応)
         for bad in (0.5, 1.0, 2.9, 31, True):
             with self.subTest(bad=bad):
                 self.err(timeout_probe_sec=bad)

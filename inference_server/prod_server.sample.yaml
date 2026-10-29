@@ -41,7 +41,7 @@ server:
   max_pending_predict: 4                # 同時に受け付ける /predict(実行中 + 順番待ち)。threads より小さいこと(/health 用のスレッドを残す)。超過は 503
   queue_wait_sec: 30                    # 推論の順番待ちの上限[秒]。超えたら 503(実行中の推論は中断しない)
   backlog: 64                           # listen の受付キュー(OS)
-  connection_limit: 32                  # 同時に開く接続数の上限(受け付けたリクエストのキューもこれで抑える)。threads 以上
+  connection_limit: 32                  # 同時に開く接続数の上限(受け付けたリクエストのキューもこれで抑える)。threads + 2 以上(Waitress は待受ソケット等も数える)
   channel_timeout_sec: 60               # リクエストの無い接続を閉じるまで[秒]
   shutdown_grace_sec: 30                # 停止シグナルの後、実行中の推論の完了を待つ上限[秒]。超えたら中断して停止
 

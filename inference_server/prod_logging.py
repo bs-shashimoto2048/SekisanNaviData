@@ -16,24 +16,29 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 
 _UNC = re.compile(r"\\\\[^\s'\"<>|]+")
-_DRIVE = re.compile(r"\b[A-Za-z]:[\\/][^\s'\"<>|]*")
+_DRIVE = re.compile(r"(?<![0-9A-Za-z])[A-Za-z]:[\\/][^\s'\"<>|]*")
 _POSIX = re.compile(r"(?<![\w.:/])/(?:[\w.\-]+/)+[\w.\-]*")
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b")
+_IPV4 = re.compile(r"(?<![0-9A-Za-z])\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?![0-9A-Za-z])")
 _SCHEME = re.compile(r"(?i)\b(bearer|basic)\s+[^\s,;]+")
 _AUTH = re.compile(r"(?i)\b(authorization:?)\s+(?!<redacted>)[^\s,;]+")
-_HEX = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_HEX = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])")     # `_` の直後・直前も対象(\b だと抜ける)
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")                   # 改行・制御文字(ログの偽造・行の分断を防ぐ)
+MAX_LINE = 500                                                              # 1 行の長さの上限(外部から来た文字列でログを溢れさせない)
 
 
 def redact(text: str) -> str:
+    text = _CTRL.sub(" ", text)
     text = _SCHEME.sub(lambda m: f"{m.group(1)} <redacted>", text)
     text = _AUTH.sub(lambda m: f"{m.group(1)} <redacted>", text)
     text = _UNC.sub("<path>", text)
     text = _DRIVE.sub("<path>", text)
     text = _POSIX.sub("<path>", text)
     text = _IPV4.sub("<addr>", text)
-    return _HEX.sub("<hex>", text)
+    text = _HEX.sub("<hex>", text)
+    return text if len(text) <= MAX_LINE else text[:MAX_LINE] + "...(省略)"
 
 
 class RedactingFilter(logging.Filter):
@@ -52,7 +57,32 @@ class RedactingFilter(logging.Filter):
 
 
 _FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
-_LOGGERS = ("prod_inference_server", "waitress")
+_LOGGERS = ("prod_inference_server", "waitress", "prod_server", "werkzeug")   # prod_server は Flask の app.logger(アプリ名)
+LOG_ERROR_NOTICE = "ログの書き込み・ローテーションに失敗しました(ログファイルの権限・他のプロセスによるロックを確認してください)"
+_NOTICE_INTERVAL_SEC = 60.0
+
+
+class _QuietErrors:
+    """ログ出力の失敗(Windows でログを別のプロセスが開いていて名前を変えられない、など)で、パスを含むトレースバックを標準エラーへ出さない。
+    固定の 1 行だけを、一定間隔で出す。サーバーは止めない。"""
+    _last_notice = None
+
+    def handleError(self, record):  # noqa: N802
+        now = time.monotonic()
+        if self._last_notice is None or now - self._last_notice >= _NOTICE_INTERVAL_SEC:
+            self._last_notice = now
+            try:
+                print(LOG_ERROR_NOTICE, file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class _QuietRotatingFileHandler(_QuietErrors, logging.handlers.RotatingFileHandler):
+    pass
+
+
+class _QuietStreamHandler(_QuietErrors, logging.StreamHandler):
+    pass
 
 
 class LogHandle:
@@ -81,8 +111,8 @@ def configure_logging(file: str, max_bytes: int, backup_count: int, level: str, 
     os.makedirs(os.path.dirname(os.path.abspath(file)), exist_ok=True)
     fmt = logging.Formatter(_FORMAT)
     handlers = []
-    fh = logging.handlers.RotatingFileHandler(file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
-    sh = logging.StreamHandler(stream if stream is not None else sys.stdout)
+    fh = _QuietRotatingFileHandler(file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    sh = _QuietStreamHandler(stream if stream is not None else sys.stdout)
     for h in (fh, sh):
         h.setFormatter(fmt)
         h.addFilter(RedactingFilter())

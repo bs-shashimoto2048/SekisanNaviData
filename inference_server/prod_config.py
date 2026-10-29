@@ -196,8 +196,10 @@ def _limits(d: dict) -> ServerLimits:
     if pending >= threads:
         raise ConfigError("同時に受け付ける /predict は threads より小さくしてください(/health 用のスレッドを残すため): server.max_pending_predict")
     conn = _int_in(d, "connection_limit", 4, 512, "server")
-    if conn < threads:
-        raise ConfigError("connection_limit は threads 以上にしてください: server.connection_limit")
+    if conn < threads + 2:
+        # Waitress は「待受ソケットと内部の trigger」も接続数に数えるため、実際に使える接続は connection_limit - 2。
+        # /predict(最大 threads-1 件)に加えて /health の接続を 1 つ確保するため、threads + 2 以上にする
+        raise ConfigError("connection_limit は threads + 2 以上にしてください(/health の接続を確保するため): server.connection_limit")
     return ServerLimits(threads=threads, max_pending_predict=pending, queue_wait_sec=_int_in(d, "queue_wait_sec", 1, 600, "server"),
                         backlog=_int_in(d, "backlog", 1, 1024, "server"), connection_limit=conn,
                         channel_timeout_sec=_int_in(d, "channel_timeout_sec", 5, 600, "server"),
@@ -207,15 +209,19 @@ def _limits(d: dict) -> ServerLimits:
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
 
 
-def _log(d: dict, output_root: str, server_yaml: str) -> LogConfig:
+def _log(d: dict, output_root: str, server_yaml: str, other_dirs: tuple = ()) -> LogConfig:
     f = _req(d, "file", str, "logging")
-    if "\x00" in f or not os.path.isabs(f) or f.startswith("\\\\") or f.startswith("//"):
-        raise ConfigError("ログファイルはローカルの絶対パスで指定してください(UNC は不可): logging.file")
+    if "\x00" in f or not os.path.isabs(f) or f.startswith("\\\\") or f.startswith("//") or (os.name == "nt" and not re.match(r"[A-Za-z]:[\\/]", f)):
+        raise ConfigError("ログファイルはローカルの絶対パス(ドライブ文字つき)で指定してください(UNC・ドライブ無しは不可): logging.file")
     if ".." in re.split(r"[\\/]+", f):
         raise ConfigError("ログファイルのパスに .. は使えません: logging.file")
     nf, nr, ny = _norm(f), _norm(output_root).rstrip("\\/"), _norm(server_yaml)
     if nf == ny or nf == nr or nf.startswith(nr + "\\") or nf.startswith(nr + "/"):
         raise ConfigError("ログファイルは出力ルート配下・server.yaml と同じ場所には置けません: logging.file")
+    for other in other_dirs:                       # 退避先・モデルのフォルダにログを書かない(モデルの検証対象・server.yaml の退避と混ざるため)
+        no = _norm(other).rstrip("\\/")
+        if nf == no or nf.startswith(no + "\\") or nf.startswith(no + "/"):
+            raise ConfigError("ログファイルは退避先・モデルのフォルダ配下には置けません: logging.file")
     level = _req(d, "level", str, "logging").upper()
     if level not in LOG_LEVELS:
         raise ConfigError("ログレベルは INFO / WARNING / ERROR のいずれか(DEBUG は不可): logging.level")
@@ -256,7 +262,7 @@ def parse_config(data: dict) -> ProdConfig:
         # Windows では、閉じたポートへの接続が「拒否」として返るまで約 2 秒かかることがある。それより短いと、拒否(古い設定)をタイムアウト(判定不能)と誤るため 3 秒以上にする
         raise ConfigError("timeout_probe_sec は 3〜30 の数値で指定してください。")
     limits = _limits(_req(data, "server", dict, "(root)"))
-    log = _log(_req(data, "logging", dict, "(root)"), out_root, server_yaml)
+    log = _log(_req(data, "logging", dict, "(root)"), out_root, server_yaml, (backup_dir, model.dir))
     return ProdConfig(host=host, port=port, allowed_clients=allowed, output_root=out_root, server_yaml=server_yaml,
                       backup_dir=backup_dir, proxy=proxy, model=model, token_file=token_file, timeout_probe_sec=float(probe),
                       limits=limits, log=log)

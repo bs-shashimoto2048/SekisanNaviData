@@ -52,6 +52,9 @@ _PRODUCT_RE = re.compile(r"[A-Za-z0-9]{4,20}")              # 製番(ops の指�
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_REQUEST_HEADER_BYTES = 8192
 CLEANUP_INTERVAL_SEC = 30                                    # Waitress: 無通信の接続を点検する間隔
+DENIED_LOG_INTERVAL_SEC = 60                                 # 許可外の接続元の拒否を、ログにまとめる間隔(洪水でログを埋めない)
+FLUSH_SEC = 2.0                                              # 停止時に、完了した応答を書き切る上限
+LOAD_JOIN_SEC = 10                                           # 停止時に、モデルの読み込み・公開のスレッドの終了を待つ上限
 SERVER_IDENT = "sekisan-inference"                           # Server ヘッダー(Waitress の版を出さない)
 MIN_TOKEN_LEN = 24
 
@@ -123,10 +126,34 @@ class ProdState:
         self._slots = threading.BoundedSemaphore(cfg.limits.max_pending_predict)   # 同時に受け付ける /predict(実行中 + 順番待ち)
         self._target_locks = {}
         self._guard = threading.Lock()
+        self._denied = 0
+        self._denied_logged = None
 
     def inflight_add(self, n: int):
         with self._guard:
             self.inflight += n
+
+    def try_begin(self) -> bool:
+        """推論の開始を登録する。停止処理に入っていたら登録せず False(`stopping` の確認と登録を同じロックで行い、停止処理が数え落とさない)。"""
+        with self._guard:
+            if self.stopping:
+                return False
+            self.inflight += 1
+            return True
+
+    def begin_stop(self):
+        with self._guard:
+            self.stopping = True
+
+    def should_log_denied(self) -> int:
+        """許可外の接続元の拒否ログを、一定間隔にまとめる。記録するときは、その間の拒否の件数(1 以上)。記録しないときは 0。"""
+        with self._guard:
+            self._denied += 1
+            now = time.monotonic()
+            if self._denied_logged is not None and now - self._denied_logged < DENIED_LOG_INTERVAL_SEC:
+                return 0
+            n, self._denied, self._denied_logged = self._denied, 0, now
+            return n
 
     def target_lock(self, key):
         with self._guard:
@@ -136,6 +163,10 @@ class ProdState:
 def _remove_tmp(tmp_dir: str, work_dir: str):
     if os.path.basename(tmp_dir).startswith(TMP_PREFIX) and _same(os.path.dirname(tmp_dir), work_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _is_known(request) -> bool:
+    return request.method in ("GET", "POST") and request.path in ("/health", "/predict")
 
 
 def create_app(state: ProdState):
@@ -152,7 +183,9 @@ def create_app(state: ProdState):
     def guard():
         # 接続元の許可リスト(プロキシ経由のとき remote_addr はプロキシの IP になる。X-Forwarded-For 等のヘッダーは信用しない)
         if not prod_config.client_allowed(cfg, request.remote_addr):
-            log.warning("接続元が許可リストに無いため拒否: %s %s", request.method, request.path)
+            n = state.should_log_denied()
+            if n:     # 拒否の洪水でログを埋めない。接続元が指定できるパス・メソッドは記録しない(改行入りの偽造行・巨大な行を防ぐ)
+                log.warning("接続元が許可リストに無いため拒否しました(%d 件。%s)", n, f"{request.method} {request.path}" if _is_known(request) else "対象外のリクエスト")
             return err(403, "許可されていない接続元です。")
         if state.token is not None and request.method == "POST" and request.path == "/predict":
             auth = request.headers.get("Authorization", "")
@@ -189,9 +222,11 @@ def create_app(state: ProdState):
             return err(400, str(e))
         if not state._slots.acquire(blocking=False):
             return err(503, "同時リクエスト数の上限です。しばらくしてから再試行してください。")
+        if not state.try_begin():                                   # 停止処理が始まった直後の登録を取りこぼさない
+            state._slots.release()
+            return err(503, "サーバーは停止処理中です。")
         tmp_dir = os.path.join(real_dir, f"{TMP_PREFIX}{uuid.uuid4().hex}")
         started = time.monotonic()
-        state.inflight_add(1)
         try:
             with state.target_lock((real_dir, page)):
                 os.makedirs(tmp_dir)
@@ -319,9 +354,19 @@ class ServerHandle:
 
     def __init__(self):
         self._event = threading.Event()
+        self._signals = 0
 
     def shutdown(self):
         self._event.set()
+
+    def signal(self):
+        """シグナルハンドラー用(フラグと数字を更新するだけ)。2 回目以降は、実行中の推論を待たずに停止する意味になる。"""
+        self._signals += 1
+        self._event.set()
+
+    @property
+    def forced(self) -> bool:
+        return self._signals >= 2
 
     @property
     def requested(self) -> bool:
@@ -345,6 +390,31 @@ def _create_waitress_server(app, cfg: prod_config.ProdConfig):
     return server
 
 
+def _step(server, loop, timeout: float):
+    """停止処理中のイベントループを 1 回回す。listen ソケットを閉じるとメンテナンス(channel_timeout など)の起点も止まるため、手動で呼ぶ。"""
+    loop(timeout)
+    try:
+        server.maintenance(time.time())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _output_pending(server) -> bool:
+    """書き出していない応答、または実行中・待機中のタスクがあるか。"""
+    td = server.task_dispatcher
+    if getattr(td, "active_count", 0) > 0 or len(getattr(td, "queue", ())) > 0:
+        return True
+    for ch in list(server._map.values()):
+        if ch is server or ch is getattr(server, "trigger", None):
+            continue
+        try:
+            if ch.writable():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def _run_loop(server, handle: ServerHandle, state: ProdState, cfg: prod_config.ProdConfig) -> int:
     """Waitress のイベントループを、このスレッドで回す。停止要求を受けたら、新規の受付を止め、実行中の推論の完了を猶予時間まで待ってから閉じる。"""
     from waitress import wasyncore
@@ -354,15 +424,19 @@ def _run_loop(server, handle: ServerHandle, state: ProdState, cfg: prod_config.P
         while not handle.requested:
             loop(0.5)
         log.info("停止要求を受け付けました。新規の受付を止め、実行中の推論の完了を待ちます(猶予 %d 秒)", cfg.limits.shutdown_grace_sec)
-        state.stopping = True
+        state.begin_stop()
         wasyncore.dispatcher.close(server)               # listen ソケットだけ閉じる(trigger・既存の接続は、実行中の応答を返すため残す)
         deadline = time.monotonic() + cfg.limits.shutdown_grace_sec
-        while state.inflight > 0 and time.monotonic() < deadline:
-            loop(0.2)
-        if state.inflight > 0:
+        while state.inflight > 0 and time.monotonic() < deadline and not handle.forced:
+            _step(server, loop, 0.2)
+        if handle.forced and state.inflight > 0:
+            log.warning("2 回目の停止要求を受けたため、実行中の推論(%d 件)を待たずに停止します", state.inflight)
+        elif state.inflight > 0:
             log.warning("猶予時間内に完了しなかった推論が %d 件あります。中断して停止します", state.inflight)
-        for _ in range(5):                               # 完了した応答を書き切る
-            loop(0.1)
+        flush_deadline = time.monotonic() + FLUSH_SEC    # 完了した応答を書き切る(回数ではなく、出力の残りと締切で判断する)
+        _step(server, loop, 0.1)
+        while _output_pending(server) and time.monotonic() < flush_deadline:
+            _step(server, loop, 0.1)
     except Exception as e:  # noqa: BLE001
         log.error("サーバーのループで失敗しました: %s", safe_trace(e))
         code = EXIT_RUNTIME
@@ -385,13 +459,19 @@ def serve(cfg: prod_config.ProdConfig, *, publish_config: bool = False, replace_
     except OSError:   # ログファイルを作れない・開けない。例外の文言(パスを含む)は出さず、固定文で終了する
         print("起動を拒否: ログファイルを開けません(logging.file の場所・権限を確認してください)", file=sys.stderr)
         return EXIT_CONFIG
+    restore: list = []
     try:
-        return _serve(cfg, publish_config, replace_stale, backend_factory, on_started, install_signals)
+        return _serve(cfg, publish_config, replace_stale, backend_factory, on_started, install_signals, restore)
     finally:
+        for sig, prev in restore:
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, TypeError, OSError):
+                pass
         logh.close()
 
 
-def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, install_signals) -> int:
+def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, install_signals, restore) -> int:
     instance_id = uuid.uuid4().hex
     log.info("起動を開始します(instance=%s)", instance_id[:8])
     try:
@@ -429,6 +509,14 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
 
     state = ProdState(cfg, instance_id, identity, token)
     app = create_app(state)
+    handle = ServerHandle()
+    if install_signals:       # 待ち受けを始める前に設置する(待ち受け直後の Ctrl+C を取りこぼさない)。ハンドラーはフラグを立てるだけ(後始末はメインループ側)
+        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+            if sig is not None:
+                try:
+                    restore.append((sig, signal.signal(sig, lambda *_: handle.signal())))
+                except ValueError:   # メインスレッド以外(テスト)
+                    pass
     try:
         server = _create_waitress_server(app, cfg)
     except (OSError, SystemExit, ImportError) as e:
@@ -438,7 +526,6 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
     log.info("待ち受けを開始しました(Waitress): threads=%d max_pending_predict=%d backlog=%d connection_limit=%d channel_timeout=%ds "
              "queue_wait=%ds shutdown_grace=%ds allowed_clients=%d publish=%s", L.threads, L.max_pending_predict, L.backlog,
              L.connection_limit, L.channel_timeout_sec, L.queue_wait_sec, L.shutdown_grace_sec, len(cfg.allowed_clients), publish_config)
-    handle = ServerHandle()
     exit_code = {"v": 0}
 
     def load():
@@ -461,6 +548,9 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
             handle.shutdown()
             return
         log.info("モデルの読み込みが完了しました")
+        if handle.requested:     # 読み込み中に停止が要求された。公開も ready もしない(停止処理とは競合させない)
+            log.info("停止要求を受けているため、接続設定の公開と ready を行いません")
+            return
         if publish_config:       # 準備完了のうえで、接続設定の公開に成功してから ready にする(公開できなかったら API を提供しない)
             try:
                 result = prod_publish.publish(cfg, instance_id, identity.public(), replace_stale=replace_stale)
@@ -480,20 +570,18 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
         state.ready = True
         log.info("準備完了(ready)")
 
-    threading.Thread(target=load, name="load-backend", daemon=True).start()
-    if install_signals:
-        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
-            if sig is not None:
-                try:
-                    signal.signal(sig, lambda *_: handle.shutdown())   # ハンドラーはフラグを立てるだけ(後始末はメインループ側)
-                except ValueError:   # メインスレッド以外(テスト)
-                    pass
+    loader = threading.Thread(target=load, name="load-backend", daemon=True)
+    loader.start()
     if on_started is not None:
         on_started(handle, state)
     try:
         loop_code = _run_loop(server, handle, state, cfg)
     finally:
-        prod_model.remove_staging(staged)
+        loader.join(LOAD_JOIN_SEC)                        # 読み込み・公開の途中で止めない(終了コードも、この後で確定する)
+        if loader.is_alive():
+            log.warning("モデルの読み込みが終わらないまま停止します(読み込みスレッドは、終了とともに破棄されます)")
+        else:
+            prod_model.remove_staging(staged)
         log.info("停止しました(接続設定ファイルは削除しません。次回の起動時に --replace-stale で更新します)")
     return exit_code["v"] or loop_code
 

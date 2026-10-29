@@ -7,4 +7,4 @@ PyYAML==6.0.1
 # Production inference API (prod_server.py). Waitress is the production WSGI server (replaces the Werkzeug development server). Pinned.
 # Verified combination: Python 3.10 / Flask 3.0.3 / Werkzeug 3.0.2 / waitress 3.0.2. requests is used by prod_publish.py (liveness probe before publishing server.yaml).
 waitress==3.0.2
-requests==2.32.3
+requests==2.32.5
