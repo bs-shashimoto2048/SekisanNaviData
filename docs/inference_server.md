@@ -81,6 +81,7 @@ inference_server\.venv\Scripts\python.exe -m unittest discover -s inference_serv
 - 実機のホスト照会・設計サーバー・実 DWG の IJCAD 処理・Navi 実画面連携。
 - 別PC構成(両者から見える UNC 共有)での `work_dir` 共有。現在は同一PC・ローカルパスのみ(UNC は既定で拒否)。
 - 本番運用へ組み込む場合のサーバー管理者の承認、既存クライアントへの影響確認。
+- (追記)本番用の API は、検証用 `server.py` とは別のエントリ `inference_server/prod_server.py` として実装した([production_inference_api.md](production_inference_api.md))。未適用・実モデルでは未検証。
 
 ## 7. 実モデルでの検証(Issue #1、2026-10-09 実施)
 
