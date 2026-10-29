@@ -192,6 +192,30 @@ python prod_server.py serve --config prod_server.local.yaml --publish-config [--
     `logging.file` は、出力ルート・`publish.backup_dir`・モデルのフォルダの配下と `server.yaml` には置けない(Windows ではドライブ文字つき。ジャンクション・シンボリックリンクの解決はしない)。
 - 配置先でのログの置き場所(権限・世代の保管・転送)は未決定(§9)。
 
+## 6.6 図面解析 AI モデルの管理画面(`prod_admin.py`)
+API ホスト上でだけ使うローカル画面。モデル(重み `.pt` と、組になる `model.yaml`)を、**複製・アップロードせずに**選んだ場所のまま参照して、`prod_server.local.yaml` の `model:` 節へ保存する。
+既存の画面(運用画面 8765 は製番処理の運用、暫定 API の画面 8771 は暫定 API 用)には本番 API のモデル設定が無いため、別の画面として追加した。
+
+```
+cd inference_server
+python prod_admin.py --config prod_server.local.yaml [--port 8790]      # http://127.0.0.1:8790/ を開く(この PC のブラウザーだけ)
+```
+- **LAN からは使えない**: 127.0.0.1 だけで待ち受ける(0.0.0.0 などでは作れない)。接続元・Host・Origin も loopback だけ受け付け、状態を変える操作はカスタムヘッダ(`X-Admin-Request`)と JSON を要求する。
+- **使い方**: ① 「モデルファイル(.pt)」欄の初期値は指定の本番モデル(`\\beans-f1\ShareData\estimatic\a_product\model\estimatic_a_20250826.pt`)。「参照…」でこの PC の画面にファイル選択が開く(UNC も選べる)。
+  ② 「model.yaml」欄: 空欄なら重みと同じフォルダの `model.yaml` を探す。無ければ「参照…」で選ぶ(別フォルダでよい。コピーしない)。
+  ③ 「検証」: 選んだ実ファイルを読み取って、サイズ・SHA-256 を算出し、重みと `model.yaml` の組を検証して、ファイル名・サイズ・ハッシュ先頭 12 桁・判定を表示する。
+  ④ 「保存」(検証に通ったときだけ有効): 算出した値を期待値として `model:` 節へ書く(手入力しない)。⑤ 「check を実行」: 読み取り専用の check(`prod_server.py check` と同じ処理)を実行して結果を表示する。
+- **`model.yaml` の扱い**(SahiBackend は `model.yaml` を必要とする): 重みだけでは保存できない。`model.yaml` が見つからない・読めない・`model.my_model` が**選んだ重みのファイル名と一致しない**場合は「保存できません」と表示して拒否する
+  (`model.yaml` は編集もコピーもしない)。model.yaml が重みと別のフォルダにあるときは、設定の `model.yaml_dir`(任意。絶対パス)にその場所を書く。API は起動時に、検証した重みと `model.yaml` を**従来どおり私用の一時フォルダへ検証付きで取り込んで**読み込む(管理画面は何もコピーしない)。
+  **本番の現状(2026-10-29 調査)**: 指定の重み(`estimatic_a_20250826.pt`)と同じフォルダに `model.yaml` は無く、ローカルの `model.yaml`(`estimate\server\model`)の `my_model` は `best.pt` で、重みの名前(`estimatic_a_20250826.pt`)と**一致しない**。
+  このため、現状の組み合わせでは保存できない。運用担当が、重みと同名の `my_model` を持つ `model.yaml` を用意する(または重みを `best.pt` の名前で用意する)ことが必要。**この組み合わせは推測で確定していない。**
+- **保存**: Git 管理外の `*.local.yaml` だけ。`model:` 節だけを置き換え(ほかの節・コメント・改行コードは保つ)、保存前に同じフォルダへ `prod_server.bak-<時刻>-<PID>.local.yaml` を作り、YAML と `model:` 節の規則を検証してから、一時ファイル + `os.replace` で原子的に置換する。
+  共有 `server.yaml` は読み書きしない。モデル設定の保存だけでは、API の起動・再起動・`--publish-config` は行わない。
+- **漏えい防止**: 応答・画面にはファイル名だけ。ハッシュは先頭 12 桁だけ(全文は設定ファイルにだけ書く)。パスを返すのは「参照…」で選んだ値を入力欄へ入れるときだけ(ローカル画面のみ)。アクセスログは出さない。
+  PyTorch のファイルは、先頭の形式(zip / pickle)を見るだけで読み込まない(pickle を実行しない)。
+- **check の注意**: `check` は従来どおり読み取り専用だが、設定に `publish.server_yaml` が書いてある場合は、既存の `server.yaml`(共有)を**読み取り**、その接続先へ `/health` を 1 回送る(§5)。共有側に触れたくない間は、`publish` を未設定のままにする(その場合 check は設定エラーで止まる)。
+- テスト: `inference_server/tests/test_prod_admin.py`(合成データ・一時フォルダ・loopback。ファイル選択〔runner 差し替え〕・UNC・存在しないファイル・不正形式・`model.yaml` の不一致・サイズ/SHA 自動取得・保存・check・LAN 拒否・非漏えい)。
+
 ## 7. `/predict` の入力検証と出力
 - `page_nmb`: 数字 1〜6 桁。`extension`: `png`・`jpeg`・`jpg`。
 - `work_dir`: 絶対パスで、**設定の `output_root` の直下の製番フォルダ**(製番は英数字 4〜20 文字)。`..`・NUL・出力ルート自身・入れ子のフォルダ・別の場所・リンク/ジャンクションで別の場所を指すものは **400**。画像も通常ファイルでリンクでないこと。
@@ -212,7 +236,7 @@ python prod_server.py serve --config prod_server.local.yaml --publish-config [--
 |---|---|
 | **定期タスク `SekisanNaviData_Ops` の扱い**: 有効のままでは、API が使える状態で次回の定刻(毎日 07:00)に**製番指定なしの全件処理**が始まる(`ops_console.py run-scheduled`。当月出図分から、出力先にある製番を除いた全件。件数上限なし) | 要判断(1 製番の確認の前に、無効化または時刻の退避。**タスクの操作は運用担当が行う**) |
 | 出力先に過去の製番が残っていない / 確認対象の製番だけが未処理であること | 要確認 |
-| 配置先の PC(この PC か GPU サーバー)・OS・GPU・CUDA・torch の版(2.5.1 / 2.6.0。`inference_server.md` §9)・依存関係の venv | **未決定・未確認** |
+| 配置先の PC(この PC か GPU サーバー)・OS・GPU・CUDA・依存関係の venv(torch は 2.5.1+cu124 に固定済み。2.6.0 では実モデルを読み込めないことを確認済み。`inference_server.md` §9) | **配置先は未決定・未確認**(torch の版は決定) |
 | 待受アドレスと許可クライアント(プロキシ経由か否か。§4-2) | 要決定 |
 | 管理担当・承認(起動・停止・版の管理を誰が行うか) | **未決定** |
 | モデルの版の記録(期待値の SHA-256・サイズ)と、共有のモデルファイルとの照合 | **未確認**(手元の旧モデルと共有のモデルは同サイズだが、ハッシュは未照合) |
@@ -225,7 +249,7 @@ python prod_server.py serve --config prod_server.local.yaml --publish-config [--
 | 実図面での検出結果の妥当性(実モデルでの確認) | 未検証(自動テストは fake バックエンド) |
 
 ### 9.2 手順
-1. 配置先に推論用 venv を用意する(`inference_server/requirements.txt`〔Waitress・Flask・Werkzeug・PyYAML・requests を固定〕と `requirements-real.txt`〔sahi・ultralytics・torch など〕。`inference_server.md` §9。torch の版を決めて記録する)。
+1. 配置先に推論用 venv を用意する(`inference_server/requirements.txt`〔Waitress・Flask・Werkzeug・PyYAML・requests を固定〕と `requirements-real.txt`〔sahi・ultralytics・torch など〕。torch は **2.5.1+cu124**: `requirements-real.txt` の固定。2.6.0+cu124 では実モデルを読み込めない。`inference_server.md` §9)。
 2. `prod_server.local.yaml` を作る(§8)。期待ハッシュは、管理担当が控えた記録から転記する。
 3. **確認(書き込みなし)**: `python prod_server.py check --config prod_server.local.yaml`。`ok: true`、`model.verified: true`、`publish_plan` の内容(どのキーが変わるか。値は出ない)を確認する。
 4. **公開なしで起動(前景プロセス)**: `python prod_server.py serve --config prod_server.local.yaml`(端末を開いたまま)。モデル読み込み後に、許可された接続元から `/health` が 200 になることを確認する(許可外の接続元から 403 になることも確認)。この時点では共有 `server.yaml` は変わらない。

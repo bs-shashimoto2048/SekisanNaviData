@@ -39,6 +39,7 @@ class ModelExpect:
     weights_sha256: str
     weights_size: int
     yaml_sha256: str
+    yaml_dir: str = ""              # model.yaml のあるフォルダ。空なら dir と同じ(重みと別の場所にある model.yaml を、コピーせずに参照できる)
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,9 @@ def _model(d: dict) -> ModelExpect:
     mdir = _req(d, "dir", str, "model")
     if not _is_abs(mdir):
         raise ConfigError("モデルのフォルダは絶対パスで指定してください: model.dir")
+    ydir = d.get("yaml_dir", "")
+    if ydir and (not isinstance(ydir, str) or not _is_abs(ydir)):
+        raise ConfigError("model.yaml のフォルダは絶対パスで指定してください: model.yaml_dir")
     weights = _req(d, "weights", str, "model")
     yml = _req(d, "yaml", str, "model")
     for key, v in (("weights", weights), ("yaml", yml)):
@@ -180,7 +184,7 @@ def _model(d: dict) -> ModelExpect:
         raise ConfigError("期待ハッシュは SHA-256(64 桁の 16 進)で指定してください: model.expected")
     if size <= 0:
         raise ConfigError("期待サイズは正の整数で指定してください: model.expected.weights_size")
-    return ModelExpect(mid, mdir, weights, yml, ws, size, ys)
+    return ModelExpect(mid, mdir, weights, yml, ws, size, ys, ydir or "")
 
 
 def _int_in(d: dict, key: str, lo: int, hi: int, section: str) -> int:

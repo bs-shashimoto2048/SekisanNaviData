@@ -54,9 +54,10 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def identify(model_id: str, model_dir: str, weights: str, yaml_name: str) -> ModelIdentity:
-    """モデルフォルダの重みと model.yaml の識別情報を計算する(通常ファイルだけ。リンク・フォルダ・欠落は拒否)。"""
-    wp, yp = Path(model_dir) / weights, Path(model_dir) / yaml_name
+def identify(model_id: str, model_dir: str, weights: str, yaml_name: str, yaml_dir: str | None = None) -> ModelIdentity:
+    """モデルフォルダの重みと model.yaml の識別情報を計算する(通常ファイルだけ。リンク・フォルダ・欠落は拒否)。
+    model.yaml が重みと別のフォルダにあるときは yaml_dir に指定する(省略なら重みと同じフォルダ)。"""
+    wp, yp = Path(model_dir) / weights, Path(yaml_dir or model_dir) / yaml_name
     for p, what in ((wp, "重みファイル"), (yp, "model.yaml")):
         if p.is_symlink() or not p.is_file():
             raise ModelVerificationError(f"{what}が通常のファイルとして見つかりません。")
@@ -104,13 +105,14 @@ def _stage_file(src: Path, dst: Path, expected_sha256: str, expected_size: int |
 
 
 def stage_and_verify(model_id: str, model_dir: str, weights: str, yaml_name: str, expected_weights_sha256: str,
-                     expected_weights_size: int, expected_yaml_sha256: str, staging_parent: str | None = None):
+                     expected_weights_size: int, expected_yaml_sha256: str, staging_parent: str | None = None,
+                     yaml_dir: str | None = None):
     """検証したバイト列そのものをステージングする。(識別情報, ステージングしたフォルダ)を返す。失敗時はフォルダを残さず ModelVerificationError。
     呼び出し側は、読み込みが終わったら `remove_staging` で消すこと。ステージングしたファイルは読み取り専用にする。"""
     staged = tempfile.mkdtemp(prefix="prod_model_", dir=staging_parent)
     try:
         ws = _stage_file(Path(model_dir) / weights, Path(staged) / weights, expected_weights_sha256, expected_weights_size, "重みファイル")
-        ys = _stage_file(Path(model_dir) / yaml_name, Path(staged) / yaml_name, expected_yaml_sha256, None, "model.yaml")
+        ys = _stage_file(Path(yaml_dir or model_dir) / yaml_name, Path(staged) / yaml_name, expected_yaml_sha256, None, "model.yaml")
         for name in (weights, yaml_name):
             os.chmod(Path(staged) / name, stat.S_IREAD)
         wst, yst = (Path(staged) / weights).stat(), (Path(staged) / yaml_name).stat()

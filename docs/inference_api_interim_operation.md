@@ -28,7 +28,7 @@
 | 本番モードの事前確認 | `app.main` が `GET /health` を 1 度だけ(`requests`、リダイレクト追跡なし、プロキシは `api.use_proxy` と `server.yaml` の `proxy`、既定 5 秒)。200 以外は製番処理を始めず失敗 | `pipeline/api_preflight.py` |
 | 運用画面の動作チェック | 本番モードでは `api_preflight.unavailable_reason` と同じ判定を使う(`requests`、設定に基づくプロキシ、リダイレクト追跡なし、既定 5 秒)。HTTP 200 以外は NG。統合モードは SKIP | `ops/checks.py`、`pipeline/api_preflight.py` |
 | 検証設定 | `app_test.yaml`: `api.use_proxy: false`、出力はローカルの `./output_test`、`server.yaml` の置き場もその配下 | `app_test.yaml` |
-| 実モデル | `requirements-real.txt` は torch 2.6.0+cu124 固定だが、動作確認済みは 2.5.1+cu124 のみ(`docs/inference_server.md` §9)。合成画像での起動→推論→停止は確認済み。**実図面での結果は未検証** | `docs/inference_server.md` §7・§9 |
+| 実モデル | `requirements-real.txt` は torch 2.5.1+cu124 固定(2.6.0+cu124 + ultralytics 8.2.2 では実モデルを読み込めないことを確認済み。`docs/inference_server.md` §9)。合成画像での起動→推論→停止は確認済み。**実図面での結果は未検証** | `docs/inference_server.md` §7・§9 |
 
 ### 2.1 結論(検証用サーバーを本番サーバーとしてそのまま扱わない理由)
 1. loopback 限定・出力ルート固定で、別 PC から使えない(GPU サーバーでは使えない)。

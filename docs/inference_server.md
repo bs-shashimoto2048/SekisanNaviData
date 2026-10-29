@@ -94,7 +94,7 @@ inference_server\.venv\Scripts\python.exe -m unittest discover -s inference_serv
 結果: 参照コピーの venv(torch 2.5.1+cu124 / sahi 0.11.15 / ultralytics 8.2.2、CUDA 利用可)と参照モデル(`best.pt`、`model.yaml`)で、
 SahiBackend が約 16 秒で ready → 推論 API で `{page}_detected.txt` / `.png` が出力 → `/shutdown` で終了コード 0 → 子プロセス・ポートとも残存なし(`RESULT: OK`)。
 入力は合成画像(検出 0 件が正常)。同日に再実施しても同じ結果(約 10 秒で ready、出力 3 ファイル、終了コード 0、子プロセス・ポート残存なし)。検出ファイルに検出行がある場合の形式は FakeBackend のテストでのみ確認している。**実図面での検出結果・積算 CSV の値は未検証**。
-注意: 参照 venv の torch は `requirements-real.txt` の固定版(2.6.0+cu124)と異なる(2.5.1+cu124)。固定版との差は未検証。
+注意: 参照 venv の torch は 2.5.1+cu124。`requirements-real.txt` は、§9 の実証(2.6.0 では読み込めない)に合わせて 2.5.1+cu124 に揃えた。
 
 ## 8. 検証設定の安全条件(追加)
 - `app_test.yaml` の `dwg_conversion.converter` はローカルの ODA File Converter を指す。検証モード(`inference_server.enabled: true`)で本番共有上のパスを指定すると、起動・書き込み前に拒否する(`app.main`、テストあり)。IJCAD の `close y` は変更していない。
@@ -103,7 +103,11 @@ SahiBackend が約 16 秒で ready → 推論 API で `{page}_detected.txt` / `.
 - 参照コピーの requirements.txt(UTF-16)は `torch==2.6.0+cu124` / `torchvision==0.21.0+cu124`(`requirements-real.txt` はこれを写した)。
   一方、参照コピーの実 venv は `torch 2.5.1+cu124` / `torchvision 0.20.1+cu124`(その他の numpy 1.24.4 / opencv-python 4.7.0.72 / pillow 10.3.0 / sahi 0.11.15 / ultralytics 8.2.2 / Flask 3.0.3 / Werkzeug 3.0.2 は固定版と一致)。参照コピーの README は torch を固定せず cu124 の公式 index から入れる手順で、実 venv はその結果と見られる。
 - 実機で確認できているのは **2.5.1 の組み合わせだけ**(§7)。2.6.0 での動作は未検証(導入していない)。
-- 懸念(推定): torch 2.6 から `torch.load` の既定が `weights_only=True` になる。参照モデルを 2.5.1 上で `weights_only=True` で読むと `UnpicklingError` になるため、
+- **実証済み(2026-10-29、隔離した新規 venv。既存 venv は変更していない)**: 本番モデル(`best.pt` = 共有の `estimatic_a_20250826.pt`、SHA-256 先頭 12 桁 `6adf124ff1ee`)を `SahiBackend` で読み込んだ結果。
+  - **torch 2.6.0+cu124 / torchvision 0.21.0+cu124 + ultralytics 8.2.2 + sahi 0.11.15: 読み込みに失敗する**(`TypeError: model_path is not a valid yolov8 model path` の原因は `UnpicklingError: Weights only load failed ... Unsupported global: ultralytics.nn.tasks.DetectionModel`。torch 2.6 が `torch.load` の `weights_only` 既定を True にしたため)。
+  - **torch 2.5.1+cu124 / torchvision 0.20.1+cu124(同じ ultralytics / sahi): 読み込める**(約 3.5 秒)。合成画像 1 枚の推論も通る(1 回目 約 21 秒〔初回〕、2 回目 約 0.8 秒、検出 0 件は合成画像のため正常。VRAM 最大 約 216 MiB、プロセスの RAM 最大 約 4.9 GiB)。`pip check` も問題なし。
+  - これを受けて `requirements-real.txt` を torch 2.5.1+cu124 / torchvision 0.20.1+cu124 に揃えた(2.6.0 を使うなら、ultralytics を torch 2.6 対応版へ上げ、別 venv で読み込みと推論を再確認してから)。
+- (参考・実証前の推定)懸念: torch 2.6 から `torch.load` の既定が `weights_only=True` になる。参照モデルを 2.5.1 上で `weights_only=True` で読むと `UnpicklingError` になるため、
   ultralytics 8.2.2(`weights_only` を指定せず読み込む)と 2.6.0 の組み合わせでは、モデルの読み込みに失敗する可能性がある。
 - 対応案(依存版は変更していない): (A) 検証済みの 2.5.1 / 0.20.1 を `requirements-real.txt` の既定にする、(B) 2.6.0 を使うなら別の venv で実際に読み込めることを確認してから採用する(ultralytics の更新は挙動差が大きいので別途検証)。どちらにするかは本番サーバーの実環境の版を確認してから決める。
 
