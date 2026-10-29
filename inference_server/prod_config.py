@@ -6,6 +6,8 @@
   - 待受は IPv4 アドレス 1 つの明示だけ。全インターフェース(0.0.0.0 / ::)・ホスト名・IPv6 は拒否する。
   - 許可するクライアントは IP / CIDR の明示リスト。全許可(/0)と広すぎる範囲(IPv4 で /24 より広い)は拒否する。
   - 例外メッセージ・ログに、設定値(パス・アドレス・ハッシュの全文)を出さない。ConfigError のメッセージは固定文 + キー名だけ。
+  - 本番起動時の上限(`server`: スレッド数・受付キュー・接続数・タイムアウト・停止の猶予)とログ(`logging`: ファイル・サイズ上限・世代数)も**すべて明示**させる。
+    `/health` が推論待ちで飢えないよう、同時に受け付ける /predict は threads より小さいことを検証する。
 """
 from __future__ import annotations
 
@@ -40,6 +42,26 @@ class ModelExpect:
 
 
 @dataclass(frozen=True)
+class ServerLimits:
+    """Waitress と /predict の上限(すべて設定で明示)。"""
+    threads: int                    # ワーカースレッド数(同時に処理するリクエスト数)
+    max_pending_predict: int        # 同時に受け付ける /predict(実行中 + 順番待ち)。threads より小さい(/health 用のスレッドを残す)
+    queue_wait_sec: int             # 推論の順番待ちの上限[秒]。超えたら 503(実行中の推論は中断しない)
+    backlog: int                    # listen の受付キュー(OS)
+    connection_limit: int           # 同時に開く接続数の上限(受け付けたリクエストのキューもこれで抑える)
+    channel_timeout_sec: int        # リクエストの無い接続を閉じるまでの時間[秒]
+    shutdown_grace_sec: int         # 停止シグナルの後、実行中の推論の完了を待つ上限[秒]
+
+
+@dataclass(frozen=True)
+class LogConfig:
+    file: str                       # ローカルのログファイル(絶対パス。UNC は不可)
+    max_bytes: int                  # 1 ファイルの上限(超えたら世代を回す)
+    backup_count: int               # 残す世代数
+    level: str                      # INFO / WARNING / ERROR(DEBUG は不可)
+
+
+@dataclass(frozen=True)
 class ProdConfig:
     host: str
     port: int
@@ -51,6 +73,8 @@ class ProdConfig:
     model: ModelExpect | None = None
     token_file: str | None = None             # 任意。指定時は /predict に Bearer トークンを要求する(クライアントが対応するまで未使用)
     timeout_probe_sec: float = 3.0            # 既存 server.yaml の接続先を確認する /health の待ち時間
+    limits: ServerLimits | None = None
+    log: LogConfig | None = None
 
 
 def _req(d: dict, key: str, typ, section: str):
@@ -159,6 +183,52 @@ def _model(d: dict) -> ModelExpect:
     return ModelExpect(mid, mdir, weights, yml, ws, size, ys)
 
 
+def _int_in(d: dict, key: str, lo: int, hi: int, section: str) -> int:
+    v = _req(d, key, int, section)
+    if not (lo <= v <= hi):
+        raise ConfigError(f"設定値が範囲外です({lo}〜{hi}): {section}.{key}")
+    return v
+
+
+def _limits(d: dict) -> ServerLimits:
+    threads = _int_in(d, "threads", 2, 64, "server")
+    pending = _int_in(d, "max_pending_predict", 1, 63, "server")
+    if pending >= threads:
+        raise ConfigError("同時に受け付ける /predict は threads より小さくしてください(/health 用のスレッドを残すため): server.max_pending_predict")
+    conn = _int_in(d, "connection_limit", 4, 512, "server")
+    if conn < threads + 2:
+        # Waitress は「待受ソケットと内部の trigger」も接続数に数えるため、実際に使える接続は connection_limit - 2。
+        # /predict(最大 threads-1 件)に加えて /health の接続を 1 つ確保するため、threads + 2 以上にする
+        raise ConfigError("connection_limit は threads + 2 以上にしてください(/health の接続を確保するため): server.connection_limit")
+    return ServerLimits(threads=threads, max_pending_predict=pending, queue_wait_sec=_int_in(d, "queue_wait_sec", 1, 600, "server"),
+                        backlog=_int_in(d, "backlog", 1, 1024, "server"), connection_limit=conn,
+                        channel_timeout_sec=_int_in(d, "channel_timeout_sec", 5, 600, "server"),
+                        shutdown_grace_sec=_int_in(d, "shutdown_grace_sec", 1, 300, "server"))
+
+
+LOG_LEVELS = ("INFO", "WARNING", "ERROR")
+
+
+def _log(d: dict, output_root: str, server_yaml: str, other_dirs: tuple = ()) -> LogConfig:
+    f = _req(d, "file", str, "logging")
+    if "\x00" in f or not os.path.isabs(f) or f.startswith("\\\\") or f.startswith("//") or (os.name == "nt" and not re.match(r"[A-Za-z]:[\\/]", f)):
+        raise ConfigError("ログファイルはローカルの絶対パス(ドライブ文字つき)で指定してください(UNC・ドライブ無しは不可): logging.file")
+    if ".." in re.split(r"[\\/]+", f):
+        raise ConfigError("ログファイルのパスに .. は使えません: logging.file")
+    nf, nr, ny = _norm(f), _norm(output_root).rstrip("\\/"), _norm(server_yaml)
+    if nf == ny or nf == nr or nf.startswith(nr + "\\") or nf.startswith(nr + "/"):
+        raise ConfigError("ログファイルは出力ルート配下・server.yaml と同じ場所には置けません: logging.file")
+    for other in other_dirs:                       # 退避先・モデルのフォルダにログを書かない(モデルの検証対象・server.yaml の退避と混ざるため)
+        no = _norm(other).rstrip("\\/")
+        if nf == no or nf.startswith(no + "\\") or nf.startswith(no + "/"):
+            raise ConfigError("ログファイルは退避先・モデルのフォルダ配下には置けません: logging.file")
+    level = _req(d, "level", str, "logging").upper()
+    if level not in LOG_LEVELS:
+        raise ConfigError("ログレベルは INFO / WARNING / ERROR のいずれか(DEBUG は不可): logging.level")
+    return LogConfig(file=f, max_bytes=_int_in(d, "max_bytes", 65536, 1024 * 1024 * 1024, "logging"),
+                     backup_count=_int_in(d, "backup_count", 1, 100, "logging"), level=level)
+
+
 def parse_config(data: dict) -> ProdConfig:
     if not isinstance(data, dict):
         raise ConfigError("設定ファイルの形式が不正です。")
@@ -188,10 +258,14 @@ def parse_config(data: dict) -> ProdConfig:
         if not _is_abs(token_file):
             raise ConfigError("トークンファイルは絶対パスで指定してください: auth.token_file")
     probe = data.get("timeout_probe_sec", 3.0)
-    if not isinstance(probe, (int, float)) or isinstance(probe, bool) or not (0.5 <= float(probe) <= 30):
-        raise ConfigError("timeout_probe_sec は 0.5〜30 の数値で指定してください。")
+    if not isinstance(probe, (int, float)) or isinstance(probe, bool) or not (3.0 <= float(probe) <= 30):
+        # Windows では、閉じたポートへの接続が「拒否」として返るまで約 2 秒かかることがある。それより短いと、拒否(古い設定)をタイムアウト(判定不能)と誤るため 3 秒以上にする
+        raise ConfigError("timeout_probe_sec は 3〜30 の数値で指定してください。")
+    limits = _limits(_req(data, "server", dict, "(root)"))
+    log = _log(_req(data, "logging", dict, "(root)"), out_root, server_yaml, (backup_dir, model.dir))
     return ProdConfig(host=host, port=port, allowed_clients=allowed, output_root=out_root, server_yaml=server_yaml,
-                      backup_dir=backup_dir, proxy=proxy, model=model, token_file=token_file, timeout_probe_sec=float(probe))
+                      backup_dir=backup_dir, proxy=proxy, model=model, token_file=token_file, timeout_probe_sec=float(probe),
+                      limits=limits, log=log)
 
 
 def load_config(path: str) -> ProdConfig:

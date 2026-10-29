@@ -233,6 +233,14 @@ class PredictTest(ProdBase):
         self.assertEqual(r.status_code, 413)
 
 
+try:
+    import waitress  # noqa: F401
+    HAVE_WAITRESS = True
+except ImportError:                                     # pragma: no cover
+    HAVE_WAITRESS = False
+
+
+@unittest.skipUnless(HAVE_WAITRESS, "serve() は Waitress が必要(inference_server/requirements.txt)")
 class ServeAndCheckTest(ProdBase):
     def run_serve(self, cfg, **kw):
         info = {}

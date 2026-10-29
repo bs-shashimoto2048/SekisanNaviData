@@ -1,6 +1,6 @@
 # 本番推論 API(`inference_server/prod_server.py`)
 
-**状態: 実装・テスト済み(fake バックエンド)。本番へは未適用。** 本番環境への配置・起動・`server.yaml` の公開・製番処理は、このリポジトリの変更では行わない(§9 の手順と前提を満たしたうえで、運用担当が実施する)。
+**状態: 実装・テスト済み(fake バックエンド。Waitress で配信)。本番へは未適用。** 本番環境への配置・起動・`server.yaml` の公開・製番処理は、このリポジトリの変更では行わない(§9 の手順と前提を満たしたうえで、運用担当が実施する)。
 
 関連: 契約は [inference_contract.md](inference_contract.md)、検証用サーバーは [inference_server.md](inference_server.md)、暫定・隔離運用と GPU 移行の設計は [inference_api_interim_operation.md](inference_api_interim_operation.md)、運用画面は [ops_console.md](ops_console.md)。
 
@@ -28,7 +28,9 @@
 ## 2. 構成(ファイル)
 | ファイル | 内容 |
 |---|---|
-| `inference_server/prod_server.py` | Flask アプリ(`/health`・`/predict`)と、`check`・`serve` のコマンド |
+| `inference_server/prod_server.py` | Flask アプリ(`/health`・`/predict`)・**Waitress での配信と前景プロセスとしての起動・停止**・`check`・`serve` のコマンド |
+| `inference_server/prod_logging.py` | 運用ログ(サイズ上限・世代数つきのローカルファイル + 標準出力。パス・アドレス・認証情報・例外メッセージを伏せる) |
+| `inference_server/requirements.txt` | 本番依存関係(`waitress==3.0.2`・`requests==2.32.3` を固定。Flask・Werkzeug・PyYAML も固定) |
 | `inference_server/prod_config.py` | 設定の読み込みと検証(待受・許可クライアント・出力ルート・公開先・モデル期待値)。既定値を持たない |
 | `inference_server/prod_model.py` | モデルの識別(SHA-256・サイズ)・検証・検証後の変更検知 |
 | `inference_server/prod_publish.py` | 共有 `server.yaml` の公開(計画・稼働確認・退避・原子的置換) |
@@ -44,7 +46,7 @@
 - この PC だけで使うなら `127.0.0.1`(外部から到達できない。最も安全)。LAN に出す場合は、その PC のアドレスを 1 つ明示する。
 - 既定値は持たない。`mode: production` を含め、書き忘れは起動拒否。
 - 起動前に `check` で「そのアドレスがこの PC に割り当てられているか」「ポートが使用中でないか」を確認できる。使用中の判定は、指定アドレスと loopback への接続試行で行う(Windows では、ワイルドカードで待ち受ける旧サーバーがあっても、特定アドレスの bind が成功することがあるため、bind の成否だけに頼らない。`serve` も同じ確認をして終了コード 3 にする)。
-- サーバー実体は werkzeug の開発用サーバー(`threaded=True`)。推論は直列化し、同時に受け付ける `/predict` は 8 件まで(超過は 503)。リクエストのタイムアウト・ヘッダーサイズ・同時接続数の制限は持たない(許可リストを通過した相手に限られるが、プロキシの IP を許可すると相手が広がる)。本番用 WSGI サーバーへの置換は未決定(§9)。
+- サーバー実体は **Waitress**(本番用 WSGI サーバー。§6.5)。`bind.host`・`bind.port` の 1 つだけで待ち受け、起動後に実際の待受アドレス・ポートが設定と一致することを確認する(一致しなければ使わない)。
 
 ## 4. 認証・ネットワーク制御
 現在のクライアント(`bs_pkg.image_mod.slice_prediction_request`)は、`work_dir`・`page_nmb`・`extension` のフォームだけを送り、**ヘッダー(認証情報)を付けられない**。`bs_pkg` はリポジトリ外(社内コード)のため、このリポジトリの変更ではクライアントを変えない。そのため、既定の防御は**ネットワーク制御**に置く。
@@ -129,6 +131,67 @@
 - 未設定: 照合しない(従来どおり)。理由に値(ハッシュ・アドレス)は含めない。
 - **設定の追記は運用担当が行う**(本実装はアプリの設定を書き換えない)。
 
+## 6.5 Waitress での配信・前景プロセスとしての起動と停止
+### 6.5.1 配信と上限(`server` 節。すべて必須・既定値なし)
+Werkzeug の開発用サーバーに代えて **Waitress 3.0.2**(`inference_server/requirements.txt` で版を固定)で配信する。上限は設定で明示し、検証する。
+
+| 設定(`server.*`) | Waitress の項目 | 内容・制約 |
+|---|---|---|
+| `threads`(2〜64) | `threads` | ワーカースレッド数。推論はモデルの安全のため直列なので、増やしても推論は速くならない(`/health` などに答えるため) |
+| `max_pending_predict`(1〜`threads`-1) | (アプリ側のセマフォ) | 同時に受け付ける `/predict`(実行中 + 順番待ち)。**`threads` より小さくすることを検証**する(`/health` 用のスレッドを必ず残し、推論中・混雑中も `/health` が答える)。超過は 503 |
+| `queue_wait_sec`(1〜600) | (アプリ側) | 推論の順番待ちの上限。超えたら 503(クライアントが再試行できる)。**実行中の推論は中断できない**(Waitress にはハンドラーの実行時間の上限が無い) |
+| `backlog`(1〜1024) | `backlog` | listen の受付キュー(OS) |
+| `connection_limit`(4〜512、**`threads` + 2 以上**) | `connection_limit` | 同時に開く接続数の上限(受け付けたリクエストのキューもこれで抑える)。Waitress は待受ソケットと内部の trigger も接続数に数えるため、実際に使える接続は `connection_limit` - 2。`/predict` が最大 `threads`-1 件でも `/health` の接続を 1 つ確保できるよう、`threads` + 2 以上を検証する。**ただし、リクエストを送らずに接続だけ保つ相手(keep-alive)が許可リストの中にいれば、その分も接続を使う**(`channel_timeout_sec` で閉じる) |
+| `channel_timeout_sec`(5〜600) | `channel_timeout` | リクエストの無い接続を閉じるまで |
+| `shutdown_grace_sec`(1〜300) | (アプリ側) | 停止シグナルの後、実行中の推論の完了を待つ上限(§6.5.3) |
+
+固定の上限(コード内): リクエスト本文 16KB・ヘッダー 8KB(超過は 400 / 413 / 431)、`expose_tracebacks=False`(応答にトレースバックを出さない)、`Server` ヘッダーは `sekisan-inference`(Waitress の版を出さない)、
+`ipv4=True / ipv6=False`、プロキシヘッダーは信用しない(`clear_untrusted_proxy_headers`。接続元はソケットのアドレスだけ。§4)。
+**`timeout_probe_sec` の下限を 0.5 秒から 3 秒へ上げた**のは、本節の機能ではなく、公開前の稼働判定(§5)の誤判定対策による(Windows では、閉じたポートへの接続が「拒否」として返るまで約 2 秒かかることがあり、
+それより短いと、拒否(古い設定)をタイムアウト(判定不能。常に拒否)と取り違える)。設定ファイルの `timeout_probe_sec` は 3〜30 秒。
+**応答側のタイムアウトは持たない**: 接続・応答の上限は、リクエストの無い接続の `channel_timeout_sec`、推論の順番待ちの `queue_wait_sec`、停止時の `shutdown_grace_sec` で表現する。クライアント(`bs_pkg`)の応答待ち(`api.request_timeout`。省略時は待ち続ける)は別に設定する。
+
+### 6.5.2 起動(前景プロセス)
+```
+cd inference_server
+python prod_server.py check --config prod_server.local.yaml               # 確認(待ち受けも書き込みもしない)
+python prod_server.py serve --config prod_server.local.yaml               # 起動(接続設定は書かない)
+python prod_server.py serve --config prod_server.local.yaml --publish-config [--replace-stale]   # 接続設定の公開つき(§5)
+```
+- 前景プロセスとして動く(端末に標準出力、`logging.file` に同じ内容)。**Windows サービス・Linux サービス(systemd など)への登録、起動の自動化、バックグラウンド化は実装していない**(配置先の OS が未決定。§9)。
+- 起動の順序: 設定の検証 → モデルの検証とステージング → (`--publish-config` のとき)公開できるかの事前判定 → ポート使用中の確認 → Waitress の待ち受け開始 → モデルの読み込み → (`--publish-config` のとき)接続設定の公開 → **ready**。
+  待ち受け開始からモデルの読み込みが終わるまでは、`/health` は 503(`loading`)。
+
+### 6.5.3 停止(前景プロセス)
+- **SIGINT(Ctrl+C)・SIGTERM・SIGBREAK(Windows の Ctrl+Break)** で正常終了する。シグナルのハンドラーは停止要求のフラグを立てるだけで、後始末はサーバーのループ側で行う:
+  1. 新規の接続の受付を止める(listen ソケットを閉じる)。**新規の接続は拒否される**(接続できない)。すでに開いている接続(keep-alive)に届いたリクエストには、`/health` は `503 stopping`、`/predict` は 503 を返す。
+     停止処理への移行と実行中の推論の登録は同じロックで行い、移行の直前に受け付けた推論を数え落とさない。listen ソケットを閉じた後は Waitress のメンテナンス(無通信の接続の整理)が止まるため、停止処理の中で手動で呼ぶ。
+  2. **実行中の推論の完了を、`shutdown_grace_sec` まで待つ**(完了した応答は返す)。猶予を超えたら、警告を記録して中断し、停止する。**停止シグナルを 2 回受けたら、猶予を待たずに停止する**(猶予を長くしても強制停止できる)。
+  3. 完了した応答を書き切る(出力の残りがなくなるか、2 秒の締切まで)。接続を閉じ、ワーカースレッドを停止し(最大 5 秒)、ステージングしたモデルのコピーを削除して、終了コード 0 で終了する。
+- **公開済みの `server.yaml` は削除しない**(現在の安全条件のとおり)。停止後に残るのは「接続を拒否する古い設定」で、クライアントには「接続が拒否されました(API 未起動、または server.yaml の接続先が古い)」と表示される。
+  次回の起動で公開するには、既存が古い(接続拒否)ことの確認のうえ `--replace-stale` を明示する。稼働中の別 API の `server.yaml` は、いつでも上書きしない(§5.2)。テストで確認している。
+- 強制終了(タスクの強制終了・電源断)では、実行中の推論の出力が一部だけ残ることがある(§7の限界)。`.infer_tmp_*` が残った場合は、手動で削除する。
+- モデルの読み込み失敗・公開失敗は、記録して終了する(終了コード 6 / 5。§9.3)。
+- **モデルの読み込み中・接続設定の公開中に停止を要求した場合**: 読み込みが終わった後に停止要求を確認し、接続設定の公開も ready もしない(終了コード 0)。停止処理は、読み込み・公開のスレッドの終了を最大 10 秒待ってから終了コードを確定する
+  (読み込みが 10 秒を超えて終わらない場合は、警告を記録してそのまま終了する。ステージングのコピーは読み込みスレッドが後始末する)。
+  公開を始めた後に停止を要求した場合は、公開は完了する(§5 のとおり、途中で壊れた server.yaml を残さない)。
+- 待ち受けを始める前に、シグナルのハンドラーを設置する(待ち受け直後の Ctrl+C を取りこぼさない)。モデルの検証・ステージングの最中の Ctrl+C は、従来どおり中断される。
+
+### 6.5.4 運用ログ(`logging` 節。すべて必須)
+- 出力先: **ローカルファイル**(`logging.file`。UNC・出力ルート配下・`server.yaml` の場所は不可。親フォルダは無ければ作る。追記・UTF-8)と標準出力。
+- サイズ上限と世代数: `max_bytes`(64KiB〜1GiB)・`backup_count`(1〜100)の `RotatingFileHandler`。`level` は INFO / WARNING / ERROR(DEBUG は不可)。
+- 記録する: 起動と停止(停止要求・猶予超過)、モデルの検証・読み込み・ready、接続設定の公開の結果、固定形式のエラー(終了コードの理由)、`/predict` の結果(ページ番号・状態・件数・所要時間。製番・パスは含めない)、
+  拒否(許可リスト外・入力検証)。**許可リスト外の拒否は、60 秒に 1 行にまとめる**(件数つき。拒否の洪水でログの世代を埋めない)。接続元が指定できるパス・メソッドは、`/health`・`/predict` の GET/POST 以外は記録しない
+  (改行を含むパスによるログの偽造・巨大な行を防ぐ)。
+- **記録しない**: パス、接続先アドレス・接続元アドレス、認証情報(トークン)、例外メッセージ、ハッシュ全文(先頭 12 桁だけ)。
+  - 本実装のコードは、例外のメッセージを出さず、型名と呼び出し位置(ファイル名・行番号・関数名)だけを記録する。
+  - **第二の防御**として、サーバーのログ(`prod_inference_server`・`waitress`・Flask のアプリのログ〔`prod_server`〕・`werkzeug`)のすべてのハンドラーに `RedactingFilter` を付ける。整形後の行から、**改行・制御文字を空白に置き換え**、
+    UNC・ドライブ文字・POSIX の 2 階層以上のパス、IPv4 アドレス、`Bearer` / `Authorization` の値、32 桁以上の 16 進文字列を伏せ字にし、1 行を 500 文字までに切り詰め、例外のトレースバックを丸ごと捨てる(Waitress など他のライブラリの出力にも効く)。
+  - ログの書き込み・ローテーションの失敗(Windows で別のプロセスがログを開いていて名前を変えられない、など)は、パスを含むトレースバックを出さず、固定の 1 行を 60 秒に 1 回だけ標準エラーへ出す。サーバーは止めない(そのあいだ、ログは記録されない場合がある)。
+  - 限界: フィルターは形が決まったものだけを伏せる。例外メッセージ中の固有名のような自由文の秘密、空白を含むパス、相対パス、1 階層だけの POSIX パス、IPv6 アドレス、`Bearer` 以外の形式のトークンまでは保証できない(そのためコードは例外メッセージを出さない)。
+    `logging.file` は、出力ルート・`publish.backup_dir`・モデルのフォルダの配下と `server.yaml` には置けない(Windows ではドライブ文字つき。ジャンクション・シンボリックリンクの解決はしない)。
+- 配置先でのログの置き場所(権限・世代の保管・転送)は未決定(§9)。
+
 ## 7. `/predict` の入力検証と出力
 - `page_nmb`: 数字 1〜6 桁。`extension`: `png`・`jpeg`・`jpg`。
 - `work_dir`: 絶対パスで、**設定の `output_root` の直下の製番フォルダ**(製番は英数字 4〜20 文字)。`..`・NUL・出力ルート自身・入れ子のフォルダ・別の場所・リンク/ジャンクションで別の場所を指すものは **400**。画像も通常ファイルでリンクでないこと。
@@ -153,32 +216,38 @@
 | 待受アドレスと許可クライアント(プロキシ経由か否か。§4-2) | 要決定 |
 | 管理担当・承認(起動・停止・版の管理を誰が行うか) | **未決定** |
 | モデルの版の記録(期待値の SHA-256・サイズ)と、共有のモデルファイルとの照合 | **未確認**(手元の旧モデルと共有のモデルは同サイズだが、ハッシュは未照合) |
-| 常駐化(サービス化・起動の自動化・ログのローテーション・ステージング用の一時領域の権限) | 未実装(werkzeug の開発用サーバーを手動起動。ステージングはユーザーの一時フォルダ=既定でそのユーザーだけが読める場所) |
-| 本番用 WSGI サーバーへの置換(`inference_api_interim_operation.md` §10 の 10) | 未決定 |
+| **サービス化・起動の自動化**(Windows サービス / Linux の systemd など)・再起動時の自動起動・異常終了時の再起動 | **未決定・未実装**(配置先の OS が未決定。前景プロセスとしての起動・停止だけを実装した。§6.5) |
+| **TLS**(HTTPS)・**プロキシ**の扱い(クライアントのプロキシ経由の可否、サーバーから見える接続元、許可リストへの追加の可否。§4) | **未決定**(現状は HTTP のみ。TLS は未実装) |
+| 許可クライアント(`allowed_clients`)の実値・待受アドレス(`bind.host`)・ポートの実値 | **未決定**(設定ファイルに明示する。サンプルは文書用の予約アドレス) |
+| `server` の上限の実値(threads・max_pending_predict・queue_wait_sec・backlog・connection_limit・channel_timeout_sec・shutdown_grace_sec)と、クライアントの応答待ち(`api.request_timeout`) | **未決定**(サンプルの数値は仮。配置先・実モデルでの推論時間の実測で決める) |
+| ログの置き場所・ACL・保管期間・転送・監視(`logging.file` の実値、世代数、容量の監視) | **未決定** |
+| ステージング用の一時領域(モデルのコピーの置き場所)の権限・容量(ユーザーの一時フォルダを使用) | 未確認(ACL による制限は実装していない) |
 | 実図面での検出結果の妥当性(実モデルでの確認) | 未検証(自動テストは fake バックエンド) |
 
 ### 9.2 手順
-1. 配置先に推論用 venv を用意する(`inference_server/requirements-real.txt` と `inference_server.md` §9。torch の版を決めて記録する)。
+1. 配置先に推論用 venv を用意する(`inference_server/requirements.txt`〔Waitress・Flask・Werkzeug・PyYAML・requests を固定〕と `requirements-real.txt`〔sahi・ultralytics・torch など〕。`inference_server.md` §9。torch の版を決めて記録する)。
 2. `prod_server.local.yaml` を作る(§8)。期待ハッシュは、管理担当が控えた記録から転記する。
 3. **確認(書き込みなし)**: `python prod_server.py check --config prod_server.local.yaml`。`ok: true`、`model.verified: true`、`publish_plan` の内容(どのキーが変わるか。値は出ない)を確認する。
-4. **公開なしで起動**: `python prod_server.py serve --config prod_server.local.yaml`。モデル読み込み後に、許可された接続元から `/health` が 200 になることを確認する(許可外の接続元から 403 になることも確認)。この時点では共有 `server.yaml` は変わらない。
+4. **公開なしで起動(前景プロセス)**: `python prod_server.py serve --config prod_server.local.yaml`(端末を開いたまま)。モデル読み込み後に、許可された接続元から `/health` が 200 になることを確認する(許可外の接続元から 403 になることも確認)。この時点では共有 `server.yaml` は変わらない。
 5. **接続設定の公開**(定期実行・手動実行が無いことを確認してから): 停止して、`--publish-config`(既存が古いときは `--replace-stale`)を付けて起動する。終了コード 5 のときは、理由(稼働中の別 API / 既存が読めない / 古い設定で `--replace-stale` が無い)を確認する。
 6. 運用画面 8765 の動作チェックで、推論 API が OK であることを確認する。必要なら `api.expected_model_sha256_12` を設定する(§6.3)。
 7. 1 製番だけを手動で実行し、生成物と画面を確認する(タスクの扱いは §9.1 の最初の行)。
-8. 戻す場合: API を停止し、`backup_dir` の退避ファイルを `server.yaml` へ戻す。
+8. **停止**: 起動した端末で Ctrl+C(Windows は Ctrl+Break も可)、または SIGTERM。実行中の推論の完了を `shutdown_grace_sec` まで待ってから終了する(§6.5.3)。ログに「停止しました」が出て、終了コードが 0 であることを確認する。
+9. 戻す場合: API を停止し、`backup_dir` の退避ファイルを `server.yaml` へ戻す。
 
 ### 9.3 終了コード
 | コード | 意味 |
 |---|---|
 | 0 | 正常終了(停止シグナル) |
 | 2 | 設定の不備(`ConfigError`)・トークンファイルの不備 |
-| 3 | ポートを待ち受けできない(使用中・ワイルドカードで待ち受ける別のサーバーがある など) |
+| 3 | ポートを待ち受けできない(使用中・ワイルドカードで待ち受ける別のサーバーがある・Waitress が無い・待受アドレスが設定と一致しない など) |
 | 4 | モデルの検証失敗(期待値と不一致・欠落) |
 | 5 | 接続設定を公開できない(`--publish-config` の条件を満たさない・書き込みの失敗)。待ち受け前・読み込み後のどちらでも、この終了コードで停止する |
 | 6 | バックエンド(モデル)の読み込みに失敗した(CUDA・依存関係など)。API は停止する |
+| 7 | サーバーのループで想定外の失敗が起きた(ログには型名と呼び出し位置だけ記録) |
 | `check` | 0: 問題なし / 1: 要確認(アドレス未割当・ポート使用中・出力ルート無し・モデル不一致) |
 
 ## 10. テスト
-`inference_server/tests/test_prod_config_model.py`・`test_prod_publish.py`・`test_prod_api.py`(Flask の test client + FakeBackend + 一時フォルダ。モデル・GPU・外部通信・共有なし)と、`tests/test_api_preflight.py`(モデル照合)。`serve()` の結合(公開に成功してからの ready・モデル不一致・検証済みコピーからの読み込み・読み込み失敗・公開失敗・ポート使用中・ワイルドカードの待受・稼働中の別 API の保護)は、ループバック上の実ソケットで確認している。実モデル(`SahiBackend`)・共有フォルダ・実運用の接続元からの確認は行っていない。
+`inference_server/tests/test_prod_config_model.py`・`test_prod_publish.py`・`test_prod_api.py`・`test_prod_waitress.py`(Flask の test client に加えて、**Waitress を別スレッド・loopback・一時設定・FakeBackend で起動した実通信**。`/health`・`/predict` の契約、許可外接続の拒否、上限(同時 /predict・順番待ち・本文/ヘッダー)、正常停止(実行中の推論の完了・猶予超過・新規接続の拒否)、実際のプロセスへのシグナルによる停止、停止をまたいだ `server.yaml` の扱い、ログの非漏えいとローテーション)と、`tests/test_api_preflight.py`(モデル照合)。モデル・GPU・外部通信・共有・本番 `server.yaml`・実製番は使わない。`serve()` と Waitress のテストは、`waitress` が入っていない環境ではスキップする。
 
-実行(Flask のある Python で): `python -m unittest discover -s inference_server/tests`(リポジトリ直下で、検証用 venv・`interim_console.local.yaml` の `python` など)。
+実行(`inference_server/requirements.txt` を入れた Python で): `cd inference_server/tests` して `python -m unittest discover -s . -p "test_*.py"`。

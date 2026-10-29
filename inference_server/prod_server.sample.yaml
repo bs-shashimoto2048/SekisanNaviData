@@ -33,4 +33,21 @@ model:
 # auth:                                 # 任意。指定すると /predict に Authorization: Bearer <token> を要求する(24 文字以上)。
 #   token_file: 'C:\ProgramData\SekisanNaviData\prod_api.token'   # ※現在のクライアント(bs_pkg)は送れないため、対応するまで使わない
 
-timeout_probe_sec: 3.0                  # 公開前に既存 server.yaml の接続先へ /health を送るときの待ち時間(省略可)
+timeout_probe_sec: 3.0                  # 公開前に既存 server.yaml の接続先へ /health を送るときの待ち時間(3〜30。Windows は閉じたポートの拒否が返るまで約 2 秒かかる)。省略可
+
+# 本番起動時の上限(Waitress)。**すべて明示が必須**(既定値なし)。数値はサンプル(配置先の実測で決める)。
+server:
+  threads: 8                            # ワーカースレッド数(2〜64)。推論は直列なので、増やしても推論は速くならない(/health などを返すため)
+  max_pending_predict: 4                # 同時に受け付ける /predict(実行中 + 順番待ち)。threads より小さいこと(/health 用のスレッドを残す)。超過は 503
+  queue_wait_sec: 30                    # 推論の順番待ちの上限[秒]。超えたら 503(実行中の推論は中断しない)
+  backlog: 64                           # listen の受付キュー(OS)
+  connection_limit: 32                  # 同時に開く接続数の上限(受け付けたリクエストのキューもこれで抑える)。threads + 2 以上(Waitress は待受ソケット等も数える)
+  channel_timeout_sec: 60               # リクエストの無い接続を閉じるまで[秒]
+  shutdown_grace_sec: 30                # 停止シグナルの後、実行中の推論の完了を待つ上限[秒]。超えたら中断して停止
+
+# 運用ログ(ローカルファイルへ。標準出力にも同じ内容)。パス・アドレス・認証情報・例外メッセージは出さない
+logging:
+  file: 'C:\ProgramData\SekisanNaviData\logs\prod_api.log'   # ローカルの絶対パス(UNC・出力ルート配下・server.yaml の場所は不可)
+  max_bytes: 5242880                    # 1 ファイルの上限(65536〜1GiB)。超えたら世代を回す
+  backup_count: 10                      # 残す世代数(1〜100)
+  level: INFO                           # INFO / WARNING / ERROR(DEBUG は不可)
