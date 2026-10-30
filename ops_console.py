@@ -24,10 +24,12 @@ def build_context(state_dir=BASE_DIR, config_path=None, main_func=None, schedule
     config = config_path or app.default_config_path()
     from ops.output_guard import OutputGuard
     # 手動実行の出力先を、本番の出力先(設定 data.output の下の storage/output = API の output_root)と照合する。定期実行・暫定運用は変えない
-    runs = RunManager(state_dir, store, history, main_func or app.main, config_path=config, output_guard=OutputGuard(config))
+    from ops.code_version import CodeVersionGuard
+    code_guard = CodeVersionGuard(BASE_DIR)    # 起動時のコミットを記録する(常駐の 8765 が、起動後に更新されたコードを使っていないかを確認するため)
+    runs = RunManager(state_dir, store, history, main_func or app.main, config_path=config, output_guard=OutputGuard(config), code_guard=code_guard)
     extra = ("--config", f'"{config_path}"') if config_path else ()
     sched = scheduler or TaskScheduler(sys.executable, str(Path(__file__).resolve()), extra_args=extra)
-    return AppContext(store=store, history=history, runs=runs, scheduler=sched, config_path=config)
+    return AppContext(store=store, history=history, runs=runs, scheduler=sched, config_path=config, code_check=code_guard.check_item)
 
 
 def cmd_serve(args) -> int:
