@@ -72,7 +72,7 @@
 | `{ページ}.jpeg` / `{ページ}.png` / `.dxf` / `_detected.txt` | **推論対象ページだけ**。推論用PNGは既存の前処理結果で、表示用プレビューとは別物。`_detected.txt` は UTF-8 で `Index$…|Device$…|Score$…|Coordinates$…` の行 |
 | `{ページ}__preview.png` | 推論対象外で印刷されたPDF-only図面の表示用画像。150dpi・ページごとの印刷内容の範囲に等しい余白を付けて描画(白紙・図枠を検出できないページは全体)。推論用PNG・オーバーレイには使わない |
 | `dwg/{ページ}.dwg` | 推論対象ページの DWG コピー |
-| `0_S0.pdf` / `0_A1.pdf` と各 `__preview.png` | PDFは既存の書類契約どおり。対応するPDFが出力されたときは、カード表示用PNG (`0_S0__preview.png` / `0_A1__preview.png`)も生成する。SekisanNaviは書類を図面一覧の最上段(仕様書→設計作図完了シート)に出し、PNGをサムネイル、PDFをクリック時の閲覧に使う。PNG生成に失敗した場合はその製番を成功扱いにしない |
+| `0_S0.pdf` / `0_A1.pdf` と各 `__preview.png` | PDFは既存の書類契約どおり。対応するPDFが出力されたときは、カード表示用PNG (`0_S0__preview.png` / `0_A1__preview.png`)も生成する。SekisanNaviは書類を図面一覧の最上段(仕様書→設計作図完了シート)に出し、PNG(クロップ済みの表示用プレビュー)を一覧のサムネイルと、カードを選んだときの中央表示の両方に使う。元PDFは、カードの別操作「PDFを開く」で閲覧する(SekisanNavi 側の変更: SekisanNavi PR #80)。推論対象外の通常図面も同様に、選択時は生成済みの `{ページ}__preview.png` を中央表示し、推論対象の図面の表示は従来どおり。PNG生成に失敗した場合はその製番を成功扱いにしない |
 | `../logs/*.log` | ログ(Git 管理外) |
 
 列の一覧と順序は `tests/test_output_contract.py` を参照(順序も契約として固定している)。
