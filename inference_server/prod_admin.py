@@ -328,8 +328,69 @@ def build_model_block(model_id: str, internal: dict, nl: str) -> str:
 
 def replace_model_section(text: str, block: str, nl: str) -> str:
     """トップレベルの `model:` 節だけを置き換える(ほかの節・コメントは保つ)。節が無ければ末尾へ追加する。"""
+    return replace_section(text, "model", block, nl)
+
+
+# ----------------------------------------------------------------------------- 性能(server 節)・ログ(logging 節)の設定
+# 値の範囲は prod_config(LIMIT_RANGES / LOG_RANGES。設定の検証と同じ表)。画面だけの設定は作らない: ここで書く項目は、すべて prod_server が実際に使う。
+PERF_DEFAULTS = {"threads": 2, "max_pending_predict": 1, "queue_wait_sec": 30, "backlog": 4, "connection_limit": 8,
+                 "channel_timeout_sec": 30, "shutdown_grace_sec": 60}          # 低負荷寄り。推論の同時実行は 1 件(max_pending_predict = 1)
+LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
+LOG_DEFAULT_BACKUPS = 5
+LOG_DEFAULT_LEVEL = "INFO"
+LOG_RELATIVE = os.path.join("logs", "prod_api.log")           # 設定ファイルと同じフォルダ配下
+PERF_FIELDS = (
+    ("threads", "ワーカースレッド数", "個", "HTTP リクエストを処理するスレッド数。推論は直列(同時に 1 件)なので、増やしても速くなりません。/health などに答えるために使います。"),
+    ("max_pending_predict", "同時に受け付ける /predict", "件", "実行中 + 順番待ちの /predict の上限。threads より小さくします。超えると 503。1 なら推論を同時に 1 件だけ受け付けます。"),
+    ("queue_wait_sec", "推論の順番待ちの上限", "秒", "超えると 503 を返し、クライアントが再試行できます。実行中の推論は中断されません。"),
+    ("backlog", "接続待ち行列の長さ", "件", "OS が受け付けて待たせる接続の数。"),
+    ("connection_limit", "同時に開く接続数の上限", "接続", "threads + 2 以上にします(Waitress が待受ソケット等も数えるため。/health の接続を確保します)。"),
+    ("channel_timeout_sec", "無通信の接続を閉じるまで", "秒", "リクエストが来ない接続を閉じるまでの時間。"),
+    ("shutdown_grace_sec", "停止時に推論の完了を待つ上限", "秒", "停止の要求後、実行中の推論の完了を待つ時間。超えると中断して停止します。"),
+)
+RETENTION_NOTE = ("ログの保管期間(日数)の設定はありません。サイズ上限と世代数で管理します(最大保存量の目安 = 最大サイズ × (世代数 + 1))。"
+                  "期間での削除が必要な場合は、別途の運用(IT との取り決め)になります。")
+CLIENT_TIMEOUT_NOTE = {
+    "setting": "api.request_timeout", "file": "app.local.yaml(データ作成側の設定。本番 API の設定ではありません)", "recommended_sec": 180,
+    "text": ("クライアントの応答待ち(秒)は、本番 API ではなく、データ作成側(製番処理)の設定ファイル app.local.yaml の「api:」節にある request_timeout で指定します。"
+             "この画面では編集できません(8765 の運用画面も、出力先と定期実行だけを編集し、この項目は編集できません。値の形式の確認だけをします)。"
+             "推奨値は 180 秒です。API 側の順番待ち(最大 30 秒)と、1 ページの推論時間(初回は約 21 秒、以降は約 1 秒。実図面は未測定)の合計を十分に上回り、"
+             "API の停止待ち(60 秒)より長くして、通常の遅延でクライアントが先に諦めないようにする意図です。省略すると、応答が無くても待ち続けます。")}
+
+
+def _strict_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check_server_values(values) -> dict:
+    """server 節の入力を検証する。{項目: メッセージ}(空なら OK)。範囲は prod_config.LIMIT_RANGES、最終判定は prod_config._limits(同じ検証ロジック)。"""
+    errors: dict = {}
+    if not isinstance(values, dict):
+        return {"_": "性能の設定の形式が正しくありません。"}
+    for key in PERF_DEFAULTS:
+        v = values.get(key)
+        lo, hi = prod_config.LIMIT_RANGES[key]
+        if not _strict_int(v):
+            errors[key] = f"{lo}〜{hi} の整数で指定してください。"
+        elif not (lo <= v <= hi):
+            errors[key] = f"{lo}〜{hi} の範囲で指定してください。"
+    t, p, c = values.get("threads"), values.get("max_pending_predict"), values.get("connection_limit")
+    if "threads" not in errors and "max_pending_predict" not in errors and p >= t:
+        errors["max_pending_predict"] = f"threads({t})より小さくしてください(最大 {t - 1}。/health 用のスレッドを残すため)。"
+    if "threads" not in errors and "connection_limit" not in errors and c < t + 2:
+        errors["connection_limit"] = f"threads + 2 以上にしてください(最小 {t + 2}。/health の接続を確保するため)。"
+    if not errors:
+        try:
+            prod_config._limits({k: values[k] for k in PERF_DEFAULTS})        # 設定の検証そのもの(画面と設定ファイルの検証を一致させる)
+        except prod_config.ConfigError as e:
+            errors["_"] = str(e)
+    return errors
+
+
+def replace_section(text: str, key: str, block: str, nl: str) -> str:
+    """トップレベルの `<key>:` 節だけを置き換える(ほかの節・コメントは保つ)。節が無ければ末尾へ追加する。"""
     lines = text.splitlines(keepends=True)
-    start = next((i for i, ln in enumerate(lines) if re.match(r"model:\s*(#.*)?\r?\n?$", ln)), None)
+    start = next((i for i, ln in enumerate(lines) if re.match(re.escape(key) + r":\s*(#.*)?\r?\n?$", ln)), None)
     if start is None:
         sep = "" if (not text or text.endswith(("\n", "\r"))) else nl
         return text + sep + (nl if text else "") + block
@@ -339,6 +400,22 @@ def replace_model_section(text: str, block: str, nl: str) -> str:
     while end > start + 1 and lines[end - 1].strip() == "":       # 節の後ろの空行は節の外(間隔を保つ)
         end -= 1
     return "".join(lines[:start]) + block + "".join(lines[end:])
+
+
+def build_server_block(values: dict, nl: str) -> str:
+    notes = {k: f"{label}({unit})" for k, label, unit, _ in PERF_FIELDS}
+    lines = ["server:                                 # Waitress の上限(モデル管理画面で保存。範囲は prod_config と同じ。推論の同時実行は max_pending_predict で制限)"]
+    lines += [f"  {k}: {values[k]}                  # {notes[k]}" for k in PERF_DEFAULTS]
+    return nl.join(lines) + nl
+
+
+def build_logging_block(values: dict, nl: str) -> str:
+    lines = ["logging:                                # 運用ログ(ローカルのフォルダ)。保管期間の設定は無く、最大サイズ × (世代数 + 1) で管理する",
+             f"  file: {_q(values['file'])}",
+             f"  max_bytes: {values['max_bytes']}                  # {values['max_bytes'] // (1024 * 1024)} MiB(1 ファイルの上限)",
+             f"  backup_count: {values['backup_count']}                  # 残す世代数",
+             f"  level: {values['level']}"]
+    return nl.join(lines) + nl
 
 
 class ModelAdmin:
@@ -389,7 +466,199 @@ class ModelAdmin:
                                     "yaml_in_other_folder": bool(m.get("yaml_dir"))}
             except Exception:  # noqa: BLE001
                 cur["error"] = "設定ファイルの YAML を読み込めません。"
-        return {"ok": True, "default_weights_path": DEFAULT_WEIGHTS_PATH, "default_yaml_path": DEFAULT_YAML_PATH, "current": cur}
+        return {"ok": True, "default_weights_path": DEFAULT_WEIGHTS_PATH, "default_yaml_path": DEFAULT_YAML_PATH, "current": cur,
+                "settings": self.settings_state(storage_ok=cur["storage_error"] is None)}
+
+    # ---- 性能(server 節)・ログ(logging 節)の設定
+    def _config_data(self) -> dict:
+        try:
+            data = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) if self.config_path.is_file() else None
+        except Exception:  # noqa: BLE001
+            data = None
+        return data if isinstance(data, dict) else {}
+
+    def log_defaults(self) -> dict:
+        return {"file": str(self.config_path.parent / LOG_RELATIVE), "max_bytes": LOG_DEFAULT_MAX_BYTES, "backup_count": LOG_DEFAULT_BACKUPS,
+                "level": LOG_DEFAULT_LEVEL}
+
+    def _require_local_log(self, path):
+        """ログファイルの置き場所が、実体としてローカルディスク内であること(UNC・ネットワークドライブ・リンク/ジャンクション経由は拒否)。固定文。"""
+        require_local_dir(os.path.dirname(os.path.abspath(path)), self._drive_type)
+        try:
+            if os.path.lexists(path) and _is_reparse_or_link(path):
+                raise AdminError(STORAGE_MESSAGE)
+        except AdminError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise AdminError(STORAGE_MESSAGE) from None
+
+    def log_storage_error(self):
+        """設定済みのログの置き場所がローカルと証明できなければ、固定文(無ければ None)。画面の起動時・状態表示で使う。"""
+        f = (self._config_data().get("logging") or {}).get("file") if isinstance(self._config_data().get("logging"), dict) else None
+        if not isinstance(f, str) or not f.strip():
+            return None
+        try:
+            self._require_local_log(f.strip())
+            return None
+        except AdminError as e:
+            return str(e)
+
+    def settings_state(self, storage_ok: bool = True) -> dict:
+        data = self._config_data() if storage_ok else {}
+        srv = data.get("server") if isinstance(data.get("server"), dict) else {}
+        lg = data.get("logging") if isinstance(data.get("logging"), dict) else {}
+        values, configured = {}, True
+        for k, dv in PERF_DEFAULTS.items():
+            ok = _strict_int(srv.get(k))
+            values[k], configured = (srv[k] if ok else dv), configured and ok
+        dlog = self.log_defaults()
+        if not storage_ok:
+            dlog["file"] = ""                        # 設定ファイルの置き場所がローカルと証明できないときは、そこから作ったパス(UNC 等)を返さない
+        lvalues, lconf = {}, True
+        for k in ("file", "max_bytes", "backup_count", "level"):
+            v = lg.get(k)
+            good = (isinstance(v, str) and v.strip() != "") if k in ("file", "level") else _strict_int(v)
+            if k == "level":
+                good = good and str(v).upper() in prod_config.LOG_LEVELS
+            lvalues[k] = (v if good else dlog[k])
+            lconf = lconf and good
+        lvalues["level"] = str(lvalues["level"]).upper()
+        return {
+            "server": {"configured": configured, "values": values, "defaults": dict(PERF_DEFAULTS),
+                       "fields": [{"key": k, "label": label, "unit": unit, "description": desc,
+                                   "min": prod_config.LIMIT_RANGES[k][0], "max": prod_config.LIMIT_RANGES[k][1]} for k, label, unit, desc in PERF_FIELDS]},
+            "logging": {"configured": lconf, "values": lvalues, "defaults": dlog, "retention_note": RETENTION_NOTE,
+                        "max_bytes_range": list(prod_config.LOG_RANGES["max_bytes"]), "backup_count_range": list(prod_config.LOG_RANGES["backup_count"]),
+                        "max_total_mib": round((lvalues["backup_count"] + 1) * lvalues["max_bytes"] / 1048576, 1),
+                        "storage_error": self.log_storage_error() if storage_ok else None},
+            "client_timeout": CLIENT_TIMEOUT_NOTE,
+        }
+
+    def check_logging_values(self, values, data: dict) -> dict:
+        errors: dict = {}
+        if not isinstance(values, dict):
+            return {"_": "ログの設定の形式が正しくありません。"}
+        f, mb, bc = values.get("file"), values.get("max_bytes"), values.get("backup_count")
+        if not isinstance(f, str) or not f.strip():
+            errors["file"] = "ログファイルのパスを入力してください。"
+        lo, hi = prod_config.LOG_RANGES["max_bytes"]
+        if not _strict_int(mb) or not (lo <= mb <= hi):
+            errors["max_bytes"] = f"{lo // 1024} KiB〜{hi // (1024 * 1024)} MiB の範囲で指定してください。"
+        lo, hi = prod_config.LOG_RANGES["backup_count"]
+        if not _strict_int(bc) or not (lo <= bc <= hi):
+            errors["backup_count"] = f"{lo}〜{hi} の整数で指定してください。"
+        if "file" not in errors:
+            cur = data.get("logging") if isinstance(data.get("logging"), dict) else {}
+            level = str(cur.get("level") or LOG_DEFAULT_LEVEL).upper()
+            level = level if level in prod_config.LOG_LEVELS else LOG_DEFAULT_LEVEL
+            pub = data.get("publish") if isinstance(data.get("publish"), dict) else {}
+            model = data.get("model") if isinstance(data.get("model"), dict) else {}
+            unset = "Z:\\__prod_admin_unset__"                                    # 未設定の項目は、どの場所とも一致しない値で代用(重なりの検査だけ)
+            others = tuple(x for x in (pub.get("backup_dir"), model.get("dir")) if isinstance(x, str) and x.strip())
+            try:                                                                  # 設定の検証そのもの(ローカルの絶対パス・.. 不可・出力ルート/server.yaml/退避先/モデルの配下は不可)
+                prod_config._log({"file": f.strip(), "max_bytes": mb if _strict_int(mb) else LOG_DEFAULT_MAX_BYTES,
+                                  "backup_count": bc if _strict_int(bc) else LOG_DEFAULT_BACKUPS, "level": level},
+                                 data.get("output_root") if isinstance(data.get("output_root"), str) and data.get("output_root").strip() else unset,
+                                 pub.get("server_yaml") if isinstance(pub.get("server_yaml"), str) and pub.get("server_yaml").strip() else unset, others)
+            except prod_config.ConfigError as e:
+                errors["file"] = str(e)
+            if "file" not in errors:
+                try:
+                    self._require_local_log(f.strip())                            # 実体の検査(ネットワークドライブ・リンク・ジャンクション)
+                except AdminError as e:
+                    errors["file"] = str(e)
+        return errors
+
+    def validate_settings(self, body: dict) -> dict:
+        try:
+            self.require_local_storage()
+            data = self._config_data()
+        except AdminError:
+            data = {}
+        errors: dict = {}
+        if "server" in body:
+            errors["server"] = check_server_values(body.get("server"))
+        if "logging" in body:
+            errors["logging"] = self.check_logging_values(body.get("logging"), data)
+        summary = {}
+        lg = body.get("logging")
+        if isinstance(lg, dict) and _strict_int(lg.get("max_bytes")) and _strict_int(lg.get("backup_count")) and not errors.get("logging", {}).get("max_bytes") \
+                and not errors.get("logging", {}).get("backup_count"):
+            summary["max_total_mib"] = round((lg["backup_count"] + 1) * lg["max_bytes"] / 1048576, 1)
+        return {"ok": True, "valid": not any(errors.values()), "errors": {k: v for k, v in errors.items() if v}, "summary": summary}
+
+    def save_settings(self, body: dict) -> dict:
+        sections = [k for k in ("server", "logging") if k in body]
+        if not sections:
+            raise AdminError("保存する設定(性能・ログ)が指定されていません。")
+        self.require_local_storage()                                              # 保存前に、設定ファイルの置き場所がローカルであることを確認する
+        path = self.config_path
+        if not path.name.endswith(".local.yaml") or path.name.endswith(".sample.yaml"):
+            raise AdminError("保存先は Git 管理外の *.local.yaml だけです。")
+        with self._lock:
+            if not path.is_file():
+                raise AdminError("prod_server.local.yaml がありません。sample を写して作ってから保存してください。")
+            raw = path.read_bytes()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise AdminError("設定ファイルが UTF-8 ではないため、保存しませんでした。") from None
+            if "\ufeff" in text[:1]:
+                raise AdminError("設定ファイルに BOM があるため、保存しませんでした。")
+            try:
+                old = yaml.safe_load(text) or {}
+            except Exception:  # noqa: BLE001
+                raise AdminError("設定ファイルの YAML を読み込めないため、保存しませんでした。") from None
+            if not isinstance(old, dict):
+                raise AdminError("設定ファイルの形式が正しくないため、保存しませんでした。")
+            errors = {}
+            if "server" in sections:
+                errors["server"] = check_server_values(body["server"])
+            if "logging" in sections:
+                errors["logging"] = self.check_logging_values(body["logging"], old)
+            errors = {k: v for k, v in errors.items() if v}
+            if errors:
+                return {"ok": False, "saved": False, "errors": errors, "error": "入力に誤りがあるため保存しませんでした(設定ファイルは変更していません)。"}
+            nl = "\r\n" if "\r\n" in text else "\n"
+            new_text, expect = text, {}
+            if "server" in sections:
+                expect["server"] = {k: body["server"][k] for k in PERF_DEFAULTS}
+                new_text = replace_section(new_text, "server", build_server_block(expect["server"], nl), nl)
+            if "logging" in sections:
+                cur = old.get("logging") if isinstance(old.get("logging"), dict) else {}
+                level = str(cur.get("level") or LOG_DEFAULT_LEVEL).upper()
+                level = level if level in prod_config.LOG_LEVELS else LOG_DEFAULT_LEVEL
+                lg = body["logging"]
+                expect["logging"] = {"file": os.path.normpath(lg["file"].strip().replace("/", "\\")), "max_bytes": lg["max_bytes"],
+                                     "backup_count": lg["backup_count"], "level": level}
+                new_text = replace_section(new_text, "logging", build_logging_block(expect["logging"], nl), nl)
+            try:                                                                  # 保存前の検証: 読めること・保存する値のとおりであること・ほかの節が変わらないこと
+                parsed = yaml.safe_load(new_text)
+                for key, val in expect.items():
+                    assert parsed[key] == val
+                if "server" in expect:
+                    prod_config._limits(parsed["server"])
+                others_old = {k: v for k, v in old.items() if k not in expect}
+                others_new = {k: v for k, v in parsed.items() if k not in expect}
+                assert others_old == others_new
+            except Exception:  # noqa: BLE001
+                raise AdminError("保存する内容の検証に失敗したため、保存しませんでした(設定ファイルは変更していません)。") from None
+            self.require_local_storage()                                          # バックアップ・一時ファイルの作成の直前にも確認する
+            if "logging" in expect:
+                self._require_local_log(expect["logging"]["file"])
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"{time.time_ns() % 10**9:09d}"
+            backup = path.with_name(f"{path.name[:-len('.local.yaml')]}.bak-{stamp}-{os.getpid()}.local.yaml")
+            with open(backup, "xb") as f:                                         # 既存の設定のバックアップ(同じフォルダ。上書きしない)
+                f.write(raw)
+            self._atomic_write(path, new_text.encode("utf-8"))                    # 原子的に置換
+        complete = True
+        try:
+            prod_config.load_config(str(path))
+        except prod_config.ConfigError:
+            complete = False
+        return {"ok": True, "saved": True, "saved_sections": sections, "backup_file": backup.name, "config_complete": complete,
+                "note": "設定だけを保存しました。API の起動・再起動・接続設定の公開は行っていません。"
+                        + ("" if complete else "(設定全体は未完了です。check で未設定の項目を確認してください)")}
 
     # ---- 参照…
     def browse(self, body: dict) -> dict:
@@ -661,7 +930,9 @@ def make_handler(admin: ModelAdmin):
             if not self._guard(True):
                 return
             routes = {"/api/model/browse": lambda: admin.browse(self._body()), "/api/model/inspect": lambda: admin.inspect(self._body()),
-                      "/api/model/save": lambda: admin.save(self._body()), "/api/check": admin.check}
+                      "/api/model/save": lambda: admin.save(self._body()), "/api/check": admin.check,
+                      "/api/settings/validate": lambda: admin.validate_settings(self._body()),
+                      "/api/settings/save": lambda: admin.save_settings(self._body())}
             fn = routes.get(self.path.split("?", 1)[0])
             if fn is None:
                 return self._error(404, "見つかりません。")
@@ -698,6 +969,9 @@ def main(argv=None) -> int:
     except AdminError as e:
         print(f"起動を拒否: {e}", file=sys.stderr)
         return 2
+    log_error = admin.log_storage_error()                    # 設定済みのログの置き場所もローカルか検査する(不正でも画面は起動し、直せるようにする。API の起動 serve / check は拒否する)
+    if log_error:
+        print(f"警告(ログの置き場所): {log_error}", file=sys.stderr)
     server = make_server(admin, port=args.port)
     print(f"モデル管理画面: http://127.0.0.1:{args.port}/  (Ctrl+C で終了。API の起動・公開はしません)")
     try:

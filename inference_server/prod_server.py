@@ -311,6 +311,21 @@ def _waitress_importable() -> bool:
         return False
 
 
+def _log_location_is_local(cfg: prod_config.ProdConfig) -> bool:
+    """ログファイルの置き場所が、実体としてローカルディスク内か(モデル管理画面と同じ検査。UNC・ネットワークドライブ・リンク/ジャンクション経由は不可)。
+    Windows だけ(他の OS ではこの検査の対象外として通す)。"""
+    if os.name != "nt":
+        return True
+    import prod_admin                       # 遅延 import(管理画面のモジュールは、check / serve の読み込みに影響させない)
+    try:
+        prod_admin.require_local_dir(os.path.dirname(os.path.abspath(cfg.log.file)))
+        if os.path.lexists(cfg.log.file) and prod_admin._is_reparse_or_link(cfg.log.file):
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - 確認できない = 証明できない
+        return False
+
+
 def run_check(cfg: prod_config.ProdConfig) -> dict:
     """設定・環境・モデル・公開計画の確認。待ち受けもファイルの書き込みもしない(出力ルート・既存 server.yaml・モデルの読み取りと、
     既存 server.yaml の接続先への /health 1 回だけ)。値(パス・アドレス・ハッシュ全文)は含めない。"""
@@ -332,7 +347,8 @@ def run_check(cfg: prod_config.ProdConfig) -> dict:
                      "queue_wait_sec": L.queue_wait_sec, "shutdown_grace_sec": L.shutdown_grace_sec}
     log_dir = os.path.dirname(os.path.abspath(cfg.log.file))
     out["logging"] = {"level": cfg.log.level, "max_bytes": cfg.log.max_bytes, "backup_count": cfg.log.backup_count,
-                      "directory_exists": os.path.isdir(log_dir), "directory_writable": os.path.isdir(log_dir) and os.access(log_dir, os.W_OK)}
+                      "directory_exists": os.path.isdir(log_dir), "directory_writable": os.path.isdir(log_dir) and os.access(log_dir, os.W_OK),
+                      "location_is_local": _log_location_is_local(cfg)}
     ident = None
     try:
         ident, summary = _check_model_in_place(cfg)
@@ -345,7 +361,8 @@ def run_check(cfg: prod_config.ProdConfig) -> dict:
         out["publish_plan"] = None
     out["ok"] = bool(out["bind"]["address_assigned_to_this_pc"] and not in_use and out["output_root"]["exists"]
                      and out["model"]["verified"] and out["server"]["waitress_importable"]
-                     and (out["logging"]["directory_writable"] or not out["logging"]["directory_exists"]))
+                     and (out["logging"]["directory_writable"] or not out["logging"]["directory_exists"])
+                     and out["logging"]["location_is_local"])
     return out
 
 
@@ -454,6 +471,9 @@ def serve(cfg: prod_config.ProdConfig, *, publish_config: bool = False, replace_
           backend_factory=None, on_started=None, install_signals: bool = True) -> int:
     """API を前景プロセスとして起動する(Waitress)。`backend_factory(cfg, model_dir)` は、**ステージングした(検証済みの)モデルフォルダ**から読み込むこと。
     停止は SIGINT / SIGTERM / SIGBREAK(または `on_started` で受け取った handle.shutdown())。公開済みの server.yaml は、停止しても削除しない。"""
+    if not _log_location_is_local(cfg):       # ログの置き場所が、実体としてローカルディスク内と確認できない(ネットワークドライブ・リンク/ジャンクション経由など)。パスは出さない
+        print("起動を拒否: ログの保存先がローカルディスク内と確認できません(logging.file)", file=sys.stderr)
+        return EXIT_CONFIG
     try:
         logh = prod_logging.configure_logging(cfg.log.file, cfg.log.max_bytes, cfg.log.backup_count, cfg.log.level)
     except OSError:   # ログファイルを作れない・開けない。例外の文言(パスを含む)は出さず、固定文で終了する

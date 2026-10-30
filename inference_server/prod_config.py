@@ -194,20 +194,27 @@ def _int_in(d: dict, key: str, lo: int, hi: int, section: str) -> int:
     return v
 
 
+# 値の範囲(設定の検証と、モデル管理画面 prod_admin の入力検証・表示が、同じ表を使う = 検証ロジックを二重に持たない)
+LIMIT_RANGES = {"threads": (2, 64), "max_pending_predict": (1, 63), "queue_wait_sec": (1, 600), "backlog": (1, 1024),
+                "connection_limit": (4, 512), "channel_timeout_sec": (5, 600), "shutdown_grace_sec": (1, 300)}
+LOG_RANGES = {"max_bytes": (65536, 1024 * 1024 * 1024), "backup_count": (1, 100)}
+
+
 def _limits(d: dict) -> ServerLimits:
-    threads = _int_in(d, "threads", 2, 64, "server")
-    pending = _int_in(d, "max_pending_predict", 1, 63, "server")
+    r = LIMIT_RANGES
+    threads = _int_in(d, "threads", *r["threads"], "server")
+    pending = _int_in(d, "max_pending_predict", *r["max_pending_predict"], "server")
     if pending >= threads:
         raise ConfigError("同時に受け付ける /predict は threads より小さくしてください(/health 用のスレッドを残すため): server.max_pending_predict")
-    conn = _int_in(d, "connection_limit", 4, 512, "server")
+    conn = _int_in(d, "connection_limit", *r["connection_limit"], "server")
     if conn < threads + 2:
         # Waitress は「待受ソケットと内部の trigger」も接続数に数えるため、実際に使える接続は connection_limit - 2。
         # /predict(最大 threads-1 件)に加えて /health の接続を 1 つ確保するため、threads + 2 以上にする
         raise ConfigError("connection_limit は threads + 2 以上にしてください(/health の接続を確保するため): server.connection_limit")
-    return ServerLimits(threads=threads, max_pending_predict=pending, queue_wait_sec=_int_in(d, "queue_wait_sec", 1, 600, "server"),
-                        backlog=_int_in(d, "backlog", 1, 1024, "server"), connection_limit=conn,
-                        channel_timeout_sec=_int_in(d, "channel_timeout_sec", 5, 600, "server"),
-                        shutdown_grace_sec=_int_in(d, "shutdown_grace_sec", 1, 300, "server"))
+    return ServerLimits(threads=threads, max_pending_predict=pending, queue_wait_sec=_int_in(d, "queue_wait_sec", *r["queue_wait_sec"], "server"),
+                        backlog=_int_in(d, "backlog", *r["backlog"], "server"), connection_limit=conn,
+                        channel_timeout_sec=_int_in(d, "channel_timeout_sec", *r["channel_timeout_sec"], "server"),
+                        shutdown_grace_sec=_int_in(d, "shutdown_grace_sec", *r["shutdown_grace_sec"], "server"))
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
@@ -229,8 +236,8 @@ def _log(d: dict, output_root: str, server_yaml: str, other_dirs: tuple = ()) ->
     level = _req(d, "level", str, "logging").upper()
     if level not in LOG_LEVELS:
         raise ConfigError("ログレベルは INFO / WARNING / ERROR のいずれか(DEBUG は不可): logging.level")
-    return LogConfig(file=f, max_bytes=_int_in(d, "max_bytes", 65536, 1024 * 1024 * 1024, "logging"),
-                     backup_count=_int_in(d, "backup_count", 1, 100, "logging"), level=level)
+    return LogConfig(file=f, max_bytes=_int_in(d, "max_bytes", *LOG_RANGES["max_bytes"], "logging"),
+                     backup_count=_int_in(d, "backup_count", *LOG_RANGES["backup_count"], "logging"), level=level)
 
 
 def parse_config(data: dict) -> ProdConfig:

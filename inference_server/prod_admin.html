@@ -53,6 +53,44 @@
     <p class="note">「検証」は、選んだファイルを読み取るだけです(数秒〜数十秒かかることがあります)。期待値(サイズ・SHA-256)は手入力せず、選んだ実ファイルから設定します。画面にはハッシュの先頭 12 桁だけを表示します。</p>
   </section>
 
+  <section id="perfBox">
+    <h2>性能(Waitress の上限)</h2>
+    <p class="note">低負荷寄りの初期値です。推論は 1 件ずつ(同時に受け付ける /predict は 1 件)に制限します。この画面の値は、保存したときだけ prod_server.local.yaml の server: 節へ書き込まれ、API が実際に使います。</p>
+    <div id="perfInit" class="note"></div>
+    <table id="perfTable"></table>
+    <div class="actions">
+      <button id="perfValidate" type="button">検証</button>
+      <button id="perfSave" type="button" class="primary">性能を保存</button>
+      <button id="perfReset" type="button">初期値に戻す</button>
+    </div>
+    <div id="perfMsg"></div>
+  </section>
+
+  <section id="logBox">
+    <h2>ログ</h2>
+    <div id="logStorage" class="ng"></div>
+    <label for="logFile">ログファイルの保存先(この PC のローカルのフォルダ。UNC・ネットワークドライブ・リンクやジャンクション経由は不可)</label>
+    <input id="logFile" type="text" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box">
+    <label for="logMib">1 ファイルあたりの最大サイズ(MiB)</label>
+    <input id="logMib" type="number" step="any" style="width:12em">
+    <label for="logBackups">ローテーション後に残す世代数(世代)</label>
+    <input id="logBackups" type="number" step="1" style="width:12em">
+    <p id="logTotal" class="note"></p>
+    <p class="note">ログレベル: <span id="logLevel"></span>(既存の値を保持します)。<span id="logRetention"></span></p>
+    <div class="actions">
+      <button id="logValidate" type="button">検証</button>
+      <button id="logSave" type="button" class="primary">ログ設定を保存</button>
+      <button id="logReset" type="button">初期値に戻す</button>
+    </div>
+    <div id="logMsg"></div>
+  </section>
+
+  <section id="ctBox">
+    <h2>クライアント側タイムアウト(api.request_timeout)</h2>
+    <p id="ctText" class="note"></p>
+    <table id="ctTable"></table>
+  </section>
+
   <section id="resultBox" hidden>
     <h2>検証結果</h2>
     <div id="result"></div>
@@ -167,6 +205,119 @@
   };
 
   loadState();
+})();
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var MIB = 1048576;
+  var st = null, busy = false;
+
+  function api(method, path, body) {
+    var opt = { method: method, headers: { "X-Admin-Request": "1", "Content-Type": "application/json" } };
+    if (body !== undefined) opt.body = JSON.stringify(body);
+    return fetch(path, opt).then(function (r) { return r.json(); });
+  }
+  function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+  function isInt(v) { return typeof v === "number" && isFinite(v) && Math.floor(v) === v; }
+  function num(id) { var s = $(id).value.trim(); return s === "" ? NaN : Number(s); }
+
+  // ---- 性能
+  function perfInputs() { return st.server.fields.map(function (f) { return "perf_" + f.key; }); }
+  function perfValues() { var v = {}; st.server.fields.forEach(function (f) { v[f.key] = num("perf_" + f.key); }); return v; }
+  function perfErrors(v) {
+    var e = {};
+    st.server.fields.forEach(function (f) {
+      var x = v[f.key];
+      if (!isInt(x)) e[f.key] = f.min + "〜" + f.max + " の整数で指定してください。";
+      else if (x < f.min || x > f.max) e[f.key] = f.min + "〜" + f.max + " の範囲で指定してください。";
+    });
+    if (!e.threads && !e.max_pending_predict && v.max_pending_predict >= v.threads) e.max_pending_predict = "threads(" + v.threads + ")より小さくしてください(最大 " + (v.threads - 1) + ")。";
+    if (!e.threads && !e.connection_limit && v.connection_limit < v.threads + 2) e.connection_limit = "threads + 2 以上にしてください(最小 " + (v.threads + 2) + ")。";
+    return e;
+  }
+  function showPerfErrors(e) {
+    st.server.fields.forEach(function (f) { var c = $("perfErr_" + f.key); c.textContent = e[f.key] || ""; });
+    $("perfSave").disabled = Object.keys(e).length > 0;
+  }
+  function onPerfInput() { showPerfErrors(perfErrors(perfValues())); }
+  function buildPerf() {
+    var t = $("perfTable"); clear(t);
+    st.server.fields.forEach(function (f) {
+      var tr = el("tr"), th = el("th", f.label), td = el("td"), inp = el("input");
+      inp.type = "number"; inp.step = "1"; inp.id = "perf_" + f.key; inp.min = f.min; inp.max = f.max; inp.style.width = "7em";
+      inp.value = st.server.values[f.key]; inp.oninput = onPerfInput;
+      td.appendChild(inp); td.appendChild(el("span", " " + f.unit + "  (範囲 " + f.min + "〜" + f.max + ")", "note"));
+      td.appendChild(el("div", f.description, "note"));
+      var er = el("div", "", "ng"); er.id = "perfErr_" + f.key; td.appendChild(er);
+      tr.appendChild(th); tr.appendChild(td); t.appendChild(tr);
+    });
+    $("perfInit").textContent = st.server.configured ? "設定ファイルの現在の値を表示しています。" :
+      "設定ファイルに性能の設定が無い(または一部だけ)ため、初期値を表示しています。「性能を保存」を押したときに、はじめて書き込まれます。";
+    onPerfInput();
+  }
+  function perfResetValues() { st.server.fields.forEach(function (f) { $("perf_" + f.key).value = st.server.defaults[f.key]; }); onPerfInput(); }
+
+  // ---- ログ
+  function logValues() { return { file: $("logFile").value, max_bytes: Math.round(num("logMib") * MIB), backup_count: num("logBackups") }; }
+  function logErrors() {
+    var e = {}, v = logValues(), lo = st.logging.max_bytes_range, bc = st.logging.backup_count_range;
+    if (!$("logFile").value.trim()) e.file = "ログファイルのパスを入力してください。";
+    if (!isFinite(v.max_bytes) || v.max_bytes < lo[0] || v.max_bytes > lo[1]) e.max_bytes = (lo[0] / 1024) + " KiB〜" + (lo[1] / MIB) + " MiB の範囲で指定してください。";
+    if (!isInt(v.backup_count) || v.backup_count < bc[0] || v.backup_count > bc[1]) e.backup_count = bc[0] + "〜" + bc[1] + " の整数で指定してください。";
+    return e;
+  }
+  function updateLogTotal() {
+    var e = logErrors(), box = $("logTotal");
+    if (e.max_bytes || e.backup_count) { box.textContent = "最大保存量の目安: 入力を確認してください。"; }
+    else { var v = logValues(); box.textContent = "最大保存量の目安: 約 " + (Math.round((v.backup_count + 1) * v.max_bytes / MIB * 10) / 10) + " MiB(最大サイズ × (世代数 + 1))。"; }
+    $("logSave").disabled = Object.keys(e).length > 0;
+  }
+  function fillLog(v) { $("logFile").value = v.file; $("logMib").value = Math.round(v.max_bytes / MIB * 10000) / 10000; $("logBackups").value = v.backup_count; updateLogTotal(); }
+  function buildLog() {
+    fillLog(st.logging.values);
+    $("logLevel").textContent = st.logging.values.level;
+    $("logRetention").textContent = st.logging.retention_note;
+    $("logStorage").textContent = st.logging.storage_error || "";
+    ["logFile", "logMib", "logBackups"].forEach(function (i) { $(i).oninput = updateLogTotal; });
+  }
+  function buildClientTimeout() {
+    var c = st.client_timeout; $("ctText").textContent = c.text;
+    var t = $("ctTable"); clear(t);
+    [["設定項目", c.setting], ["設定ファイル", c.file], ["推奨値", c.recommended_sec + " 秒"]].forEach(function (r) {
+      var tr = el("tr"); tr.appendChild(el("th", r[0])); tr.appendChild(el("td", r[1])); t.appendChild(tr);
+    });
+  }
+
+  function showResult(boxId, r) {
+    var box = $(boxId); clear(box);
+    var errs = r.errors || {};
+    Object.keys(errs).forEach(function (sec) {
+      var m = errs[sec]; Object.keys(m).forEach(function (k) { box.appendChild(el("p", m[k], "ng")); });
+    });
+    if (r.saved) box.appendChild(el("p", "保存しました(バックアップ: " + r.backup_file + ")。" + r.note, "ok"));
+    else if (r.valid === true) box.appendChild(el("p", "検証 OK です(まだ保存していません)。" + (r.summary && r.summary.max_total_mib ? " 最大保存量の目安: 約 " + r.summary.max_total_mib + " MiB。" : ""), "ok"));
+    else if (r.error) box.appendChild(el("p", r.error, "ng"));
+  }
+  function perfBody() { return { server: perfValues() }; }
+  function logBody() { return { logging: logValues() }; }
+  function run(path, body, boxId, done) {
+    if (busy) return; busy = true;
+    api("POST", path, body).then(function (r) { showResult(boxId, r); if (done) done(r); })
+      .catch(function () { $(boxId).textContent = "処理に失敗しました。"; }).then(function () { busy = false; });
+  }
+  function reload() { return api("GET", "/api/state").then(function (s) { if (s.ok) { st = s.settings; buildPerf(); buildLog(); buildClientTimeout(); } }); }
+
+  $("perfValidate").onclick = function () { run("/api/settings/validate", perfBody(), "perfMsg"); };
+  $("perfSave").onclick = function () { run("/api/settings/save", perfBody(), "perfMsg", function (r) { if (r.saved) { reload().then(function () { showResult("perfMsg", r); }); } }); };
+  $("perfReset").onclick = perfResetValues;
+  $("logValidate").onclick = function () { run("/api/settings/validate", logBody(), "logMsg"); };
+  $("logSave").onclick = function () { run("/api/settings/save", logBody(), "logMsg", function (r) { if (r.saved) { reload().then(function () { showResult("logMsg", r); }); } }); };
+  $("logReset").onclick = function () { fillLog(st.logging.defaults); };
+
+  reload();
 })();
 </script>
 </body>
