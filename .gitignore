@@ -7,6 +7,10 @@ packages/bs_pkg/bs_pkg/config/*.local.yaml
 # 仮想環境・キャッシュ・生成物
 .venv/
 inference_server/.venv/
+# 本番推論 API の実行時の生成物(PID 記録・ロック・server.yaml の退避・ログ。prod_ctl.py / prod_server.py が作る)
+inference_server/run/
+inference_server/logs/
+inference_server/server_yaml_backup/
 __pycache__/
 *.pyc
 .pytest_cache/

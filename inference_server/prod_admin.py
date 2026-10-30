@@ -532,7 +532,18 @@ class ModelAdmin:
                         "max_total_mib": round((lvalues["backup_count"] + 1) * lvalues["max_bytes"] / 1048576, 1),
                         "storage_error": self.log_storage_error() if storage_ok else None},
             "client_timeout": CLIENT_TIMEOUT_NOTE,
+            "api": self.api_info(data),
         }
+
+    @staticmethod
+    def api_info(data: dict) -> dict:
+        """設定(bind・allowed_clients)から、API の URL と許可クライアントを返す(表示用。未設定なら None)。"""
+        bind = data.get("bind") if isinstance(data.get("bind"), dict) else {}
+        host, port = bind.get("host"), bind.get("port")
+        ok = isinstance(host, str) and host.strip() != "" and _strict_int(port)
+        allowed = data.get("allowed_clients")
+        return {"url": f"http://{host}:{port}" if ok else None, "protocol": "HTTP(社内ネットワーク内)",
+                "allowed_clients": [str(x) for x in allowed] if isinstance(allowed, list) else []}
 
     def check_logging_values(self, values, data: dict) -> dict:
         errors: dict = {}

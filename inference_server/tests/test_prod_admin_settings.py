@@ -454,6 +454,20 @@ class HttpAndClientTimeoutTest(SettingsBase):
         self.assertNotIn("request_timeout", Path(prod_admin.__file__).read_text(encoding="utf-8").replace(
             "api.request_timeout", "").replace("request_timeout で指定", ""))                   # 画面の説明以外に、保存処理で使わない
 
+    def test_the_api_url_and_allowed_clients_are_shown_from_the_config(self):
+        api = self.admin.state()["settings"]["api"]
+        self.assertEqual(api["url"], f"http://{HOST}:{self.port}")
+        self.assertEqual(api["allowed_clients"], ["127.0.0.1/32"])
+        self.assertIn("HTTP", api["protocol"])
+        page = requests.get(self.base + "/", timeout=5, proxies=NO_PROXY).text
+        self.assertIn("apiInfo", page)
+        d = self.data()
+        d["bind"] = {"host": None, "port": None}
+        d["allowed_clients"] = None
+        self.write_config(d)
+        api = self.admin.state()["settings"]["api"]
+        self.assertEqual((api["url"], api["allowed_clients"]), (None, []))                    # 未設定なら、URL は出さない
+
     def test_responses_never_contain_unrelated_paths_or_hashes(self):
         res = self.admin.save_settings({"server": dict(prod_admin.PERF_DEFAULTS)})
         blob = json.dumps(res, ensure_ascii=False)

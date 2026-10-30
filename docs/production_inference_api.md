@@ -299,6 +299,17 @@ python prod_admin.py --config prod_server.local.yaml [--port 8790]      # http:/
 | 7 | サーバーのループで想定外の失敗が起きた(ログには型名と呼び出し位置だけ記録) |
 | `check` | 0: 問題なし / 1: 要確認(アドレス未割当・ポート使用中・出力ルート無し・モデル不一致) |
 
+### 9.4 起動・停止の操作(`prod_ctl.py`・`start_prod_api.bat`・`stop_prod_api.bat`)
+**Windows サービスではない。** 前景プロセスを、非表示のコンソールで起動する補助(登録・自動復旧はしない)。実行環境は `inference_server\\.venv`(`requirements-real.txt`。既存の venv とは別)。
+- **起動**: `start_prod_api.bat`(= `python prod_ctl.py start`)。**二重起動しない**(起動の排他ロック `run\\prod_api.start.lock`・PID 記録 `run\\prod_api.pid`〔PID + プロセス作成時刻〕・待受ポートの使用確認)。
+  起動後に、**待受アドレス・ポート(設定と一致するプロセスが待ち受けていること)・`/health`(`status: ok`・`ready: true`・`mode: production`)・モデル識別(id・重み/`model.yaml` の先頭 12 桁・サイズ = 設定の期待値)**を確認し、`URL = http://<bind.host>:<bind.port>` を表示する。
+  失敗(設定の不備・アドレスが無い・ポートが他で使用中・準備完了の前に終了・タイムアウト・待受/モデルの不一致)は、**固定の説明**を表示して終了コードで返す(起動したプロセスは停止する。他のプロセスには触れない)。**共有 `server.yaml` の公開(`--publish-config`)はしない。**
+  バッチは ASCII のみ(cmd.exe はバッチを OEM コードページで読むため、日本語を入れると壊れる)。日本語の説明は `prod_ctl.py` が出す。
+- **停止**: `stop_prod_api.bat`(= `python prod_ctl.py stop`)。**記録した PID(作成時刻・コマンドラインまで一致するもの)だけ**を停止する(Ctrl+Break による正常停止 → `shutdown_grace_sec` + 20 秒を過ぎたら、その PID と子だけを強制終了)。`python.exe` の一括終了はしない。共有 `server.yaml` は変更しない。
+- **スタートアップ**: **起動バッチのショートカットだけ**を、ユーザーのスタートアップフォルダ(`%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup`)に置く。停止用のショートカットは**スタートアップに置かず**、デスクトップに置く。
+  **自動起動は、このユーザーのログオン後に限る**(PC の起動だけ・ログオフ中は起動しない。サービス・タスクスケジューラは使わない)。ログオフ・再起動で API は止まる。
+- **URL の確認**: 管理画面の「現在の設定」(API の URL・プロトコル・許可クライアント)と、起動時の表示(`prod_server.py serve` のコンソール出力、`prod_ctl.py start` の出力)。運用ログはアドレスを伏せ字にするため、URL は出さない。
+
 ## 10. テスト
 `inference_server/tests/test_prod_config_model.py`・`test_prod_publish.py`・`test_prod_api.py`・`test_prod_waitress.py`(Flask の test client に加えて、**Waitress を別スレッド・loopback・一時設定・FakeBackend で起動した実通信**。`/health`・`/predict` の契約、許可外接続の拒否、上限(同時 /predict・順番待ち・本文/ヘッダー)、正常停止(実行中の推論の完了・猶予超過・新規接続の拒否)、実際のプロセスへのシグナルによる停止、停止をまたいだ `server.yaml` の扱い、ログの非漏えいとローテーション)と、`tests/test_api_preflight.py`(モデル照合)。モデル・GPU・外部通信・共有・本番 `server.yaml`・実製番は使わない。`serve()` と Waitress のテストは、`waitress` が入っていない環境ではスキップする。
 
