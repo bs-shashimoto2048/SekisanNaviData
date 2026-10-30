@@ -547,6 +547,7 @@ def _serve(cfg, publish_config, replace_stale, backend_factory, on_started, inst
     log.info("待ち受けを開始しました(Waitress): threads=%d max_pending_predict=%d backlog=%d connection_limit=%d channel_timeout=%ds "
              "queue_wait=%ds shutdown_grace=%ds allowed_clients=%d publish=%s", L.threads, L.max_pending_predict, L.backlog,
              L.connection_limit, L.channel_timeout_sec, L.queue_wait_sec, L.shutdown_grace_sec, len(cfg.allowed_clients), publish_config)
+    print(f"待ち受けを開始しました: http://{cfg.host}:{cfg.port}(HTTP)", flush=True)     # 起動時の表示(運用ログはアドレスを伏せ字にするため、コンソールにだけ URL を出す)
     exit_code = {"v": 0}
 
     def load():

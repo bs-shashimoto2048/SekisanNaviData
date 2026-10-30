@@ -31,6 +31,7 @@
   <section>
     <h2>現在の設定(prod_server.local.yaml)</h2>
     <div id="current" class="note">読み込み中…</div>
+    <div id="apiInfo" class="note" style="margin-top:8px"></div>
   </section>
 
   <section>
@@ -283,6 +284,11 @@
     $("logStorage").textContent = st.logging.storage_error || "";
     ["logFile", "logMib", "logBackups"].forEach(function (i) { $(i).oninput = updateLogTotal; });
   }
+  function buildApi() {
+    var a = st.api, box = $("apiInfo"); clear(box);
+    box.appendChild(el("div", a.url ? "API の URL: " + a.url + "(" + a.protocol + ")" : "API の URL: 未設定(bind.host / bind.port が空欄です)", a.url ? "ok" : "ng"));
+    box.appendChild(el("div", "許可クライアント: " + (a.allowed_clients.length ? a.allowed_clients.join(", ") : "未設定")));
+  }
   function buildClientTimeout() {
     var c = st.client_timeout; $("ctText").textContent = c.text;
     var t = $("ctTable"); clear(t);
@@ -308,7 +314,7 @@
     api("POST", path, body).then(function (r) { showResult(boxId, r); if (done) done(r); })
       .catch(function () { $(boxId).textContent = "処理に失敗しました。"; }).then(function () { busy = false; });
   }
-  function reload() { return api("GET", "/api/state").then(function (s) { if (s.ok) { st = s.settings; buildPerf(); buildLog(); buildClientTimeout(); } }); }
+  function reload() { return api("GET", "/api/state").then(function (s) { if (s.ok) { st = s.settings; buildPerf(); buildLog(); buildClientTimeout(); buildApi(); } }); }
 
   $("perfValidate").onclick = function () { run("/api/settings/validate", perfBody(), "perfMsg"); };
   $("perfSave").onclick = function () { run("/api/settings/save", perfBody(), "perfMsg", function (r) { if (r.saved) { reload().then(function () { showResult("perfMsg", r); }); } }); };
