@@ -66,6 +66,7 @@ class CtlBase(ProdBase):
         self.run_dir = self.root / "run"
         self.ps = FakePsutil(HOST)
         self.lines, self.spawned, self.breaks, self.now = [], [], [], [0.0]
+        self.spawn_extra = []
         self.health_script = []              # 呼ばれるたびに先頭から返す(最後の値は繰り返す)
         self.proc_state = {"rc": None}
 
@@ -82,9 +83,10 @@ class CtlBase(ProdBase):
                 raise item
             return item
 
-        def spawn(cfg_path):
+        def spawn(cfg_path, extra=()):
             pid = 4000 + len(self.spawned)
-            proc = self.ps.add(pid, ["python", str(HERE / "prod_server.py"), "serve", "--config", str(cfg_path)], create_time=2000.0 + len(self.spawned))
+            self.spawn_extra.append(list(extra))
+            proc = self.ps.add(pid, ["python", str(HERE / "prod_server.py"), "serve", "--config", str(cfg_path), *extra], create_time=2000.0 + len(self.spawned))
             self.spawned.append(pid)
             self.ps.add(pid + 500, ["python", "real"], 2000.5)                       # venv ランチャーの子(実体のインタープリター)
             self.ps.kids[pid] = [pid + 500]
@@ -120,6 +122,35 @@ class StartTest(CtlBase):
         self.assertIn("設定と一致", self.text())
         self.assertFalse((self.run_dir / "prod_api.start.lock").exists())              # ロックは解放される
         self.assertTrue((self.run_dir / "last_start.txt").is_file())
+
+    def test_publish_is_off_by_default_and_only_passed_when_explicit(self):
+        self.spawn_extra = []
+        self.health_script = [self.health_ok()]
+        self.assertEqual(self.make().start(), prod_ctl.EXIT_OK)
+        self.assertEqual(self.spawn_extra, [[]])                                        # 既定: 公開しない(スタートアップのバッチと同じ)
+        self.assertNotIn("--publish-config", " ".join(self.ps.procs[self.spawned[0]].cmd))
+
+    def test_explicit_publish_and_replace_stale_are_passed_to_serve(self):
+        self.spawn_extra = []
+        self.health_script = [self.health_ok()]
+        self.assertEqual(self.make().start(publish_config=True, replace_stale=True), prod_ctl.EXIT_OK)
+        self.assertEqual(self.spawn_extra, [["--publish-config", "--replace-stale"]])
+        self.assertIn("接続設定の公開を明示して起動します", self.text())
+
+    def test_publish_is_not_applied_to_an_already_running_api(self):
+        self.spawn_extra = []
+        self.health_script = [self.health_ok()]
+        self.assertEqual(self.make().start(), prod_ctl.EXIT_OK)
+        self.assertEqual(self.make().start(publish_config=True), prod_ctl.EXIT_OK)
+        self.assertEqual(self.spawn_extra, [[]])                                        # 2 回目は何も起動しない
+        self.assertIn("公開(--publish-config)は行いません", self.text())
+
+    def test_command_line_rules_for_the_publish_options(self):
+        for argv in (["start", "--replace-stale"], ["stop", "--publish-config"], ["status", "--replace-stale", "--publish-config"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit) as cm:
+                    prod_ctl.main(argv)
+                self.assertEqual(cm.exception.code, 2)
 
     def test_second_start_does_not_start_a_second_process(self):
         self.health_script = [self.health_ok()]
@@ -291,7 +322,8 @@ class BatchFilesTest(unittest.TestCase):
 
     def test_the_controller_never_publishes_the_shared_server_yaml(self):
         src = (HERE / "prod_ctl.py").read_text(encoding="utf-8")
-        self.assertNotIn('"--publish-config"', src)
+        self.assertIn("publish_config: bool = False", src)                                  # 公開は、明示した指定のときだけ(既定は False)
+        self.assertNotIn("publish_config=True", src)
         self.assertNotIn("taskkill", src.lower())
 
 

@@ -71,7 +71,7 @@ class Controller:
             body = {}
         return r.status_code, body
 
-    def _default_spawn(self, cfg_path):
+    def _default_spawn(self, cfg_path, extra_args=()):
         flags = 0
         startup = None
         if os.name == "nt":
@@ -79,7 +79,7 @@ class Controller:
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup.wShowWindow = 0                                                       # SW_HIDE
-        p = subprocess.Popen([sys.executable, "-X", "utf8", str(HERE / "prod_server.py"), "serve", "--config", str(cfg_path)], cwd=str(HERE),
+        p = subprocess.Popen([sys.executable, "-X", "utf8", str(HERE / "prod_server.py"), "serve", "--config", str(cfg_path), *extra_args], cwd=str(HERE),
                              creationflags=flags, startupinfo=startup, stdin=subprocess.DEVNULL)
         return p
 
@@ -200,7 +200,8 @@ class Controller:
             pass
 
     # ---- start
-    def start(self) -> int:
+    def start(self, publish_config: bool = False, replace_stale: bool = False) -> int:
+        """`publish_config` / `replace_stale` は、利用者が明示したときだけ(既定は公開しない。スタートアップのバッチは指定しない)。prod_server.py serve へそのまま渡す。"""
         cfg = self.load()
         if cfg is None:
             return EXIT_CONFIG
@@ -208,13 +209,15 @@ class Controller:
             self.say(MESSAGES[EXIT_BUSY_START])
             return EXIT_BUSY_START
         try:
-            return self._start_locked(cfg)
+            return self._start_locked(cfg, publish_config, replace_stale)
         finally:
             self._release_lock()
 
-    def _start_locked(self, cfg) -> int:
+    def _start_locked(self, cfg, publish_config: bool = False, replace_stale: bool = False) -> int:
         rec = self._record()
         if rec and self.is_our_process(*rec):                                    # すでに起動している(二重起動しない)
+            if publish_config:
+                self.say("API はすでに起動しているため、接続設定の公開(--publish-config)は行いません。いったん停止してから、もう一度実行してください。")
             status, body = self.health(cfg)
             if status == 200 and body.get("ready"):
                 self.say(f"API はすでに起動しています(PID {rec[0]}): {self.url(cfg)}  health=ok  モデル={body.get('model', {}).get('weights_sha256_12', '?')}")
@@ -232,7 +235,10 @@ class Controller:
         if self._listening_on(cfg) is not None:
             self.say(MESSAGES[EXIT_PORT])
             return EXIT_PORT
-        proc = self._spawn(self.config_path)
+        extra = (["--publish-config"] if publish_config else []) + (["--replace-stale"] if replace_stale else [])
+        if extra:
+            self.say("接続設定の公開を明示して起動します: " + " ".join(extra) + "(準備完了のあとに、共有 server.yaml を、バックアップを作ってから更新します)")
+        proc = self._spawn(self.config_path, extra) if extra else self._spawn(self.config_path)
         try:
             create_time = self._write_pid(proc.pid)
         except Exception:  # noqa: BLE001
@@ -361,9 +367,17 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="本番推論 API の起動・停止・状態確認")
     ap.add_argument("action", choices=("start", "stop", "status"))
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
+    ap.add_argument("--publish-config", action="store_true", help="start のとき、準備完了後に共有 server.yaml を更新する(明示したときだけ。既定は公開しない)")
+    ap.add_argument("--replace-stale", action="store_true", help="--publish-config のとき、既存の接続先が接続を明示的に拒否する(古い設定)場合に置き換えを許可する")
     args = ap.parse_args(argv)
+    if args.action != "start" and (args.publish_config or args.replace_stale):
+        ap.error("--publish-config / --replace-stale は start のときだけ指定できます")
+    if args.replace_stale and not args.publish_config:
+        ap.error("--replace-stale は --publish-config と一緒に指定してください")
     c = Controller(args.config)
-    return {"start": c.start, "stop": c.stop, "status": c.status}[args.action]()
+    if args.action == "start":
+        return c.start(publish_config=args.publish_config, replace_stale=args.replace_stale)
+    return {"stop": c.stop, "status": c.status}[args.action]()
 
 
 if __name__ == "__main__":
