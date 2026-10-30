@@ -706,6 +706,8 @@ def _make_display_previews(ctx: ProductContext) -> Optional[ProductResult]:
             lambda page: page_pdf_name(ctx, page),
             print_support.SPEC_PDF_NAME,
             print_support.CHECK_SHEET_PDF_NAME,
+            log=ctx.logger.info,
+            warn=ctx.logger.warning,
         )
     except display_previews.DisplayPreviewError as exc:
         ctx.logger.error(" └> [表示用PNG] PDFから表示用画像を作成できませんでした(%s)" % type(exc).__name__)
