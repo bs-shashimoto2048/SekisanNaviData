@@ -230,7 +230,19 @@ python prod_admin.py --config prod_server.local.yaml [--port 8790]      # http:/
 - **漏えい防止**: 応答・画面にはファイル名だけ。ハッシュは先頭 12 桁だけ(全文は設定ファイルにだけ書く)。パスを返すのは「参照…」で選んだ値を入力欄へ入れるときだけ(ローカル画面のみ)。アクセスログは出さない。
   PyTorch のファイルは、先頭の形式(zip / pickle)を見るだけで読み込まない(pickle を実行しない)。
 - **check の注意**: `check` は従来どおり読み取り専用だが、設定に `publish.server_yaml` が書いてある場合は、既存の `server.yaml`(共有)を**読み取り**、その接続先へ `/health` を 1 回送る(§5)。共有側に触れたくない間は、`publish` を未設定のままにする(その場合 check は設定エラーで止まる)。
-- テスト: `inference_server/tests/test_prod_admin.py`(合成データ・一時フォルダ・loopback。ファイル選択〔runner 差し替え〕・UNC・存在しないファイル・不正形式・`model.yaml` の不一致・サイズ/SHA 自動取得・保存・check・LAN 拒否・非漏えい)。
+- **性能(`server:` 節)の設定**: 画面の「性能(Waitress の上限)」で、7 項目(`threads`・`max_pending_predict`・`queue_wait_sec`・`backlog`・`connection_limit`・`channel_timeout_sec`・`shutdown_grace_sec`)を編集・保存する。すべて §6.5.1 の項目で、`prod_server` が実際に使う(画面だけの設定は作らない)。
+  各項目に、日本語の短い説明と単位を表示する。**初期値(低負荷寄り)**: threads 2・max_pending_predict 1(推論の同時実行は 1 件)・queue_wait_sec 30・backlog 4・connection_limit 8・channel_timeout_sec 30・shutdown_grace_sec 60。
+  設定ファイルにこれらが無い(または一部だけ)ときは、**表示だけ**初期値にし、**「性能を保存」を押したときだけ**書き込む(表示では書かない)。
+  範囲と大小関係の検証は、サーバー側(`prod_config.LIMIT_RANGES` と `_limits`。設定の検証そのもの)と画面側(同じ範囲の表)の両方で行い、範囲外・`max_pending_predict` ≥ `threads`・`connection_limit` < `threads` + 2 では保存できない。
+- **ログ(`logging:` 節)の設定**: 画面の「ログ」で、保存先(`file`)・1 ファイルの最大サイズ(`max_bytes`。画面は MiB)・残す世代数(`backup_count`)を編集・保存する。ログレベル(`level`)は既存の値を保持し(無ければ INFO)、画面には表示だけする。
+  **初期値**: 設定ファイルと同じフォルダ配下の `logs\prod_api.log`・10 MiB・5 世代(最大保存量の目安 = 最大サイズ × (世代数 + 1) = **約 60 MiB**。画面に常に表示)。ログの**保管期間(日数)の設定は実装に無く**、未使用の項目は作らない。サイズ上限と世代数で管理する(画面にも明示)。
+  保存先は、設定の検証(ローカルの絶対パス・`..` 不可・出力ルート/`server.yaml`/退避先/モデルのフォルダの配下は不可)に加え、**書き込み先のローカル検査**(`require_local_dir`。UNC・ネットワークドライブ・リンク/ジャンクション経由を固定文で拒否)を、**保存時**・**管理画面の起動時**(不正でも画面は起動して警告を出し、直せるようにする)に行う。
+  さらに **API 側**(`prod_server.py` の `check` と `serve`)も、同じ検査でログの置き場所がローカルと証明できなければ、`serve` は固定文で起動を拒否(終了コード 2)し、`check` は `ok: false`(`logging.location_is_local`)にする。
+- **保存の方式**: 性能・ログとも、保存した節だけを置き換え(`model:`・`output_root` などほかの節とコメント・改行コードは保つ)、保存前に同じフォルダへバックアップを作り、YAML・値・ほかの節が変わらないことを検証してから、一時ファイル + `os.replace` で原子的に置換する。保存しても API の起動・再起動・公開はしない。
+- **クライアント側タイムアウト(`api.request_timeout`)**: **本番 API(`prod_server.local.yaml`)の設定ではない**。データ作成側(製番処理。`pipeline/settings.py` の `parse_request_timeout`・`app.py`→`product_flow.step4_detect_objects`)が、**`app.local.yaml` の `api:` 節の `request_timeout`**(秒)から読む。8765 の運用画面は、この項目を編集できない(出力先と定期実行だけを編集し、動作チェックで値の形式を確認するだけ)。
+  このため管理画面には**説明だけ**を表示し、`prod_server.local.yaml` には見かけだけの項目を作らない。編集は `app.local.yaml`(Git 管理外のローカル設定)を直接編集する。**推奨値は 180 秒**: API 側の順番待ち(`queue_wait_sec` 30 秒)と 1 ページの推論時間(合成画像で初回約 21 秒・以降約 1 秒。実図面は未測定)の合計を十分に上回り、API の停止待ち(`shutdown_grace_sec` 60 秒)より長くして、通常の遅延でクライアントが先に諦めない(製番を失敗にしない)ための値。省略すると、応答が無くても待ち続ける。
+- テスト: `inference_server/tests/test_prod_admin.py`(合成データ・一時フォルダ・loopback。ファイル選択〔runner 差し替え〕・UNC・存在しないファイル・不正形式・`model.yaml` の不一致・サイズ/SHA 自動取得・保存・check・LAN 拒否・非漏えい)、
+  `test_prod_admin_settings.py`(性能・ログ: 初期値の表示と無書き込み、範囲・大小関係の検証〔画面側とサーバー側の一致〕、保存・再読込・ほかの節の保持・バックアップ・原子的保存、ローカル以外のログ先〔UNC・ネットワーク/取り外し可能ドライブ・ジャンクション・シンボリックリンク〕の拒否、起動時の検査、`api.request_timeout` を作らないこと)。
 
 ## 7. `/predict` の入力検証と出力
 - `page_nmb`: 数字 1〜6 桁。`extension`: `png`・`jpeg`・`jpg`。
