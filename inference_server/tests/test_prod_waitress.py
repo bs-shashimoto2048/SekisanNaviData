@@ -355,6 +355,19 @@ class WaitressShutdownTest(ProdBase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), before)
 
+    def test_a_normal_start_without_the_publish_option_never_touches_an_existing_server_yaml(self):
+        # prod_ctl start は、公開オプションが無ければ `serve`(--publish-config なし)を起動する。その通常起動・稼働・停止で、共有の server.yaml を変えない
+        self.server_yaml.write_text("host:\n  ip: 10.0.0.9\n  pc_ip: 10.0.0.9\n  port: 7108\nproxy:\n  host: proxy.example\n  port: 80\n", encoding="utf-8")
+        before, tree = self.server_yaml.read_bytes(), sorted(p.name for p in self.pub_dir.iterdir())
+        mtime = self.server_yaml.stat().st_mtime_ns
+        run = Running(self, self.cfg()).start()
+        self.assertEqual(run.get("/health").status_code, 200)
+        self.assertEqual(run.stop(), 0)
+        self.assertEqual(self.server_yaml.read_bytes(), before)
+        self.assertEqual(self.server_yaml.stat().st_mtime_ns, mtime)                            # 書き換えも(同じ内容での上書きも)していない
+        self.assertEqual(sorted(p.name for p in self.pub_dir.iterdir()), tree)                  # ロック・一時ファイルも作らない
+        self.assertFalse(self.backup_dir.exists() and any(self.backup_dir.iterdir()))           # 退避も作らない
+
     def test_load_failure_and_publish_failure_still_stop_cleanly_with_waitress(self):
         def boom(c, d):
             raise RuntimeError("CUDA failed")
