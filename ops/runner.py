@@ -109,7 +109,9 @@ class RunManager:
     def __init__(self, state_dir, store: SettingsStore, history: History, main_func: Callable,
                  config_path: Optional[str] = None,
                  com_init: Callable = com_mod.co_initialize, com_uninit: Callable = com_mod.co_uninitialize,
-                 output_guard: Optional[Callable] = None):
+                 output_guard: Optional[Callable] = None, code_guard: Optional[Callable] = None):
+        # code_guard(): 手動実行の開始前に、起動後のコード更新(古いコードのままの常駐プロセス)を検出する(更新されていれば SettingsError)。None なら確認しない(従来どおり。暫定運用など)
+        self.code_guard = code_guard
         # output_guard(root, source): 手動実行の出力先を、実行を始める前に確認する(違えば SettingsError)。None なら確認しない(従来どおり。暫定運用など)
         self.output_guard = output_guard
         self.com_init = com_init              # app.main(ホスト DB は COM)を呼ぶスレッドで、呼ぶ前に初期化する
@@ -172,6 +174,8 @@ class RunManager:
     def start_manual(self, product, output_root: Optional[str] = None) -> Tuple[str, threading.Thread]:
         """指定した 1 製番を、別スレッドで 1 回処理する。二重起動は Busy。入力が不正なら SettingsError。"""
         product = validate_product_no(product)
+        if self.code_guard is not None:         # 履歴・ロック・スレッド・フォルダ作成・印刷・API 呼び出しより前に、起動時のコードのままか確認する
+            self.code_guard()
         from_field = bool((output_root or "").strip())
         root = (output_root or "").strip() or self.store.load().output_root
         if root:

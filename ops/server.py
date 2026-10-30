@@ -28,6 +28,7 @@ class AppContext:
     config_path: str
     run_checks: Callable = checks_mod.run_checks
     picker: FolderPicker = field(default_factory=FolderPicker)
+    code_check: Optional[Callable] = None      # 動作チェックに加える「実行中のコードの版」の項目(ops.code_version.CodeVersionGuard.check_item)
 
 
 def make_handler(ctx: AppContext):
@@ -171,7 +172,10 @@ def make_handler(ctx: AppContext):
 
         def _do_checks(self):
             settings = ctx.store.load()
-            return {"ok": True, "results": ctx.run_checks(ctx.config_path, settings)}
+            results = ctx.run_checks(ctx.config_path, settings)
+            if ctx.code_check is not None:
+                results = list(results) + [ctx.code_check()]
+            return {"ok": True, "results": results}
 
         def _do_run(self):
             body = self._body()
