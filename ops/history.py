@@ -45,12 +45,15 @@ class History:
             with open(self.path, "a", encoding="utf-8", newline="") as f:
                 f.write(line + "\n")
 
-    def start(self, kind: str, product: str) -> str:
-        """実行の開始を記録して id を返す。"""
+    def start(self, kind: str, product: str, reason: str = "", targets: Optional[List[str]] = None) -> str:
+        """実行の開始を記録して id を返す。reason は開始時点の説明、targets は今回の対象一覧(定期実行の確定した対象。省略可)。"""
         with self._lock:
             self._seq += 1
             run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{os.getpid()}-{self._seq}"
-        self._append({"id": run_id, "started": self._now(), "kind": kind, "product": product, "status": RUNNING, "reason": ""})
+        event = {"id": run_id, "started": self._now(), "kind": kind, "product": product, "status": RUNNING, "reason": sanitize_reason(reason)}
+        if targets is not None:
+            event["targets"] = [str(t) for t in targets]
+        self._append(event)
         return run_id
 
     def finish(self, run_id: str, status: str, reason: str = ""):
