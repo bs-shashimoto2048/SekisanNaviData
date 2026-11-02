@@ -20,7 +20,8 @@ import yaml  # noqa: E402
 from ops import runner as runner_mod, scheduler as scheduler_mod  # noqa: E402
 from ops.history import COMPLETED, FAILED, History  # noqa: E402
 from ops.runner import NO_TARGET_LABEL, SKIPPED, Busy, RunManager  # noqa: E402
-from ops.scheduled_plan import REASON_DONE, REASON_NOT_CONFIGURED, REASON_OVER_LIMIT, build_plan  # noqa: E402
+from ops.scheduled_plan import (DEMOTE_AFTER, REASON_DONE, REASON_NOT_CONFIGURED, REASON_OVER_LIMIT, build_plan, failure_streaks,  # noqa: E402
+                                results_from)
 from ops.settings_store import (MAX_SCHEDULED_MINUTES_LIMIT, MAX_SCHEDULED_PRODUCTS_LIMIT, OpsSettings, SettingsError,  # noqa: E402
                                 SettingsStore, validate)
 from test_main_integration import PRODUCT, MainIntegrationBase  # noqa: E402
@@ -391,7 +392,7 @@ class EntryPointTest(Base):
         runs = SimpleNamespace(run_scheduled_targeted_dry_run=lambda: "完了", refusal=None, last_plan=plan)
         code, out, err = self.run_cli(runs, dry=True)
         self.assertEqual(code, 0)
-        self.assertIn("今回の対象: " + ", ".join(LISTED[:2]), out)
+        self.assertIn("今回の対象(この順): " + ", ".join(LISTED[:2]), out)
         self.assertIn("定期タスクの実行先", out)
         self.assertIn("別の場所", out)                                         # mismatch の説明
 
@@ -404,6 +405,214 @@ class EntryPointTest(Base):
         self.assertIsInstance(ctx.runs.output_guard, OutputGuard)
         self.assertIsInstance(ctx.runs.code_guard, CodeVersionGuard)
         self.assertTrue(callable(ctx.runs.output_dir_resolver))
+
+
+class OrderingAndResultsTest(Base):
+    """失敗・スキップが続く製番が、毎回の件数上限を占有しないこと(後ろに回す)と、製番ごとの結果の記録。"""
+
+    def run_with(self, outcomes, cap=1, retry=(), listed=None, n=1):
+        """定期実行を n 回行い、各回に処理した製番を返す。outcomes[p] = ok / fail / skip(未指定は ok)。ok は出力フォルダができる(処理済み)。"""
+        self.settings(scheduled_products=listed or LISTED[:4], scheduled_max_products=cap, scheduled_retry_products=list(retry))
+        seen = []
+
+        def main(**kw):
+            seen.append(list(kw["products"]))
+            res = {"completed": [], "failed": {}, "skipped": {}}
+            for p in kw["products"]:
+                what = outcomes.get(p, "ok")
+                if what == "ok":
+                    self.done.add(p)
+                    res["completed"].append(p)
+                elif what == "fail":
+                    res["failed"][p] = "RuntimeError: 製番固有の失敗"
+                else:
+                    res["skipped"][p] = "処理対象外"
+            return res
+        mgr = self.manager(main)
+        for _ in range(n):
+            mgr.run_scheduled_targeted()
+        return seen, mgr
+
+    def test_a_head_product_that_keeps_failing_does_not_starve_the_rest_with_a_cap_of_one(self):
+        seen, _ = self.run_with({LISTED[0]: "fail"}, cap=1, n=7)
+        # 連続 2 回に達するまでは先頭のまま(従来どおり)→ 達したら後ろに回る → 後続が順に処理され → 最後に再試行される
+        self.assertEqual([x[0] for x in seen], [LISTED[0], LISTED[0], LISTED[1], LISTED[2], LISTED[3], LISTED[0], LISTED[0]])
+
+    def test_a_head_product_that_keeps_being_skipped_is_handled_the_same_way(self):
+        seen, _ = self.run_with({LISTED[0]: "skip"}, cap=1, n=5)
+        self.assertEqual([x[0] for x in seen], [LISTED[0], LISTED[0], LISTED[1], LISTED[2], LISTED[3]])
+
+    def test_the_order_and_existing_behaviour_are_kept_until_two_consecutive_failures(self):
+        seen, mgr = self.run_with({LISTED[0]: "fail"}, cap=2, n=1)
+        self.assertEqual(seen, [[LISTED[0], LISTED[1]]])                       # 1 回の失敗では並べ替えない
+        self.assertEqual(mgr.last_plan.deferred, ())
+        mgr.run_scheduled_targeted()                                            # 2 回目: 連続は 1 回なので、先頭のまま(処理済みの製番は除かれる)
+        self.assertEqual(seen[1], [LISTED[0], LISTED[2]])
+
+    def test_a_failure_followed_by_a_success_resets_the_streak(self):
+        self.settings(scheduled_products=LISTED[:3], scheduled_max_products=1)
+        mgr = self.manager(lambda **kw: {"completed": [], "failed": {kw["products"][0]: "x"}, "skipped": {}})
+        mgr.run_scheduled_targeted()
+        runs = self.history.runs(limit=None)
+        self.assertEqual(failure_streaks(runs, [LISTED[0]])[LISTED[0]], 1)
+        self.history.start("定期", LISTED[0], targets=[LISTED[0]])
+        rid = self.history.runs(limit=None)[0]["id"]
+        self.history.finish(rid, "完了", "", results={LISTED[0]: {"status": "完了"}})
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), [LISTED[0]])[LISTED[0]], 0)
+
+    def test_completed_products_are_still_excluded(self):
+        self.done = {LISTED[0]}
+        seen, _ = self.run_with({}, cap=2, n=1)
+        self.assertEqual(seen, [[LISTED[1], LISTED[2]]])
+
+    def test_deferred_products_are_not_deleted_and_are_retried_when_slots_remain(self):
+        seen, mgr = self.run_with({LISTED[0]: "fail"}, cap=8, listed=LISTED[:3], n=3)
+        self.assertEqual(seen[2], [LISTED[0]])                                 # 後続は処理済み。残った枠で、後ろに回した製番が再試行される
+        self.assertEqual(self.store.load().scheduled_products, tuple(LISTED[:3]))   # リストからは消さない
+
+    def test_environment_wide_failures_do_not_count_against_a_product(self):
+        self.settings(scheduled_products=LISTED[:3], scheduled_max_products=3)
+        mgr = self.manager(lambda **kw: {"completed": [], "failed": {p: "推論 API を利用できません" for p in kw["products"]}, "skipped": {}})
+        for _ in range(4):
+            mgr.run_scheduled_targeted()
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:3]), {p: 0 for p in LISTED[:3]})
+        self.assertEqual(mgr.last_plan.deferred, ())
+        self.assertTrue(all(r["scope"] == "run" for r in self.history.runs()[0]["results"].values()))
+
+    def test_whole_run_exceptions_and_time_limit_skips_do_not_count(self):
+        self.settings(scheduled_products=LISTED[:2], scheduled_max_products=2)
+
+        def boom(**kw):
+            raise RuntimeError("全体の失敗")
+        for _ in range(3):
+            self.manager(boom).run_scheduled_targeted()
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:2]), {LISTED[0]: 0, LISTED[1]: 0})
+        late = lambda **kw: {"completed": [], "failed": {}, "skipped": {p: "実行時間の上限に達したため開始しませんでした" for p in kw["products"]}}
+        for _ in range(3):
+            self.manager(late).run_scheduled_targeted()
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:2]), {LISTED[0]: 0, LISTED[1]: 0})
+
+    def test_retry_setting_returns_a_deferred_product_to_the_normal_order(self):
+        seen, mgr = self.run_with({LISTED[0]: "fail"}, cap=1, n=3)
+        self.assertEqual(seen[2][0], LISTED[1])                                 # 後ろに回っている
+        self.settings(scheduled_products=LISTED[:4], scheduled_max_products=1, scheduled_retry_products=[LISTED[0]])
+        m = self.manager()
+        m.run_scheduled_targeted_dry_run()
+        self.assertEqual(m.last_plan.targets, (LISTED[0],))                    # 再試行の指定で通常の順序(先頭)に戻る
+        self.assertEqual(m.last_plan.deferred, ())
+
+    def test_results_are_recorded_per_product_and_distinguish_not_started(self):
+        self.settings(scheduled_products=LISTED[:4], scheduled_max_products=4)
+        mgr = self.manager(lambda **kw: {"completed": [LISTED[0]], "failed": {LISTED[1]: "RuntimeError: x"},
+                                         "skipped": {LISTED[2]: "処理対象外", LISTED[3]: "実行時間の上限に達したため開始しませんでした"}})
+        mgr.run_scheduled_targeted()
+        r = self.history.runs()[0]["results"]
+        self.assertEqual({p: v["status"] for p, v in r.items()}, {LISTED[0]: "完了", LISTED[1]: "失敗", LISTED[2]: "スキップ", LISTED[3]: "未開始"})
+        self.assertNotIn("scope", r[LISTED[1]])                                # 製番固有の失敗
+        self.assertEqual(self.history.runs()[0]["targets"], LISTED[:4])
+
+    def test_a_history_with_the_old_finish_signature_still_works_for_manual_and_legacy_runs(self):
+        """暫定運用(interim)は、finish(run_id, status, reason) だけを受け取る自前の履歴を渡す。従来の全件処理・手動実行は、その呼び出し形のまま。"""
+        calls = []
+
+        class OldHistory:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def start(self, kind, product):
+                return self.inner.start(kind, product)
+
+            def finish(self, run_id, status, reason=""):
+                calls.append((status, reason))
+                return self.inner.finish(run_id, status, reason)
+
+            def events(self):
+                return self.inner.events()
+        mgr = RunManager(self.state, self.store, OldHistory(self.history), self.main, config_path="cfg.yaml",
+                         com_init=lambda: None, com_uninit=lambda: None)
+        self.assertEqual(mgr.run_scheduled(), COMPLETED)
+        mgr.start_manual("A1TEST0001")[1].join(5)
+        self.assertEqual([c[0] for c in calls], ["完了", "完了"])
+
+    def test_results_are_not_recorded_for_manual_runs(self):
+        mgr = self.manager()
+        mgr.start_manual("A1TEST0001")[1].join(5)
+        self.assertNotIn("results", self.history.runs()[0])
+
+    def test_dry_run_shows_the_same_order_and_the_reason_as_the_real_run(self):
+        for _ in range(2):                                                      # 先頭が 2 回連続で失敗した履歴を作る
+            self.run_with({LISTED[0]: "fail"}, cap=1, n=1)
+            self.done.clear()
+        self.settings(scheduled_products=LISTED[:4], scheduled_max_products=3)
+        dry = self.manager(main=mock.Mock(side_effect=AssertionError("dry-run では app.main を呼ばない")))
+        self.assertEqual(dry.run_scheduled_targeted_dry_run(), COMPLETED)
+        dry_event = [r for r in self.history.runs() if r["kind"] == "定期(検証)"][0]
+        self.assertEqual(dry_event["targets"], [LISTED[1], LISTED[2], LISTED[3]])          # 並べ替え後(連続した製番は、枠があっても最後)
+        self.assertEqual(dry_event["deferred"], [{"product": LISTED[0], "streak": 2}])
+        self.assertTrue(any("2 回連続" in line and LISTED[0] in line for line in dry.last_plan.deferred_lines()))
+        self.settings(scheduled_products=LISTED[:4], scheduled_max_products=3)
+        real = self.manager()
+        real.run_scheduled_targeted()
+        self.assertEqual(self.calls[-1]["products"], dry_event["targets"])                # dry-run と実行時の対象が一致
+        self.assertEqual(real.last_plan.deferred, dry.last_plan.deferred)
+
+    def test_a_product_completed_by_a_concurrent_run_is_dropped_after_the_lock_and_does_not_waste_a_slot(self):
+        self.settings(scheduled_products=LISTED[:4], scheduled_max_products=2)
+        mgr = self.manager()
+        real_acquire = mgr.lock.acquire
+
+        def acquire_then_other_process_finishes(tag=""):
+            real_acquire(tag)
+            self.done.add(LISTED[0])                                             # ロック取得の直前〜直後に、並行処理が先頭の製番を完了した
+        mgr.lock.acquire = acquire_then_other_process_finishes
+        self.assertEqual(mgr.run_scheduled_targeted(), COMPLETED)
+        self.assertEqual(self.calls[0]["products"], [LISTED[1], LISTED[2]])       # 枠(2 件)は、次の製番で埋まる
+        self.assertEqual(self.history.runs()[0]["targets"], [LISTED[1], LISTED[2]])
+
+    def test_if_everything_became_done_after_the_lock_nothing_runs(self):
+        self.settings(scheduled_products=LISTED[:2], scheduled_max_products=2)
+        mgr = self.manager()
+        real_acquire = mgr.lock.acquire
+
+        def acquire_then_all_done(tag=""):
+            real_acquire(tag)
+            self.done.update(LISTED[:2])
+        mgr.lock.acquire = acquire_then_all_done
+        self.assertEqual(mgr.run_scheduled_targeted(), SKIPPED)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(mgr.status()["running"])
+
+    def test_the_dry_run_also_replans_after_taking_its_lock(self):
+        self.settings(scheduled_products=LISTED[:3], scheduled_max_products=2)
+        mgr = self.manager()
+        real_acquire = mgr.lock.acquire
+
+        def acquire_then_done(tag=""):
+            real_acquire(tag)
+            self.done.add(LISTED[0])
+        mgr.lock.acquire = acquire_then_done
+        mgr.run_scheduled_targeted_dry_run()
+        self.assertEqual(self.history.runs()[0]["targets"], [LISTED[1], LISTED[2]])
+
+
+class NormalizationTest(Base):
+    def test_products_are_normalized_to_upper_case_and_deduplicated_after_normalization(self):
+        saved = self.settings(scheduled_products=["a1test0002", "A1TEST0001", "A1test0002", " a1TEST0001 "], scheduled_retry_products=["a1test0003", "A1TEST0003"])
+        self.assertEqual(saved.scheduled_products, ("A1TEST0002", "A1TEST0001"))      # 最初の出現の順
+        self.assertEqual(saved.scheduled_retry_products, ("A1TEST0003",))
+        self.assertEqual(self.store.load().scheduled_products, ("A1TEST0002", "A1TEST0001"))   # 保存・再読込でも大文字のまま
+
+    def test_the_processed_targets_and_history_use_upper_case(self):
+        self.settings(scheduled_products=["a1test0001", "a1test0002"], scheduled_max_products=2)
+        self.manager().run_scheduled_targeted()
+        self.assertEqual(self.calls[0]["products"], ["A1TEST0001", "A1TEST0002"])
+        self.assertEqual(self.history.runs()[0]["targets"], ["A1TEST0001", "A1TEST0002"])
+
+    def test_the_done_check_uses_the_upper_case_name(self):
+        self.done = {"A1TEST0001"}
+        self.settings(scheduled_products=["a1test0001", "a1test0002"], scheduled_max_products=2)
+        self.manager().run_scheduled_targeted()
+        self.assertEqual(self.calls[0]["products"], ["A1TEST0002"])
 
 
 class RealWiringTest(Base):

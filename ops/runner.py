@@ -10,7 +10,8 @@ from typing import Callable, Optional, Tuple
 
 from ops import com as com_mod
 from ops.history import COMPLETED, FAILED, KIND_MANUAL, KIND_SCHEDULED, KIND_SCHEDULED_CHECK, RUNNING, History, sanitize_reason
-from ops.scheduled_plan import ScheduledPlan, build_plan, default_is_done
+from ops.scheduled_plan import (DEADLINE_MARK, RESULT_FAILED, RESULT_NOT_STARTED, ScheduledPlan, build_plan, default_is_done, failure_streaks,
+                                results_from, run_level_results)
 from ops.settings_store import OpsSettings, SettingsError, SettingsStore, validate_product_no
 
 LOCK_FILE = "ops_run.local.lock"
@@ -21,7 +22,6 @@ SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
 DRY_RUN_OK_REASON = "検証のみ(dry-run): 起動・ロック・COM・設定の読込を確認しました。製番処理は実行していません"
 NO_TARGET_LABEL = "(対象なし)"
 UNRESOLVED_OUTPUT_REASON = "出力先を確認できないため、実行しませんでした(出力先の確認手段がありません)。製番フォルダの作成・印刷・API の呼び出しは行っていません。"
-DEADLINE_MARK = "実行時間の上限"          # app.main が、時間上限で開始しなかった製番に付ける理由に含まれる語
 
 
 class Busy(RuntimeError):
@@ -157,22 +157,38 @@ class RunManager:
             self.com_init()
         except Exception as e:  # noqa: BLE001 - 初期化できないときは app.main を実行しない
             status = FAILED
-            self.history.finish(run_id, status, f"COM を初期化できないため実行しませんでした({type(e).__name__})")
+            reason = f"COM を初期化できないため実行しませんでした({type(e).__name__})"
+            self._finish(run_id, status, reason, run_level_results(products, RESULT_NOT_STARTED, "COM を初期化できませんでした") if batch else None)
             return status
+        results = None                  # 定期実行(batch)だけ、製番ごとの結果を履歴に残す(完了・失敗・スキップ・未開始を区別する)
         try:
             res = self._call_main(products, output_root, stop_after)
             status, reason = self._summarize(res, product_label, batch)
+            if batch:
+                results = results_from(res, products)
         except Exception as e:  # noqa: BLE001 - どんな失敗も「完了」にしない
             status, reason = FAILED, f"{type(e).__name__}: {e}"
+            if batch:
+                results = run_level_results(products, RESULT_FAILED, "実行全体の失敗")
         except SystemExit:  # 下位モジュールの sys.exit()。履歴を「実行中」のまま残さない。終了コード・メッセージは記録しない(固定の理由)
             status, reason = FAILED, SYSTEM_EXIT_REASON
+            if batch:
+                results = run_level_results(products, RESULT_FAILED, "実行全体の失敗")
         finally:
             try:
                 self.com_uninit()      # 初期化したのと同じスレッドで必ず終了する
             except Exception:  # noqa: BLE001 - 終了処理の失敗で結果の記録を失わない
                 pass
-        self.history.finish(run_id, status, reason)
+        self._finish(run_id, status, reason, results)
         return status
+
+    def _finish(self, run_id: str, status: str, reason: str, results=None):
+        """履歴に終了を記録する。製番ごとの結果(results)は定期実行(batch)だけ。results が無いときは、従来どおりの呼び出し
+        (暫定運用 interim は、finish が results を受け取らない自前の履歴を渡すため、引数を増やさない)。"""
+        if results is None:
+            self.history.finish(run_id, status, reason)
+        else:
+            self.history.finish(run_id, status, reason, results=results)
 
     @staticmethod
     def _summarize(res: dict, product_label: str, batch: bool = False) -> Tuple[str, str]:
@@ -220,6 +236,12 @@ class RunManager:
         return run_id, t
 
     # ---- 定期実行 ----
+    def _make_plan(self, settings: OpsSettings, root: str) -> ScheduledPlan:
+        """今回の対象の確定。処理済み(出力先)と、直近の失敗・スキップの連続(履歴)を読んで並べ替える。副作用なし。"""
+        output_dir = self.output_dir_resolver(root)
+        streaks = failure_streaks(self.history.runs(limit=None), settings.scheduled_products)
+        return build_plan(settings, output_dir, self._is_done, streaks=streaks)
+
     def scheduled_preflight(self) -> Tuple[OpsSettings, str, ScheduledPlan]:
         """定期実行(本番・dry-run 共通)の検査と、今回の対象の確定。履歴・ロック・フォルダ作成・印刷・API 呼び出しより前に行う(副作用なし)。
         順序: 運用設定の読込(不正なら拒否)→ 実効出力先の照合(手動実行と同じ OutputGuard)→ 起動時のコード版の照合 → 今回の対象の確定。
@@ -233,8 +255,7 @@ class RunManager:
         if self.output_dir_resolver is None:
             raise SettingsError(UNRESOLVED_OUTPUT_REASON)   # 実効の出力先を確認できなければ、処理済みの判定ができないため始めない
         try:
-            output_dir = self.output_dir_resolver(root)
-            plan = build_plan(settings, output_dir, self._is_done)
+            plan = self._make_plan(settings, root)
         except SettingsError:
             raise
         except Exception as e:  # noqa: BLE001 - 理由は固定文(例外メッセージ・パスは出さない)
@@ -243,29 +264,54 @@ class RunManager:
         self.last_plan = plan
         return settings, root, plan
 
+    def _replan_under_lock(self, settings: OpsSettings, root: str) -> Optional[ScheduledPlan]:
+        """ロック取得後、実処理の直前に対象を作り直す(検査から、ここまでの間に、並行処理で処理済みになった製番が、上限の枠を無駄に使わないように)。
+        作り直せなければ None(呼び出し側は、何も処理せずに拒否する)。"""
+        try:
+            plan = self._make_plan(settings, root)
+        except Exception as e:  # noqa: BLE001
+            self.refusal = (f"ロック取得後に対象を確定し直せないため、実行しませんでした({type(e).__name__})。"
+                            "製番フォルダの作成・印刷・API の呼び出しは行っていません。")
+            return None
+        self.last_plan = plan
+        return plan
+
+    @staticmethod
+    def _deferred_of(plan: ScheduledPlan):
+        return [{"product": p, "streak": n} for p, n in plan.deferred]
+
     def run_scheduled_targeted(self) -> str:
         """定期実行(運用画面 ops_console のタスクスケジューラから起動)。設定に明示された製番リストだけを、件数・時間の上限内で処理する(出図リストからは追加しない)。
-        検査(設定・出力先・コード版)に通らなければ、履歴・ロック・フォルダ作成・印刷・API 呼び出しより前に拒否する(self.refusal に理由)。結果の状態を返す。"""
+        検査(設定・出力先・コード版)に通らなければ、履歴・ロック・フォルダ作成・印刷・API 呼び出しより前に拒否する(self.refusal に理由)。
+        失敗・スキップが続く製番は後ろに回し、ロック取得後に処理済み判定をやり直してから、確定した対象を履歴に記録して処理する。結果の状態を返す。"""
         self.refusal = None
         self.last_plan = None
         try:
-            _settings, root, plan = self.scheduled_preflight()
+            settings, root, plan = self.scheduled_preflight()
         except SettingsError as e:
             self.refusal = str(e)
             return FAILED
         if not plan.targets:                                # リスト未設定・空・全件処理済み: 何も処理せず、記録だけ残す(ロックは取らない)
-            run_id = self.history.start(KIND_SCHEDULED, NO_TARGET_LABEL, plan.summary(), targets=[])
+            run_id = self.history.start(KIND_SCHEDULED, NO_TARGET_LABEL, plan.summary(), targets=[], deferred=self._deferred_of(plan))
             self.history.finish(run_id, SKIPPED, plan.summary())
             return SKIPPED
-        label = ",".join(plan.targets)
         try:
             self.lock.acquire("scheduled")
         except Busy:
-            rid = self.history.start(KIND_SCHEDULED, label, targets=list(plan.targets))
+            rid = self.history.start(KIND_SCHEDULED, ",".join(plan.targets), targets=list(plan.targets))
             self.history.finish(rid, SKIPPED, "実行中のため開始しませんでした(二重起動の防止)")
             return SKIPPED
         try:
-            run_id = self.history.start(KIND_SCHEDULED, label, plan.summary(), targets=list(plan.targets))   # 今回の対象を、実行前に記録する
+            plan = self._replan_under_lock(settings, root)    # 実処理の直前に、処理済み判定をやり直す
+            if plan is None:
+                return FAILED
+            if not plan.targets:                             # 並行処理で、対象がすべて処理済みになった
+                run_id = self.history.start(KIND_SCHEDULED, NO_TARGET_LABEL, plan.summary(), targets=[], deferred=self._deferred_of(plan))
+                self.history.finish(run_id, SKIPPED, plan.summary())
+                return SKIPPED
+            label = ",".join(plan.targets)
+            run_id = self.history.start(KIND_SCHEDULED, label, plan.summary(), targets=list(plan.targets),
+                                        deferred=self._deferred_of(plan))   # 今回の対象を、実行前に記録する
             self.current = {"id": run_id, "kind": KIND_SCHEDULED, "product": label}
             deadline = time.monotonic() + plan.max_minutes * 60
             return self._execute(run_id, list(plan.targets), root, label, stop_after=deadline, batch=True)
@@ -274,13 +320,13 @@ class RunManager:
             self.lock.release()
 
     def run_scheduled_targeted_dry_run(self) -> str:
-        """run-scheduled --dry-run(タスクの起動経路の検証用)。本番と同じ検査(設定・出力先・コード版)と対象の確定を行い、その結果を履歴(種別「定期(検証)」)に
-        残す。ロック取得・COM の初期化と終了だけを行い、main_func(app.main)は呼ばない。製番・出力先・設定値は履歴の理由に記録しない(対象一覧は targets に残す)。
-        検査に通らなければ、履歴・ロックより前に拒否する(self.refusal に理由)。結果の状態を返す。"""
+        """run-scheduled --dry-run(タスクの起動経路の検証用)。本番と同じ検査(設定・出力先・コード版)と対象の確定(並べ替え・ロック後の再確認を含む)を行い、
+        その結果を履歴(種別「定期(検証)」)に残す。ロック取得・COM の初期化と終了だけを行い、main_func(app.main)は呼ばない。
+        製番・出力先・設定値は履歴の理由に記録しない(対象一覧は targets、後ろに回した製番は deferred に残す)。検査に通らなければ、履歴・ロックより前に拒否する。"""
         self.refusal = None
         self.last_plan = None
         try:
-            _settings, _root, plan = self.scheduled_preflight()
+            settings, root, plan = self.scheduled_preflight()
         except SettingsError as e:
             self.refusal = str(e)
             return FAILED
@@ -291,7 +337,11 @@ class RunManager:
             self.history.finish(rid, SKIPPED, "実行中のため開始しませんでした(二重起動の防止)")
             return SKIPPED
         try:
-            run_id = self.history.start(KIND_SCHEDULED_CHECK, DRY_RUN_LABEL, plan.summary(), targets=list(plan.targets))
+            plan = self._replan_under_lock(settings, root)    # 本番と同じく、ロック取得後に対象を確定し直す
+            if plan is None:
+                return FAILED
+            run_id = self.history.start(KIND_SCHEDULED_CHECK, DRY_RUN_LABEL, plan.summary(), targets=list(plan.targets),
+                                        deferred=self._deferred_of(plan))
             self.current = {"id": run_id, "kind": KIND_SCHEDULED_CHECK, "product": DRY_RUN_LABEL}
             try:
                 self.com_init()

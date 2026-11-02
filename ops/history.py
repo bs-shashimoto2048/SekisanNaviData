@@ -45,21 +45,28 @@ class History:
             with open(self.path, "a", encoding="utf-8", newline="") as f:
                 f.write(line + "\n")
 
-    def start(self, kind: str, product: str, reason: str = "", targets: Optional[List[str]] = None) -> str:
-        """実行の開始を記録して id を返す。reason は開始時点の説明、targets は今回の対象一覧(定期実行の確定した対象。省略可)。"""
+    def start(self, kind: str, product: str, reason: str = "", targets: Optional[List[str]] = None,
+              deferred: Optional[List[dict]] = None) -> str:
+        """実行の開始を記録して id を返す。reason は開始時点の説明、targets は今回の対象一覧(定期実行の確定した対象。省略可)、
+        deferred は「失敗・スキップが続いて後ろに回した製番」(`[{"product", "streak"}]`。省略可)。"""
         with self._lock:
             self._seq += 1
             run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{os.getpid()}-{self._seq}"
         event = {"id": run_id, "started": self._now(), "kind": kind, "product": product, "status": RUNNING, "reason": sanitize_reason(reason)}
         if targets is not None:
             event["targets"] = [str(t) for t in targets]
+        if deferred:
+            event["deferred"] = [{"product": str(d["product"]), "streak": int(d["streak"])} for d in deferred]
         self._append(event)
         return run_id
 
-    def finish(self, run_id: str, status: str, reason: str = ""):
+    def finish(self, run_id: str, status: str, reason: str = "", results: Optional[dict] = None):
+        """実行の終了を記録する。results は製番ごとの結果(定期実行だけ。`{製番: {"status", "reason", "scope"?}}`。status は 完了/失敗/スキップ/未開始)。"""
         started = next((e["started"] for e in self.events() if e["id"] == run_id), self._now())
-        self._append({"id": run_id, "started": started, "finished": self._now(), "status": status,
-                      "reason": sanitize_reason(reason)})
+        event = {"id": run_id, "started": started, "finished": self._now(), "status": status, "reason": sanitize_reason(reason)}
+        if results is not None:
+            event["results"] = {str(p): {k: (sanitize_reason(v, 80) if k == "reason" else v) for k, v in r.items()} for p, r in results.items()}
+        self._append(event)
 
     def events(self) -> List[dict]:
         if not self.path.is_file():

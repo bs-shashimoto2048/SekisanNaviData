@@ -78,7 +78,9 @@ def cmd_run_scheduled(args) -> int:
         plan = ctx.runs.last_plan
         if plan is not None:
             print(f"検査に合格しました(設定・出力先・コード版)。{plan.summary()}")
-            print("今回の対象: " + (", ".join(plan.targets) if plan.targets else "(なし)"))
+            print("今回の対象(この順): " + (", ".join(plan.targets) if plan.targets else "(なし)"))
+            for line in plan.deferred_lines():
+                print("後ろに回した製番 — " + line)
         try:
             print("定期タスクの実行先: " + TARGET_STATE_TEXT[ctx.scheduler.action_target_state()])
         except Exception:  # noqa: BLE001 - 参考情報。照会の失敗で検証結果を変えない

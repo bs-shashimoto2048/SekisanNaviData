@@ -27,10 +27,12 @@ class OpsSettings:
     scheduled_products: tuple = ()    # 定期実行の対象製番(許可リスト)。既定は空 = 何も処理しない(出図リストへフォールバックしない)
     scheduled_max_products: int = 5   # 1 回の定期実行で処理を開始する製番の上限(件)。未設定は既定値(無制限にはならない)
     scheduled_max_minutes: int = 120  # 1 回の定期実行で、新しい製番の処理を開始してよい時間の上限(分)。超えた後は新しい製番を始めない
+    scheduled_retry_products: tuple = ()   # 「失敗・スキップが続いて後ろに回された製番」を、原因の対処後に、通常の順序へ戻す(再試行する)製番。既定は空
 
     def as_dict(self) -> dict:
         d = asdict(self)
         d["scheduled_products"] = list(self.scheduled_products)       # 画面・YAML では配列
+        d["scheduled_retry_products"] = list(self.scheduled_retry_products)
         return d
 
 
@@ -89,7 +91,8 @@ def validate_scheduled_max_minutes(value) -> int:
 
 
 def validate_scheduled_products(value) -> tuple:
-    """定期実行の対象製番リスト。未設定・空は空(何も処理しない)。順序を保ち、重複は 1 つにする。1 件でも不正な製番があれば全体を拒否する
+    """定期実行の対象製番リスト。未設定・空は空(何も処理しない)。**大文字に正規化**し(app の対象判定は大文字の `A1` 前方一致で、小文字だと毎回
+    「処理対象外」になるため)、重複は大文字にそろえたあとで 1 つにする(順序は最初の出現のまま)。1 件でも不正な製番があれば全体を拒否する
     (一部だけ採用して、意図しない範囲で実行しないため)。"""
     if value is None:
         return ()
@@ -101,7 +104,7 @@ def validate_scheduled_products(value) -> tuple:
     for item in value:
         if not isinstance(item, str):
             raise SettingsError("定期実行の対象製番は、文字列の製番で指定してください。")
-        p = validate_product_no(item)
+        p = validate_product_no(item).upper()
         if p not in out:
             out.append(p)
     return tuple(out)
@@ -127,7 +130,8 @@ def validate(data: dict) -> OpsSettings:
                        schedule_interval_days=validate_interval(data.get("schedule_interval_days", OpsSettings.schedule_interval_days)),
                        scheduled_products=validate_scheduled_products(data.get("scheduled_products")),
                        scheduled_max_products=validate_scheduled_max_products(data.get("scheduled_max_products")),
-                       scheduled_max_minutes=validate_scheduled_max_minutes(data.get("scheduled_max_minutes")))
+                       scheduled_max_minutes=validate_scheduled_max_minutes(data.get("scheduled_max_minutes")),
+                       scheduled_retry_products=validate_scheduled_products(data.get("scheduled_retry_products")))
 
 
 class SettingsStore:
@@ -144,7 +148,7 @@ class SettingsStore:
             raise SettingsError(f"保存済みの運用設定を読み込めません({type(e).__name__})。") from e
         return validate(raw)
 
-    SCHEDULED_KEYS = ("scheduled_products", "scheduled_max_products", "scheduled_max_minutes")
+    SCHEDULED_KEYS = ("scheduled_products", "scheduled_max_products", "scheduled_max_minutes", "scheduled_retry_products")
 
     def save(self, data: dict) -> OpsSettings:
         # 画面からの保存(出力先・時刻・間隔)で、手で設定した定期実行の対象範囲(製番リスト・上限)を消さないよう、
