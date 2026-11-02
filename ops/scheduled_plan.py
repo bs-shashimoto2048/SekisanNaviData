@@ -42,11 +42,14 @@ def default_is_done(output_dir: str, product: str) -> bool:
 
 def results_from(res: dict, targets: Iterable[str]) -> Dict[str, dict]:
     """app.main の戻り値から、製番ごとの結果(履歴に残す形)を作る。時間上限などで開始しなかった製番は「未開始」(実際に処理した製番と区別する)。
-    2 件以上の対象がすべて同じ理由で失敗したときは、環境の問題(API 停止など)とみなし、`scope: run`(製番固有の失敗として数えない)を付ける。"""
+    app.main が **実行全体の中断**(`res["aborted"]`。推論 API の事前確認の失敗)を返したときは、対象が 1 件でも複数件でも、すべての製番を
+    「未開始・`scope: run`」にする(製番固有の失敗として数えない)。理由文の文字列判定や「同じ理由で失敗」という推測は使わない。"""
     completed = set(res.get("completed") or [])
     failed = dict(res.get("failed") or {})
     skipped = dict(res.get("skipped") or {})
     targets = list(targets)
+    if res.get("aborted"):                                  # 実行全体の中断: どの製番も処理を始めていない
+        return run_level_results(targets, RESULT_NOT_STARTED, str(res["aborted"]))
     out: Dict[str, dict] = {}
     for p in targets:
         if p in completed:
@@ -58,10 +61,6 @@ def results_from(res: dict, targets: Iterable[str]) -> Dict[str, dict]:
             out[p] = {"status": RESULT_NOT_STARTED if DEADLINE_MARK in reason else RESULT_SKIPPED, "reason": reason}
         else:
             out[p] = {"status": RESULT_NOT_STARTED, "reason": "結果が返りませんでした"}
-    failures = [p for p in targets if out[p]["status"] == RESULT_FAILED]
-    if len(targets) >= 2 and len(failures) == len(targets) and len({out[p]["reason"] for p in failures}) == 1:
-        for p in failures:
-            out[p]["scope"] = SCOPE_RUN
     return out
 
 
@@ -72,7 +71,10 @@ def run_level_results(targets: Iterable[str], status: str, reason: str) -> Dict[
 
 def failure_streaks(runs: List[dict], products: Iterable[str]) -> Dict[str, int]:
     """履歴(新しい順。History.runs())の定期実行の results から、製番ごとの「直近の連続した失敗・スキップ」の回数を数える。
-    数えるのは 失敗(製番固有)・スキップ(処理済み・時間上限を除く)。完了で止まる。未開始・実行全体の失敗・その製番の結果が無い実行は、数えず飛ばす。"""
+    **連続回数の定義**(docs/ops_console.md と tests/test_ops_scheduled_scope.py の `StreakDefinitionTest` で固定):
+    - 数える(+1): その製番の「失敗」(製番固有。`scope: run` でないもの)と「スキップ」(処理済み・時間上限によるものを除く)。
+    - リセット(0 に戻す): その製番の「完了」。
+    - 数えず、リセットもしない(結果が無いものとして飛ばす): 「未開始」・`scope: run`(実行全体の中断・失敗)・その製番の結果が無い実行・処理済みや時間上限のスキップ。"""
     streaks: Dict[str, int] = {}
     scheduled = [r for r in runs if r.get("kind") == "定期" and isinstance(r.get("results"), dict)]
     for p in products:

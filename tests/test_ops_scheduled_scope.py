@@ -470,14 +470,52 @@ class OrderingAndResultsTest(Base):
         self.assertEqual(seen[2], [LISTED[0]])                                 # 後続は処理済み。残った枠で、後ろに回した製番が再試行される
         self.assertEqual(self.store.load().scheduled_products, tuple(LISTED[:3]))   # リストからは消さない
 
-    def test_environment_wide_failures_do_not_count_against_a_product(self):
+    API_DOWN = "推論 API を利用できないため、製番処理を開始しませんでした(接続が拒否されました)"
+
+    def api_down_main(self, **kw):
+        """app.main が、API の事前確認に失敗したときの戻り値(製番ごとの failed と、実行全体の中断を示す aborted)。"""
+        self.calls.append(kw)
+        return {"completed": [], "failed": {p: self.API_DOWN for p in kw["products"]}, "skipped": {}, "aborted": self.API_DOWN}
+
+    def test_api_unavailable_with_a_single_product_is_not_counted_and_never_defers_it(self):
+        self.settings(scheduled_products=LISTED[:1], scheduled_max_products=1)
+        mgr = self.manager(self.api_down_main)
+        for _ in range(5):                                                      # 何度続いても
+            self.assertEqual(mgr.run_scheduled_targeted(), FAILED)
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:1]), {LISTED[0]: 0})
+        self.assertEqual(mgr.last_plan.deferred, ())                              # 後順位に回らない
+        self.assertEqual(mgr.last_plan.targets, (LISTED[0],))
+        res = self.history.runs()[0]["results"][LISTED[0]]
+        self.assertEqual((res["status"], res["scope"]), ("未開始", "run"))        # 処理を始めていない・実行全体の中断
+
+    def test_api_unavailable_with_several_products_is_not_counted_either(self):
         self.settings(scheduled_products=LISTED[:3], scheduled_max_products=3)
-        mgr = self.manager(lambda **kw: {"completed": [], "failed": {p: "推論 API を利用できません" for p in kw["products"]}, "skipped": {}})
+        mgr = self.manager(self.api_down_main)
         for _ in range(4):
             mgr.run_scheduled_targeted()
         self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:3]), {p: 0 for p in LISTED[:3]})
         self.assertEqual(mgr.last_plan.deferred, ())
-        self.assertTrue(all(r["scope"] == "run" for r in self.history.runs()[0]["results"].values()))
+        self.assertTrue(all(r["scope"] == "run" and r["status"] == "未開始" for r in self.history.runs()[0]["results"].values()))
+
+    def test_api_unavailable_does_not_reset_or_add_to_a_streak_of_a_product_specific_failure(self):
+        self.settings(scheduled_products=LISTED[:2], scheduled_max_products=1)
+        fail = lambda **kw: {"completed": [], "failed": {kw["products"][0]: "RuntimeError: 製番固有の失敗"}, "skipped": {}}
+        self.manager(fail).run_scheduled_targeted()                               # 失敗 1 回目
+        for _ in range(3):
+            self.manager(self.api_down_main).run_scheduled_targeted()             # API の中断は、数えない・リセットもしない
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:2])[LISTED[0]], 1)
+        self.manager(fail).run_scheduled_targeted()                               # 失敗 2 回目 → 2 回連続
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:2])[LISTED[0]], 2)
+
+    def test_identical_product_specific_failures_are_still_counted(self):
+        """「同じ理由で失敗した」という推測で、環境の失敗とはみなさない(製番固有の失敗は、複数件でも数える)。"""
+        self.settings(scheduled_products=LISTED[:2], scheduled_max_products=2)
+        same = lambda **kw: {"completed": [], "failed": {p: "[Step.2] 印刷(PDF): 1 件が作成されませんでした(未完了)" for p in kw["products"]}, "skipped": {}}
+        for _ in range(2):
+            self.manager(same).run_scheduled_targeted()
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), LISTED[:2]), {LISTED[0]: 2, LISTED[1]: 2})
+        r = self.history.runs()[0]["results"]
+        self.assertTrue(all("scope" not in v for v in r.values()))
 
     def test_whole_run_exceptions_and_time_limit_skips_do_not_count(self):
         self.settings(scheduled_products=LISTED[:2], scheduled_max_products=2)
@@ -593,6 +631,90 @@ class OrderingAndResultsTest(Base):
         mgr.lock.acquire = acquire_then_done
         mgr.run_scheduled_targeted_dry_run()
         self.assertEqual(self.history.runs()[0]["targets"], [LISTED[1], LISTED[2]])
+
+
+class StreakDefinitionTest(Base):
+    """連続失敗回数の定義(docs/ops_console.md): 失敗・スキップは数える / 完了でリセット / 未開始・実行全体の中断・結果が無い実行は、数えずリセットもしない。"""
+
+    P = "A1TEST0001"
+
+    def history_of(self, sequence):
+        """sequence は古い順の結果。(status, 追加項目) または None(その製番の結果が無い実行)。"""
+        for item in sequence:
+            rid = self.history.start("定期", self.P, targets=[self.P])
+            self.history.finish(rid, "完了", "", results=({self.P: {"status": item[0], "reason": item[1].get("reason", ""), **{k: v for k, v in item[1].items() if k != "reason"}}} if item else {"A1OTHER0001": {"status": "完了"}}))
+        return failure_streaks(self.history.runs(limit=None), [self.P])[self.P]
+
+    FAIL = ("失敗", {})
+    SKIP = ("スキップ", {"reason": "処理対象外"})
+    DONE = ("完了", {})
+    NOT_STARTED = ("未開始", {"reason": "実行時間の上限に達したため開始しませんでした"})
+    RUN_ABORT = ("未開始", {"reason": "API", "scope": "run"})
+    RUN_FAIL = ("失敗", {"reason": "実行全体の失敗", "scope": "run"})
+    SKIP_DONE = ("スキップ", {"reason": "処理済み"})
+    SKIP_TIME = ("スキップ", {"reason": "実行時間の上限に達したため開始しませんでした"})
+
+    def test_failures_and_skips_are_counted(self):
+        self.assertEqual(self.history_of([self.FAIL]), 1)
+        self.assertEqual(self.history_of([self.SKIP, self.FAIL]), 3)              # 履歴は積み上がる(同じ Base の履歴に続けて書く)
+
+    def test_the_definition_table(self):
+        cases = [
+            ([self.FAIL, self.FAIL], 2),
+            ([self.SKIP, self.SKIP], 2),
+            ([self.FAIL, self.SKIP], 2),
+            ([self.FAIL, self.FAIL, self.DONE], 0),                                # 完了でリセット
+            ([self.FAIL, self.DONE, self.FAIL], 1),                                # リセット後の数え直し
+            ([self.FAIL, self.NOT_STARTED, self.FAIL], 2),                         # 未開始は数えず、リセットもしない
+            ([self.FAIL, self.RUN_ABORT, self.FAIL], 2),                           # 実行全体の中断も同じ
+            ([self.FAIL, self.RUN_FAIL, self.FAIL], 2),
+            ([self.FAIL, None, self.FAIL], 2),                                     # その製番の結果が無い実行も同じ
+            ([self.FAIL, self.SKIP_DONE, self.SKIP_TIME, self.FAIL], 2),           # 処理済み・時間上限のスキップは数えない
+            ([self.NOT_STARTED, self.RUN_ABORT, self.RUN_FAIL, None], 0),          # 結果が無いものだけなら 0
+            ([self.FAIL, self.FAIL, self.RUN_ABORT], 2),                           # 直近が中断でも、連続は維持される
+        ]
+        for sequence, expected in cases:
+            with self.subTest(sequence=[c[0] if c else None for c in sequence]):
+                for f in self.state.glob("ops_history.local.jsonl"):
+                    f.unlink()                                                      # ケースごとに履歴を作り直す
+                self.assertEqual(self.history_of(sequence), expected)
+
+    def test_a_run_only_counts_scheduled_runs_with_results(self):
+        rid = self.history.start("手動", self.P)
+        self.history.finish(rid, "失敗", "x")                                       # 手動実行・結果(results)の無い実行は数えない
+        rid = self.history.start("定期(検証)", "(検証のみ)", targets=[self.P])
+        self.history.finish(rid, "完了", "")
+        self.assertEqual(failure_streaks(self.history.runs(limit=None), [self.P])[self.P], 0)
+
+    def test_two_consecutive_failures_defer_the_product_and_the_definition_keeps_it_there_across_aborts(self):
+        self.settings(scheduled_products=[self.P, "A1TEST0002"], scheduled_max_products=1)
+        fail = lambda **kw: {"completed": [], "failed": {kw["products"][0]: "RuntimeError: x"}, "skipped": {}}
+        api = lambda **kw: {"completed": [], "failed": {p: "API" for p in kw["products"]}, "skipped": {}, "aborted": "API"}
+        for main in (fail, api, fail):
+            self.manager(main).run_scheduled_targeted()
+        m = self.manager()
+        m.run_scheduled_targeted_dry_run()
+        self.assertEqual(m.last_plan.deferred, ((self.P, 2),))                       # 2 回連続(間の中断は飛ばす)→ 後順位
+        self.assertEqual(m.last_plan.targets, ("A1TEST0002",))
+
+
+class AppAbortedTest(MainIntegrationBase):
+    """app.main が、API の事前確認の失敗を、対象が 1 件でも「実行全体の中断」として戻り値で明示する。"""
+    REASON = "推論 API を利用できないため、製番処理を開始しませんでした(接続が拒否されました)"
+
+    def test_the_abort_is_explicit_for_one_product_and_for_the_normal_run(self):
+        for products in ([PRODUCT], [PRODUCT, "A1BL9999"], None):
+            self.preflight_reason = self.REASON
+            self.run_main(products=products)
+            self.assertEqual(self.results["aborted"], self.REASON, products)
+            self.assertTrue(all(v == self.REASON for v in self.results["failed"].values()), products)   # 既存の failed の形も従来どおり
+            self.assertEqual(self.results["completed"], [], products)
+            self.assertEqual(self.print_script_calls, [], products)
+
+    def test_a_normal_run_has_no_aborted_key(self):
+        self.preflight_reason = None
+        self.run_main(products=[PRODUCT])
+        self.assertNotIn("aborted", self.results)
 
 
 class NormalizationTest(Base):

@@ -136,6 +136,7 @@ def main(config_path=None, products=None, output_root=None, stop_after=None): # 
     logger.info(f" └> 配電盤 箱体型式: {box_types = }\n")
 
     # 製番ごとの結果。失敗を成功扱いにしないよう、呼び出し元(起動入口)へ戻り値で伝える。
+    # 実行全体を始められずに中断したとき(推論 API の事前確認の失敗)だけ、追加のキー "aborted"(理由の固定文)が付く。
     results:dict = {"completed": [], "failed": {}, "skipped": {}}
 
     if manager is not None:
@@ -158,6 +159,7 @@ def main(config_path=None, products=None, output_root=None, stop_after=None): # 
                 logger.error(f"{unavailable}\n")
                 for key in (list(products) if products is not None else ["(全体)"]):
                     results["failed"][key] = unavailable
+                results["aborted"] = unavailable    # 実行全体の中断(製番固有の失敗ではない)。呼び出し側(定期実行の履歴)が、対象が 1 件でも区別できるようにする
                 return results      # finally が結果のログを出して終了する
             logger.info("推論 API の事前確認: OK(/health)\n")
 
