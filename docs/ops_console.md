@@ -142,7 +142,7 @@ stop_ops_console.bat  [--port 8765]
 .venv\Scripts\python.exe ops_ctl.py status [--port 8765]
 ```
 
-- Python は環境変数 `OPS_PYTHON`(あれば)、無ければこのフォルダの `.venv\Scripts\python.exe`。**バッチを置いた作業ツリーの `ops_console.py` を起動する**ので、設定(`ops.local.yaml`・`app.local.yaml`)・履歴もその作業ツリーのものになる。
+- Python は、環境変数 `OPS_PYTHON`(あれば)→ このフォルダの `ops_python.local.txt` の1行目(任意・Git 管理外。`.venv` の無い作業ツリーで、本体の `.venv\Scripts\python.exe` のフルパスを書いておく。ダブルクリックでも環境変数なしで使える)→ このフォルダの `.venv\Scripts\python.exe` の順。どれも無い/ファイルが存在しなければ、起動せずにエラーで終わる(別の Python は使わない)。**バッチを置いた作業ツリーの `ops_console.py` を起動する**ので、設定(`ops.local.yaml`・`app.local.yaml`)・履歴もその作業ツリーのものになる。
 - 起動: ポートが使用中なら起動しない(使っているプロセスは止めない)。起動したら PID とプロセス作成時刻を `ops_console.local.pid`(Git 管理外)に記録し、`/api/state` が 200 を返し、待受が自分のプロセスになったことを確認する。
 - 停止: 記録した PID が「作成時刻・コマンドライン(この場所の `ops_console.py serve --port N`)まで一致」し、待受ポートの持ち主が自分のプロセスのときだけ、そのプロセスと子(venv の起動ランチャーと実体)を止める。**名前(python.exe)での一括終了はしない。記録の無いプロセス(手で起動した 8765 など)は止めない。**
 - 製番処理・定期実行・検証の実行中(実行ロック `ops_run.local.lock` が取られている)、または実行中かを確認できないときは、停止しない。

@@ -140,6 +140,70 @@ class OpsCtlTest(unittest.TestCase):
         self.assertIsNone(other.poll())
 
 
+class FailingOps(ops_ctl.SystemOps):
+    def processes(self):
+        raise ops_ctl.OpsQueryError("test")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows 用")
+class QueryFailureTest(unittest.TestCase):
+    def test_a_failed_process_query_changes_nothing_and_keeps_the_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            rec = json.dumps({"pid": 4242, "created": "x", "port": 18999, "base": str(base)})
+            (base / ops_ctl.PID_FILE).write_text(rec, encoding="utf-8")
+            lines = []
+            for action in ("start", "stop", "status"):
+                ctl = ops_ctl.OpsController(base=base, port=18999, ops=FailingOps(), busy_check=lambda: False, say=lines.append)
+                self.assertEqual(getattr(ctl, action)(), 1, action)
+            self.assertEqual((base / ops_ctl.PID_FILE).read_text(encoding="utf-8"), rec)     # 記録を消さない
+            self.assertIn("何も操作しませんでした", "\n".join(lines))
+
+    def test_empty_process_list_is_a_query_failure_not_an_empty_system(self):
+        class Empty(ops_ctl.SystemOps):
+            def _ps_json(self, script):
+                raise ops_ctl.OpsQueryError("empty")
+        with self.assertRaises(ops_ctl.OpsQueryError):
+            Empty().processes()
+
+
+@unittest.skipUnless(os.name == "nt", "cmd.exe 用のバッチ")
+class BatchPythonResolutionTest(unittest.TestCase):
+    """.venv の無い作業ツリーでの Python の決め方(隔離: 一時フォルダへバッチだけをコピーし、偽の ops_ctl.py が引数を表示するだけ)。"""
+
+    def run_bat(self, td, extra_env=None, with_txt=None):
+        import shutil
+        d = Path(td)
+        shutil.copy(ROOT / "start_ops_console.bat", d / "start_ops_console.bat")
+        (d / "ops_ctl.py").write_text("import sys;print('FAKE-CTL', sys.executable, *sys.argv[1:])", encoding="utf-8")
+        if with_txt:
+            (d / "ops_python.local.txt").write_text(with_txt + "\n", encoding="ascii")
+        env = {k: v for k, v in os.environ.items() if k != "OPS_PYTHON"}
+        env.update(extra_env or {})
+        return subprocess.run(["cmd", "/c", str(d / "start_ops_console.bat"), "--port", "1"], stdin=subprocess.DEVNULL,
+                              capture_output=True, env=env, timeout=120)
+
+    def test_ops_python_env_var_wins(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self.run_bat(td, {"OPS_PYTHON": sys.executable}, with_txt="C:\\does\\not\\exist\\python.exe")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(b"FAKE-CTL", r.stdout)
+
+    def test_local_txt_is_used_without_the_env_var(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self.run_bat(td, with_txt=sys.executable)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(b"FAKE-CTL", r.stdout)
+            self.assertIn(b"start --port 1", r.stdout)
+
+    def test_a_wrong_path_fails_without_falling_back_to_another_python(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self.run_bat(td, {"OPS_PYTHON": "C:\\does\\not\\exist\\python.exe"})
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn(b"FAKE-CTL", r.stdout)
+            self.assertIn(b"Python was not found", r.stdout)
+
+
 class BatchFilesTest(unittest.TestCase):
     NAMES = ("start_ops_console.bat", "stop_ops_console.bat")
 

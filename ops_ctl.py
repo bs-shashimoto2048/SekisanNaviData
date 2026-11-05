@@ -28,6 +28,10 @@ STOP_WAIT_SEC = 15
 EXIT_OK, EXIT_FAIL = 0, 1
 
 
+class OpsQueryError(RuntimeError):
+    """OS への問い合わせに失敗した(プロセス一覧・待受の取得不能)。空の結果と区別し、何も操作せずに止める。"""
+
+
 class SystemOps:
     """OS への問い合わせ・操作(テストでは差し替えず、隔離した偽の画面プロセスに対して実物を使う)。"""
 
@@ -38,18 +42,26 @@ class SystemOps:
         r = subprocess.run(self.PS + [script], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
         text = r.stdout.decode("utf-8", "replace").strip()
         if r.returncode != 0 or not text:
-            return []
-        data = json.loads(text)
+            raise OpsQueryError("PowerShell の問い合わせに失敗しました")
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise OpsQueryError("PowerShell の結果を解釈できません") from e
         return data if isinstance(data, list) else [data]
 
     def processes(self) -> dict:
         rows = self._ps_json("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,"
                              "@{n='Created';e={$_.CreationDate.ToString('o')}} | ConvertTo-Json -Compress")
-        return {int(r["ProcessId"]): {"pid": int(r["ProcessId"]), "ppid": int(r["ParentProcessId"] or 0),
+        procs = {int(r["ProcessId"]): {"pid": int(r["ProcessId"]), "ppid": int(r["ParentProcessId"] or 0),
                                       "cmd": r.get("CommandLine") or "", "created": r.get("Created") or ""} for r in rows}
+        if os.getpid() not in procs:                            # 自分自身が見えない一覧は、取得に失敗している
+            raise OpsQueryError("プロセス一覧に自分自身が含まれません")
+        return procs
 
     def listeners(self, port: int) -> list:
         r = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            raise OpsQueryError("netstat に失敗しました")
         pids = set()
         for line in r.stdout.decode("ascii", "replace").splitlines():
             cols = line.split()                              # Proto, Local, Foreign, State, PID
@@ -128,8 +140,23 @@ class OpsController:
                     todo.append(q["pid"])
         return out
 
-    # ---- 操作 ----
+    def _guarded(self, fn) -> int:
+        try:
+            return fn()
+        except OpsQueryError as e:
+            self.say(f"何も操作しませんでした: OS への問い合わせに失敗しました({e})。管理記録は変更していません。もう一度実行してください。")
+            return EXIT_FAIL
+
     def start(self) -> int:
+        return self._guarded(self._start)
+
+    def stop(self) -> int:
+        return self._guarded(self._stop)
+
+    def status(self) -> int:
+        return self._guarded(self._status)
+
+    def _start(self) -> int:
         procs = self.ops.processes()
         rec = self.read_record()
         if rec and self.is_ours(rec, procs):
@@ -183,7 +210,7 @@ class OpsController:
             except OSError:
                 pass
 
-    def stop(self) -> int:
+    def _stop(self) -> int:
         rec = self.read_record()
         procs = self.ops.processes()
         if not rec:
@@ -223,7 +250,7 @@ class OpsController:
         self.say("停止を確認できませんでした。プロセスが残っている可能性があります(記録は残しています)。")
         return EXIT_FAIL
 
-    def status(self) -> int:
+    def _status(self) -> int:
         rec = self.read_record()
         procs = self.ops.processes()
         holders = self.ops.listeners(self.port)
