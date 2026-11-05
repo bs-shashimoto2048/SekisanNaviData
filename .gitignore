@@ -61,3 +61,6 @@ file_renamer_gui.*
 # 運用画面(ops_console.py)のローカル設定・履歴・実行ロック(実行環境ごとの値。コミットしない)
 ops_history.local.jsonl
 ops_run.local.lock
+
+# ops_ctl.py (8765 start/stop) runtime PID record
+*.local.pid
