@@ -320,6 +320,38 @@ class BatchFilesTest(unittest.TestCase):
             self.assertEqual(raw.count(b"\r\n"), raw.count(b"\n"), name)                      # 改行は CRLF だけ(cmd.exe 用)
             self.assertTrue(all(b < 128 for b in raw), name)                                  # ASCII だけ(cmd.exe は OEM コードページで読むため、日本語を入れない)
 
+    def test_batches_do_not_use_timeout_which_fails_when_stdin_is_redirected(self):
+        # timeout.exe は標準入力がリダイレクトされていると「Input redirection is not supported」で即終了する(待たない)。
+        # スタートアップ・非対話の呼び出しでも同じ待機になるよう、標準入力に依存しない ping -n で待つ。
+        for name in ("start_prod_api.bat", "stop_prod_api.bat"):
+            low = self.read(name).lower()
+            self.assertNotRegex(low, r"(?m)^\s*timeout\b", name)
+            self.assertIn("ping -n", low, name)
+
+    @unittest.skipUnless(os.name == "nt", "cmd.exe 用のバッチ")
+    def test_stop_batch_prints_no_redirection_error_with_stdin_closed(self):
+        # 実 API は停止しない隔離テスト: 一時フォルダへバッチだけをコピーし、.venv\Scripts\python.exe に whoami.exe(引数エラーで終わる)を
+        # 置く。prod_ctl.py も無いので、API・PID 記録・共有 server.yaml には一切触れない。標準入力は閉じて実行する。
+        import shutil
+        import subprocess
+        import tempfile
+        import time
+        whoami = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "whoami.exe"
+        if not whoami.is_file():
+            self.skipTest("whoami.exe が無い")
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            shutil.copy(HERE / "stop_prod_api.bat", d / "stop_prod_api.bat")
+            (d / ".venv" / "Scripts").mkdir(parents=True)
+            shutil.copy(whoami, d / ".venv" / "Scripts" / "python.exe")
+            t0 = time.monotonic()
+            r = subprocess.run(["cmd", "/c", str(d / "stop_prod_api.bat")], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=60)
+            elapsed = time.monotonic() - t0
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        self.assertNotIn("Input redirection", out)
+        self.assertGreaterEqual(elapsed, 8)          # 最後の約 10 秒の待機が、標準入力なしでも実際に待つ(即終了しない)
+
     def test_the_controller_never_publishes_the_shared_server_yaml(self):
         src = (HERE / "prod_ctl.py").read_text(encoding="utf-8")
         self.assertIn("publish_config: bool = False", src)                                  # 公開は、明示した指定のときだけ(既定は False)
