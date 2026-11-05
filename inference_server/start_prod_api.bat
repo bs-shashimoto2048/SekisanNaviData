@@ -8,7 +8,7 @@ cd /d "%~dp0"
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo Cannot start: the runtime environment ^(.venv^) was not found. Contact the administrator.
-  timeout /t 30 >nul
+  ping -n 31 127.0.0.1 >nul
   exit /b 1
 )
 "%PY%" -X utf8 prod_ctl.py start
@@ -16,6 +16,6 @@ set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
   echo.
   echo START FAILED ^(code %RC%^). The API is not running. See the explanation above.
-  timeout /t 60 >nul
+  ping -n 61 127.0.0.1 >nul
 )
 exit /b %RC%
