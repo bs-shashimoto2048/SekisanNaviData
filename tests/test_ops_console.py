@@ -1155,25 +1155,26 @@ class EntryPointTest(NoRealSubprocess):
         import importlib
         oc = importlib.import_module("ops_console")
         captured = {}
-        runs = SimpleNamespace(run_scheduled=mock.Mock(name="run_scheduled"), run_scheduled_dry_run=mock.Mock(return_value="完了"))
+        runs = SimpleNamespace(run_scheduled_targeted=mock.Mock(name="run_scheduled_targeted"),
+                               run_scheduled_targeted_dry_run=mock.Mock(return_value="完了"), refusal=None, last_plan=None)
 
         def fake_build(**kw):
             captured.update(kw)
-            return SimpleNamespace(runs=runs)
+            return SimpleNamespace(runs=runs, scheduler=mock.Mock(action_target_state=mock.Mock(return_value='match')))
         import os
         cwd = os.getcwd()
         self.addCleanup(os.chdir, cwd)
         with mock.patch.object(oc, "build_context", side_effect=fake_build):
             self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 0)
-            runs.run_scheduled_dry_run.return_value = "失敗"
+            runs.run_scheduled_targeted_dry_run.return_value = "失敗"
             self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 1)        # 失敗は終了コード 1
-        runs.run_scheduled.assert_not_called()
+        runs.run_scheduled_targeted.assert_not_called()
         with self.assertRaises(AssertionError):                                  # 渡された main_func は呼べない(万一でも app.main に届かない)
             captured["main_func"]()
         with mock.patch.object(oc, "build_context", side_effect=fake_build):
-            runs.run_scheduled.return_value = "完了"
+            runs.run_scheduled_targeted.return_value = "完了"
             self.assertEqual(oc.main(["run-scheduled"]), 0)                      # --dry-run なしは従来の通常処理
-        runs.run_scheduled.assert_called_once()
+        runs.run_scheduled_targeted.assert_called_once()
 
     def test_scheduled_task_command_is_unchanged_and_has_no_dry_run(self):
         ts = scheduler_mod.TaskScheduler("py.exe", "ops_console.py")
@@ -1185,7 +1186,7 @@ class EntryPointTest(NoRealSubprocess):
         oc = importlib.import_module("ops_console")
         cwd = os.getcwd()
         self.addCleanup(os.chdir, cwd)
-        ctx = SimpleNamespace(runs=SimpleNamespace(run_scheduled=lambda: "完了"))
+        ctx = SimpleNamespace(runs=SimpleNamespace(run_scheduled_targeted=lambda: "完了", refusal=None, last_plan=None))
         os.chdir(self.tmp)
         with mock.patch.object(oc, "build_context", return_value=ctx):
             self.assertEqual(oc.cmd_run_scheduled(SimpleNamespace(config=None)), 0)    # タスクの既定の作業フォルダ(System32)でも、リポジトリ基準になる

@@ -4,7 +4,9 @@
 #
 # 登録するタスクは「既存の通常処理を指定時刻に起動する」だけ:
 #   <python> <ops_console.py> run-scheduled   -> app.main() をそのまま実行(製番検索・処理済み判定・実行間隔は変えない)
-# N 日ごと(1 = 毎日、2 = 1 日置き)の指定時刻に 1 回起動する。製番の指定はしない。
+# N 日ごと(1 = 毎日、2 = 1 日置き)の指定時刻に 1 回起動する。製番はコマンドには書かない(対象は設定 ops.local.yaml の scheduled_products)。
+import html
+import os
 import re
 import subprocess
 from typing import Callable, Optional
@@ -77,6 +79,30 @@ class TaskScheduler:
 
     def delete(self):
         self._run(self.delete_args(), "解除")
+
+    # ---- 登録済みタスクの起動先の照会(読み取りのみ。タスクは変更しない) ----
+    TARGET_UNREGISTERED, TARGET_MATCH, TARGET_MISMATCH, TARGET_UNKNOWN = "unregistered", "match", "mismatch", "unknown"
+
+    @staticmethod
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path.strip().strip('"')))
+
+    def action_target_state(self) -> str:
+        """登録済みタスクが起動する ops_console.py が、このコードの場所(self.script_path)かを照会する。
+        match = 同じ場所 / mismatch = 別の場所(古い作業ツリーを指している等) / unregistered = タスク未登録 / unknown = 照会できない。"""
+        res = self.runner(self.query_args())
+        if res.returncode != 0:
+            return self.TARGET_UNREGISTERED
+        xml = _decode(res.stdout)
+        args = re.search(r"<Arguments>(.*?)</Arguments>", xml, re.S)
+        command = re.search(r"<Command>(.*?)</Command>", xml, re.S)
+        text = html.unescape(((args.group(1) if args else "") or "").strip())
+        m = re.search(r'"([^"]+\.py)"', text) or re.search(r"(\S+\.py)", text)
+        if not m or not command:
+            return self.TARGET_UNKNOWN
+        same_script = self._norm(m.group(1)) == self._norm(self.script_path)
+        same_python = self._norm(html.unescape(command.group(1))) == self._norm(self.python_exe)
+        return self.TARGET_MATCH if same_script and same_python else self.TARGET_MISMATCH
 
     def status(self) -> dict:
         """登録状態の照会(読み取りのみ)。{registered, enabled, time}。"""

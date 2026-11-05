@@ -21,6 +21,7 @@
 import os
 from pathlib import Path
 import shutil    # テストが app.shutil.rmtree を差し替える(削除の実体は pipeline.product_flow)
+from time import monotonic as _monotonic   # 定期実行の時間上限の確認(`time` という名前では持たない: tests/test_s7_cleanup)
 import sys
 import traceback # トレースバック出力に使用
 import warnings
@@ -58,10 +59,15 @@ _assert_not_sample_config = settings_mod.assert_not_sample_config
 _is_under = product_flow.is_under
 _safe_rmtree = product_flow.safe_rmtree
 
-def main(config_path=None, products=None, output_root=None): # 社内図面解析処理
+DEADLINE_SKIP_REASON = "実行時間の上限に達したため開始しませんでした"   # ops.runner.DEADLINE_MARK を含む
+
+
+def main(config_path=None, products=None, output_root=None, stop_after=None): # 社内図面解析処理
     """products: 処理する製番のリスト(運用画面の指定実行用)。省略(None)なら従来どおり、ホストの出図済み製番から処理済みを除いた全件。
     指定時はホストの製番一覧取得を省き、指定した製番だけを同じ製番処理(run_product)に通す(処理済み判定・対象判定は製番処理の中でそのまま行う)。
-    output_root: 出力ルート(設定の data.output)の上書き。省略なら設定どおり。"""
+    output_root: 出力ルート(設定の data.output)の上書き。省略なら設定どおり。
+    stop_after: 時間上限(time.monotonic() の時刻。定期実行だけが指定する)。この時刻以降は、新しい製番の処理を始めず「スキップ」に記録する
+    (処理中の製番は中断しない)。省略(None)なら従来どおり上限なし。"""
     # 設定初期化
     warnings.simplefilter("ignore", FutureWarning) # 警告出力なし
 
@@ -130,6 +136,7 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
     logger.info(f" └> 配電盤 箱体型式: {box_types = }\n")
 
     # 製番ごとの結果。失敗を成功扱いにしないよう、呼び出し元(起動入口)へ戻り値で伝える。
+    # 実行全体を始められずに中断したとき(推論 API の事前確認の失敗)だけ、追加のキー "aborted"(理由の固定文)が付く。
     results:dict = {"completed": [], "failed": {}, "skipped": {}}
 
     if manager is not None:
@@ -152,6 +159,7 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
                 logger.error(f"{unavailable}\n")
                 for key in (list(products) if products is not None else ["(全体)"]):
                     results["failed"][key] = unavailable
+                results["aborted"] = unavailable    # 実行全体の中断(製番固有の失敗ではない)。呼び出し側(定期実行の履歴)が、対象が 1 件でも区別できるようにする
                 return results      # finally が結果のログを出して終了する
             logger.info("推論 API の事前確認: OK(/health)\n")
 
@@ -187,6 +195,10 @@ def main(config_path=None, products=None, output_root=None): # 社内図面解�
 
         logger.info("処理開始\n")
         for product in product_list:
+            if stop_after is not None and _monotonic() >= stop_after:
+                results["skipped"][product] = DEADLINE_SKIP_REASON
+                logger.warning(f"実行時間の上限に達したため、製番の処理を開始しません: {product}")
+                continue
             dir_product = os.path.join(output_dir, product)
             # 製番 1 件の処理(Step 単位の関数)は pipeline.product_flow。結果の記録と失敗時の後始末もそちらで行う
             ctx = product_flow.ProductContext(
