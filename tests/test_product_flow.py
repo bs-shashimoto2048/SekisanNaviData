@@ -167,25 +167,51 @@ class RunProductCleanupTest(FlowBase):
         self.assertTrue(r["failed"]["A1BN0001"].startswith("InferenceRequestError"))
         self.assertTrue(any("推論APIの失敗内容(製番 A1BN0001 は未完了)" in m for m in self.logged("error")))
 
-    def test_system_exit_is_failure_cleans_partial_output_and_reraises_without_leaking_details(self):
+    def test_system_exit_is_failure_cleans_partial_output_and_does_not_reraise_without_leaking_details(self):
         def boom(ctx):
             raise SystemExit(r"C:\secret\x password=abc")        # sys.exit() 相当(終了コード・メッセージにパス/秘密が入っていても記録しない)
         self.dir_product.mkdir()
         results = self.new_results()
         with mock.patch.object(pf, "process_product", boom):
-            with self.assertRaises(SystemExit):                  # 従来どおり終了させる(CLI の挙動は変えない)
-                pf.run_product(self.ctx(), results)
+            pf.run_product(self.ctx(), results)                  # 再送出しない(残りの製番を処理できるようにする)
         self.assertEqual(results, {"completed": [], "failed": {"A1BN0001": pf.SYSTEM_EXIT_REASON}, "skipped": {}})
         self.rmtree.assert_called_once_with(str(self.dir_product))          # 部分出力は既存の失敗と同じ後始末で削除
         self.assertFalse(any("secret" in m or "password" in m for m in self.logged("error") + self.logged("info")))
+
+    def test_batch_continues_after_system_exit_and_after_a_normal_exception(self):
+        """1件目が SystemExit / 通常例外でも、失敗記録と後始末のあと2件目が実行され、成功する(成功済みの出力は削除しない)。"""
+        for first in (SystemExit(3), RuntimeError("x")):
+            self.rmtree.reset_mock()
+            self.dir_product.mkdir(exist_ok=True)
+            ran = []
+            def fake(c, _first=first):
+                ran.append(c.product)
+                if c.product == "A1BN0001":
+                    raise _first
+                return pf.ProductResult(pf.COMPLETED)
+            results = self.new_results()
+            with mock.patch.object(pf, "process_product", fake):
+                pf.run_product(self.ctx(), results)
+                pf.run_product(self.ctx(product="A1BN0002", dir_product=str(self.output_dir / "A1BN0002")), results)
+            self.assertEqual(ran, ["A1BN0001", "A1BN0002"], repr(first))
+            self.assertEqual(list(results["failed"]), ["A1BN0001"])
+            self.assertEqual(results["completed"], ["A1BN0002"])
+            self.rmtree.assert_called_once_with(str(self.dir_product))       # 後始末の対象は失敗した製番だけ
+            if isinstance(first, SystemExit):
+                self.assertEqual(results["failed"]["A1BN0001"], pf.SYSTEM_EXIT_REASON)
+
+    def test_keyboard_interrupt_still_stops_everything(self):
+        results = self.new_results()
+        with mock.patch.object(pf, "process_product", lambda c: (_ for _ in ()).throw(KeyboardInterrupt())):
+            with self.assertRaises(KeyboardInterrupt):
+                pf.run_product(self.ctx(), results)
 
     def test_system_exit_never_deletes_outside_output_root(self):
         outside = self.tmp / "other"
         outside.mkdir()
         results = self.new_results()
         with mock.patch.object(pf, "process_product", lambda c: (_ for _ in ()).throw(SystemExit(1))):
-            with self.assertRaises(SystemExit):
-                pf.run_product(self.ctx(dir_product=str(outside)), results)
+            pf.run_product(self.ctx(dir_product=str(outside)), results)
         self.assertEqual(self.rmtree.call_count, 0)
         self.assertTrue(outside.is_dir())
         self.assertIn("A1BN0001", results["failed"])
@@ -194,8 +220,7 @@ class RunProductCleanupTest(FlowBase):
     def test_system_exit_without_product_folder_deletes_nothing(self):
         results = self.new_results()
         with mock.patch.object(pf, "process_product", lambda c: (_ for _ in ()).throw(SystemExit())):
-            with self.assertRaises(SystemExit):
-                pf.run_product(self.ctx(), results)
+            pf.run_product(self.ctx(), results)
         self.assertEqual(self.rmtree.call_count, 0)
         self.assertIn("A1BN0001", results["failed"])
 
