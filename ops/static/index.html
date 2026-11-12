@@ -69,6 +69,9 @@
       <div class="row"><button id="register">タスクを登録・更新</button><button id="unregister" class="secondary">解除</button></div>
       <div class="msg" id="msg3"></div>
       <div class="msg" style="font-size:18px">※ ログオン中のみ動作します(ログオフ中は動きません)。間隔 2 = 1 日置き、1 = 毎日。</div>
+      <div class="row" style="margin-top:10px;padding-top:8px;border-top:1px solid var(--line)"><button id="runnow">今すぐ実行</button><span class="msg" id="msg5"></span></div>
+      <div class="msg" style="font-size:18px">※ 定期処理を、次回の実行を待たずに今すぐ 1 回開始します。タスクの登録・有効/無効・開始時刻は変わりません(タスクが未登録・無効でも実行できます)。</div>
+      <div id="runnowresult" style="font-size:19px"></div>
     </section>
     <section id="s4">
       <h2>4. 製番を指定して実行</h2>
@@ -99,7 +102,42 @@ async function api(method, path, body) {
   return data;
 }
 function say(id, text, cls) { const e = $(id); e.textContent = text || ""; e.className = "msg" + (cls ? " " + cls : ""); }
-const statusClass = { "完了": "ok", "失敗": "ng", "実行中": "skip", "スキップ": "skip" };
+const statusClass = { "完了": "ok", "失敗": "ng", "実行中": "skip", "スキップ": "skip", "未開始": "skip" };
+const RUN_NOW_CONFIRM = "「今すぐ実行」を開始します。\n\n"
+  + "・ホストの「当月の3番図面出図・initials=A1・未処理または未完了マーカーあり」の製番を、この時点で取得して処理します。\n"
+  + "・本番の出力(製番フォルダ・PDF・画像など)が作成されます。\n"
+  + "・件数・時間の上限はなく、取得した製番をすべて処理します。\n"
+  + "・タスクスケジュールの有効/無効・開始時刻は変わりません。\n\nよろしいですか?";
+// 直近の定期系の実行(今すぐ実行・定期)の結果を表示する。画面を再読み込みしても、履歴から復元する。
+function renderBatch(runs) {
+  const box = $("runnowresult"); box.textContent = "";
+  const r = runs.find((x) => x.kind === "今すぐ実行" || x.kind === "定期");
+  if (!r) return;
+  const head = document.createElement("div");
+  head.textContent = "直近の" + r.kind + "(" + (r.started || "") + "): " + r.status;
+  head.className = "badge " + (statusClass[r.status] || ""); box.appendChild(head);
+  const results = r.results || null, targets = r.targets || [];
+  if (results) {
+    const c = { "完了": 0, "失敗": 0, "スキップ": 0, "未開始": 0 };
+    for (const v of Object.values(results)) if (v.status in c) c[v.status] += 1;
+    const n = document.createElement("div"); n.textContent = "完了 " + c["完了"] + " 件・失敗 " + c["失敗"] + " 件・スキップ " + c["スキップ"] + " 件・未開始 " + c["未開始"] + " 件"; box.appendChild(n);
+  } else if (r.status === "実行中") {
+    const n = document.createElement("div"); n.textContent = targets.length ? "実行中: 対象 " + targets.length + " 件を処理しています" : "実行中: ホストから対象を取得しています"; box.appendChild(n);
+  }
+  if (r.reason) { const n = document.createElement("div"); n.className = "msg"; n.textContent = r.reason; box.appendChild(n); }
+  const names = results ? Object.keys(results) : targets;
+  if (names.length) {
+    const t = document.createElement("table"); t.style.minWidth = "0";
+    for (const name of names) {
+      const v = results ? results[name] : null, tr = document.createElement("tr");
+      for (const [text, cls] of [[name, ""], [v ? v.status : (r.status === "実行中" ? "処理待ち/処理中" : ""), v ? "badge " + (statusClass[v.status] || "") : "skip"], [v && v.reason ? v.reason : "", "reason"]]) {
+        const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td);
+      }
+      t.appendChild(tr);
+    }
+    box.appendChild(t);
+  }
+}
 
 function applySettings(s) {
   if (!s) return;
@@ -128,6 +166,7 @@ async function refreshState(withSchedule) {
     $("runstate").textContent = running ? "実行中" + (st.status.current ? "(" + st.status.current.product + ")" : "") : "待機中";
     $("runstate").className = "state " + (running ? "skip" : "ok");
     $("run").disabled = !!running;
+    $("runnow").disabled = !!running; $("runnow").textContent = running ? "実行中" : "今すぐ実行";
     if (st.settings_error) say("msg1", st.settings_error, "ng");
     if (withSchedule) { applySettings(st.settings); showSchedule(st.schedule); }
   } catch (e) { $("runstate").textContent = "接続できません"; $("runstate").className = "state ng"; }
@@ -135,6 +174,7 @@ async function refreshState(withSchedule) {
 async function refreshHistory() {
   try {
     const { runs } = await api("GET", "/api/history");
+    renderBatch(runs);
     const body = $("history"); body.textContent = "";
     for (const r of runs) {
       const tr = document.createElement("tr"); if (r.status === "実行中") tr.className = "running";
@@ -172,6 +212,14 @@ $("run").onclick = async () => {
   say("msg4", "");
   try { await api("POST", "/api/run", { product: $("product").value, output_root: $("runroot").value }); say("msg4", "開始しました。", "ok"); refreshState(false); refreshHistory(); }
   catch (e) { say("msg4", e.message, "ng"); }
+};
+$("runnow").onclick = async () => {
+  say("msg5", "");
+  if (!window.confirm(RUN_NOW_CONFIRM)) return;
+  $("runnow").disabled = true;
+  try { await api("POST", "/api/run-now", { confirmed: true }); say("msg5", "開始しました。", "ok"); }
+  catch (e) { say("msg5", e.message, "ng"); }
+  refreshState(false); refreshHistory();
 };
 refreshState(true); refreshHistory();
 setInterval(() => { refreshState(false); refreshHistory(); }, 3000);

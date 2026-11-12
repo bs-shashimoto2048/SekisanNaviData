@@ -123,6 +123,7 @@ def make_handler(ctx: AppContext):
                 "/api/settings/browse-folder": self._do_browse,
                 "/api/checks": self._do_checks,
                 "/api/run": self._do_run,
+                "/api/run-now": self._do_run_now,
                 "/api/schedule/register": self._do_register,
             }
             if path not in routes:
@@ -180,6 +181,18 @@ def make_handler(ctx: AppContext):
         def _do_run(self):
             body = self._body()
             run_id, _ = ctx.runs.start_manual(body.get("product"), body.get("output_root"))
+            return {"ok": True, "id": run_id}
+
+        def _do_run_now(self):
+            """「今すぐ実行」。ホストから対象を取得して本番処理を 1 回開始する(定期実行と同じ処理・同じロック)。本番出力が作られるため、
+            画面の確認ダイアログで同意した要求(body.confirmed が true)だけ受け付ける。タスクスケジューラの登録・有効/無効・時刻は変更しない。
+            他の実行が動作中なら 409(「すでに実行中」)。対象の確定と処理は別スレッドで行い、ここは開始だけを返す(結果は履歴・状態から読む)。"""
+            if self._body().get("confirmed") is not True:
+                raise SettingsError("確認が必要です。「今すぐ実行」は、確認ダイアログで同意したときだけ開始します。")
+            try:
+                run_id, _ = ctx.runs.start_run_now()
+            except Busy:
+                raise Busy("すでに実行中です。完了してから開始してください。") from None
             return {"ok": True, "id": run_id}
 
         def _do_register(self):
