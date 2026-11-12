@@ -35,7 +35,7 @@ from cad_data.baninf_tables import (  # noqa: F401
     side_view_classifier,
     to_numeric_safe,
 )
-from cad_data.boxspec_material import export_material_csv, MaterialDataError  # noqa: F401  (設計データの *.boxspec -> material.csv。分割後に追加)
+from cad_data.boxspec_material import export_material_csv, MaterialDataError, BoxspecMissingError  # noqa: F401  (設計データの *.boxspec -> material.csv。分割後に追加)
 from cad_data.design_page_db import (  # noqa: F401  (設計データのページ番号 .db -> design.csv。分割後に追加)
     DESIGN_CSV_NAME,
     DesignDataError,

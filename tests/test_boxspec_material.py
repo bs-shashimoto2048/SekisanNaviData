@@ -272,24 +272,58 @@ class WithBoxspecTest(PipelineIntegrationTest):
 
 
 class WithoutBoxspecTest(PipelineIntegrationTest):
+    """設計データ(*.boxspec)がまだ無い製番は、失敗ではなく「未処理(スキップ)」。出力を残さず、次回の対象選定に再び含まれる。"""
     boxspec_lines = None
+    REASON = "設計データ未整備のため未処理。*.boxspec の作成後、次回実行で再処理します"
 
-    def test_product_fails_and_is_recorded_without_material_csv(self):
+    def test_product_is_skipped_with_a_clear_reason_and_creates_no_output(self):
         self.run_main()
-        self.assert_failed_at_step1("material.csv を作成できません")
-        self.assertIn("*.boxspec がありません", self.results["failed"][PRODUCT])
+        self.assertEqual(self.results["completed"], [])
+        self.assertEqual(self.results["failed"], {})                                   # 失敗にしない
+        self.assertEqual(self.results["skipped"], {PRODUCT: self.REASON})              # 未処理であることと再処理の条件が分かる理由
+        self.assertEqual(self.print_script_calls, [])                                  # 後続の印刷・推論には進まない
+        self.assertEqual(self.convert_calls, [])
+        self.assertEqual(self.api_calls, [])
+        self.assertEqual([Path(c.args[0]).resolve() for c in self.rmtree.call_args_list], [self.product_out])   # 製番フォルダの後始末を要求
         self.assertFalse((self.product_out / "material.csv").exists())
+        self.assertIn("未処理(スキップ)", self.log_text())
+        self.assertNotIn("を失敗とします", self.log_text())
+
+    def test_same_product_stays_in_the_next_host_target_selection(self):
+        from ops.host_targets import resolve_targets
+        self.run_main()
+        out_root = str(self.product_out.parent)
+        fetch = lambda: [{"SEIBAN": PRODUCT}, {"SEIBAN": "B2OTHER001"}]      # noqa: E731
+        # 後始末(rmtree はモックで実削除されない)の要求どおり製番フォルダが無くなれば、通常の未処理として対象に残る
+        shutil.rmtree(self.product_out, ignore_errors=True)
+        self.assertEqual(resolve_targets(out_root, PRODUCT[:2], fetch=fetch).targets, (PRODUCT,))
 
     def test_rerun_succeeds_after_the_boxspec_is_added(self):
         self.run_main()
-        self.assertIn(PRODUCT, self.results["failed"])
+        self.assertIn(PRODUCT, self.results["skipped"])
         # 参照元(設計データ)を整えて再実行する。後始末は rmtree モックで実削除されないので、出力側の製番フォルダを手で消してから流す
         shutil.rmtree(self.product_out, ignore_errors=True)
         write_boxspec(self.design_product, "301.boxspec", [STEEL_ALL])
         self.run_main()
         self.assertEqual(self.results["failed"], {})
+        self.assertEqual(self.results["skipped"], {})
         self.assertEqual(self.results["completed"], [PRODUCT])
         self.assertEqual(len(read_rows(self.product_out / "material.csv")), 9)
+
+
+class BoxspecErrorKindsTest(unittest.TestCase):
+    """スキップにするのは「*.boxspec が 1 つも無い」だけ。解析失敗・材料行なしは、従来どおり製番の失敗(MaterialDataError)。"""
+
+    def test_only_a_missing_boxspec_is_the_skip_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            design = Path(td) / "design"
+            design.mkdir()
+            with self.assertRaises(bm.BoxspecMissingError):
+                bm.build_material_rows(design)
+            write_boxspec(design, "1.boxspec", ["シンボル名$BSP-STEELA-H|oops|"])
+            with self.assertRaises(bm.MaterialDataError) as cm:
+                bm.build_material_rows(design)
+            self.assertNotIsInstance(cm.exception, bm.BoxspecMissingError)
 
 
 class BrokenBoxspecTest(PipelineIntegrationTest):

@@ -2,6 +2,7 @@
 # 外部接続なし: ホスト・設計サーバー・IJCAD・推論 API は mock、フォルダは一時ディレクトリ、shutil.rmtree は記録用モック。
 # (全体を通した成功・失敗の流れは test_main_integration / test_output_contract が見ている)
 import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,9 @@ write_design_csv = importlib.import_module("cad_data.design_page_db").write_desi
 
 STEPS = ["check_product", "step1_design_data", "step2_inference_images", "step3_frame_scale",
          "step4_detect_objects", "step5_aggregate"]
+
+
+_real_rmtree = shutil.rmtree          # FlowBase が pf.shutil.rmtree をモックにする前の本物
 
 
 class FlowBase(unittest.TestCase):
@@ -199,6 +203,45 @@ class RunProductCleanupTest(FlowBase):
             self.rmtree.assert_called_once_with(str(self.dir_product))       # 後始末の対象は失敗した製番だけ
             if isinstance(first, SystemExit):
                 self.assertEqual(results["failed"]["A1BN0001"], pf.SYSTEM_EXIT_REASON)
+
+    def test_missing_boxspec_skip_leaves_no_folder_or_marker_and_is_selected_next_time(self):
+        """*.boxspec が無い製番: スキップ(失敗ではない)。製番フォルダも未完了マーカーも残さず、次回のホスト対象選定に再び含まれる。"""
+        from ops.host_targets import resolve_targets
+        self.rmtree.side_effect = _real_rmtree                                  # この試験だけ実際に削除する(出力は一時フォルダの中だけ)
+        reason = pf.BOXSPEC_MISSING_SKIP_REASON
+        self.assertIn("未処理", reason)
+        self.assertIn("*.boxspec", reason)
+        self.assertIn("次回実行で再処理", reason)
+        self.dir_product.mkdir()
+        (self.dir_product / "design.csv").write_text("x", encoding="utf-8")
+        pf.mark_incomplete(str(self.output_dir), "A1BN0001")
+        results = self.new_results()
+        with mock.patch.object(pf, "process_product", lambda c: pf.ProductResult(pf.SKIPPED, reason, cleanup=True)):
+            pf.run_product(self.ctx(), results)
+        self.assertEqual(results, {"completed": [], "failed": {}, "skipped": {"A1BN0001": reason}})
+        self.assertFalse(self.dir_product.exists())
+        self.assertFalse(pf.has_incomplete_marker(str(self.output_dir), "A1BN0001"))
+        plan = resolve_targets(str(self.output_dir), "A1", fetch=lambda: [{"S": "A1BN0001"}])
+        self.assertEqual(plan.targets, ("A1BN0001",))
+
+    def test_batch_continues_after_a_boxspec_skip_or_a_failure_and_keeps_other_failures(self):
+        """先行の製番が(*.boxspec なしの)スキップでも、印刷成果物不足などの失敗でも、後続を試行する。失敗の扱いは変えない。"""
+        for first in (pf.ProductResult(pf.SKIPPED, pf.BOXSPEC_MISSING_SKIP_REASON, cleanup=True),
+                      pf.ProductResult(pf.FAILED, "[Step.2] 印刷(PDF)の成果物が不足しています: 対象 5 件中 3 件(欠落 3 件・空または不正 0 件)(未完了)", cleanup=True)):
+            ran = []
+            def fake(c, _first=first):
+                ran.append(c.product)
+                return _first if c.product == "A1BN0001" else pf.ProductResult(pf.COMPLETED)
+            results = self.new_results()
+            with mock.patch.object(pf, "process_product", fake):
+                pf.run_product(self.ctx(), results)
+                pf.run_product(self.ctx(product="A1BN0002", dir_product=str(self.output_dir / "A1BN0002")), results)
+            self.assertEqual(ran, ["A1BN0001", "A1BN0002"])
+            self.assertEqual(results["completed"], ["A1BN0002"])
+            if first.status == pf.SKIPPED:
+                self.assertEqual((results["failed"], list(results["skipped"])), ({}, ["A1BN0001"]))
+            else:
+                self.assertEqual((list(results["failed"]), results["skipped"]), (["A1BN0001"], {}))      # 印刷成果物不足は従来どおり失敗
 
     def test_keyboard_interrupt_still_stops_everything(self):
         results = self.new_results()
