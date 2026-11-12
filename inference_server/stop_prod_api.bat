@@ -8,11 +8,11 @@ cd /d "%~dp0"
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo Cannot stop: the runtime environment ^(.venv^) was not found. Contact the administrator.
-  timeout /t 30 >nul
+  ping -n 31 127.0.0.1 >nul
   exit /b 1
 )
 "%PY%" -X utf8 prod_ctl.py stop
 set "RC=%ERRORLEVEL%"
 echo.
-timeout /t 10 >nul
+ping -n 11 127.0.0.1 >nul
 exit /b %RC%
