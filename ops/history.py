@@ -13,6 +13,7 @@ HISTORY_FILE = "ops_history.local.jsonl"
 
 RUNNING, COMPLETED, FAILED = "実行中", "完了", "失敗"
 KIND_MANUAL, KIND_SCHEDULED = "手動", "定期"
+KIND_RUN_NOW = "今すぐ実行"            # 運用画面の「今すぐ実行」。対象選定・処理は定期実行と同じ(区別のための種別だけが違う)
 KIND_SCHEDULED_CHECK = "定期(検証)"      # run-scheduled --dry-run。製番処理は行わない(通常の「定期」と区別する)
 MAX_REASON = 200
 
@@ -59,6 +60,17 @@ class History:
             event["deferred"] = [{"product": str(d["product"]), "streak": int(d["streak"])} for d in deferred]
         self._append(event)
         return run_id
+
+    def update(self, run_id: str, reason: Optional[str] = None, targets: Optional[List[str]] = None, product: Optional[str] = None):
+        """実行中の記録に、確定した対象(targets)・製番欄・開始時点の説明を追記する(実行は「実行中」のまま)。"""
+        event = {"id": run_id, "status": RUNNING}
+        if reason is not None:
+            event["reason"] = sanitize_reason(reason)
+        if targets is not None:
+            event["targets"] = [str(t) for t in targets]
+        if product is not None:
+            event["product"] = product
+        self._append(event)
 
     def finish(self, run_id: str, status: str, reason: str = "", results: Optional[dict] = None):
         """実行の終了を記録する。results は製番ごとの結果(定期実行だけ。`{製番: {"status", "reason", "scope"?}}`。status は 完了/失敗/スキップ/未開始)。"""

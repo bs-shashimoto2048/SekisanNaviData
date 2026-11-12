@@ -1054,13 +1054,13 @@ class ServerTest(NoRealSubprocess):
         self.assertEqual(w.items["s1"], [("input", "outroot"), ("button", "browse"), ("button", "save"), ("button", "reload")])
         self.assertEqual(w.items["s2"], [("button", "check"), ("ul", "checks")])
         self.assertEqual(w.items["s3"], [("input", "enabled"), ("input", "time"), ("input", "interval"),
-                                         ("button", "register"), ("button", "unregister")])
+                                         ("button", "register"), ("button", "unregister"), ("button", "runnow")])
         self.assertEqual(w.items["s4"], [("input", "product"), ("input", "runroot"), ("button", "run")])
         self.assertEqual(w.items["s5"], [("tbody", "history")])
         # 実行履歴の列(日時・種別・製番・状態・理由)
         self.assertEqual(w.th, ["日時", "種別", "製番", "状態", "理由"])
         html = raw.decode("utf-8")
-        for caption in ("参照…", "保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "この製番を1回実行",
+        for caption in ("参照…", "保存", "再読込", "動作チェックを実行", "タスクを登録・更新", "解除", "今すぐ実行", "この製番を1回実行",
                         "出力先", "有効", "開始時刻", "間隔", "日ごと", "製番"):
             self.assertIn(caption, html, caption)
     def test_mutating_requests_need_the_header_and_a_loopback_host(self):
@@ -1155,8 +1155,8 @@ class EntryPointTest(NoRealSubprocess):
         import importlib
         oc = importlib.import_module("ops_console")
         captured = {}
-        runs = SimpleNamespace(run_scheduled_targeted=mock.Mock(name="run_scheduled_targeted"),
-                               run_scheduled_targeted_dry_run=mock.Mock(return_value="完了"), refusal=None, last_plan=None)
+        runs = SimpleNamespace(run_scheduled_host=mock.Mock(name="run_scheduled_host"),
+                               run_scheduled_host_dry_run=mock.Mock(return_value="完了"), refusal=None, last_plan=None)
 
         def fake_build(**kw):
             captured.update(kw)
@@ -1166,15 +1166,15 @@ class EntryPointTest(NoRealSubprocess):
         self.addCleanup(os.chdir, cwd)
         with mock.patch.object(oc, "build_context", side_effect=fake_build):
             self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 0)
-            runs.run_scheduled_targeted_dry_run.return_value = "失敗"
+            runs.run_scheduled_host_dry_run.return_value = "失敗"
             self.assertEqual(oc.main(["run-scheduled", "--dry-run"]), 1)        # 失敗は終了コード 1
-        runs.run_scheduled_targeted.assert_not_called()
+        runs.run_scheduled_host.assert_not_called()
         with self.assertRaises(AssertionError):                                  # 渡された main_func は呼べない(万一でも app.main に届かない)
             captured["main_func"]()
         with mock.patch.object(oc, "build_context", side_effect=fake_build):
-            runs.run_scheduled_targeted.return_value = "完了"
+            runs.run_scheduled_host.return_value = "完了"
             self.assertEqual(oc.main(["run-scheduled"]), 0)                      # --dry-run なしは従来の通常処理
-        runs.run_scheduled_targeted.assert_called_once()
+        runs.run_scheduled_host.assert_called_once()
 
     def test_scheduled_task_command_is_unchanged_and_has_no_dry_run(self):
         ts = scheduler_mod.TaskScheduler("py.exe", "ops_console.py")
@@ -1186,7 +1186,7 @@ class EntryPointTest(NoRealSubprocess):
         oc = importlib.import_module("ops_console")
         cwd = os.getcwd()
         self.addCleanup(os.chdir, cwd)
-        ctx = SimpleNamespace(runs=SimpleNamespace(run_scheduled_targeted=lambda: "完了", refusal=None, last_plan=None))
+        ctx = SimpleNamespace(runs=SimpleNamespace(run_scheduled_host=lambda: "完了", refusal=None, last_plan=None))
         os.chdir(self.tmp)
         with mock.patch.object(oc, "build_context", return_value=ctx):
             self.assertEqual(oc.cmd_run_scheduled(SimpleNamespace(config=None)), 0)    # タスクの既定の作業フォルダ(System32)でも、リポジトリ基準になる
