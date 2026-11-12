@@ -116,6 +116,54 @@ class ResolveTargetsTest(Base):
             self.assertNotIn(word, sql.upper())
 
 
+# ------------------------------------------------------------------ 通常バッチ(host_mod)と取得条件が完全に一致する
+class NormalBatchEquivalenceTest(Base):
+    """通常バッチ=host_mod.create_n3_design_list / HostAccess.search_design3 / get_missing_folders / include_incomplete_products。
+    定期実行・今すぐ実行の対象確定(ops.host_targets)が、SQL・対象行・処理済み除外・未完了の再処理まで同じであること(日付の上限なし=年・月だけ、も含めて)。"""
+    FIELDS = ["F0", "F1", "F2", "F3", "F4", "F5", "F6", "DT"]
+
+    def normal_sql(self, yyyymmdd):
+        from bs_pkg import host_mod
+        seen = []
+        with mock.patch.object(host_mod, "get_tables", return_value=("TBL", self.FIELDS)),                 mock.patch.object(host_mod, "access_db", side_effect=lambda sql, fields: seen.append(sql) or None):
+            host_mod.HostAccess().search_design3(yyyymmdd)
+        return seen[0]
+
+    def new_sql(self, today):
+        fake_win32 = mock.MagicMock()
+        conn, rs = mock.MagicMock(), mock.MagicMock()
+        fake_win32.client.Dispatch.side_effect = lambda name: conn if name == "ADODB.Connection" else rs
+        rs.EOF = True
+        with mock.patch.dict(sys.modules, {"win32com": fake_win32, "win32com.client": fake_win32.client}),                 mock.patch("bs_pkg.host_mod.get_tables", return_value=("TBL", self.FIELDS)),                 mock.patch("bs_pkg.config_loader.load_yaml", return_value={"host_name": "h", "user_id": "u", "password": "p"}):
+            host_targets.fetch_design3_rows(today)
+        return rs.Open.call_args[0][0]
+
+    def test_sql_is_identical_to_the_normal_batch_on_boundary_dates_and_has_no_day_condition(self):
+        from datetime import datetime
+        for d in ("2026-01-01", "2026-01-31", "2026-02-28", "2028-02-29", "2026-03-01", "2026-09-30", "2026-10-01", "2026-11-12", "2026-12-31"):
+            today = datetime.strptime(d, "%Y-%m-%d")
+            normal = self.normal_sql(today.strftime("%Y%m%d"))
+            self.assertEqual(self.new_sql(today), normal, d)                    # 文字まで同じ
+            self.assertEqual(normal.count("EXTRACT("), 2, d)                     # 年・月だけ。日(DAY)や「実行日まで」の比較は通常バッチにも無い
+            self.assertNotIn("DAY", normal.upper())
+            self.assertNotIn("<=", normal)
+            self.assertIn(f"= {today.strftime('%m')} ", normal + " ")
+            self.assertIn(f"= {today.strftime('%Y')}", normal)
+
+    def test_targets_match_the_normal_batch_for_rows_folders_and_incomplete_markers(self):
+        from bs_pkg import host_mod
+        names = ["A1TEST0003", "A1TEST0001", "A1TEST0001", "B2OTHER001", "a1lower001", "", "A1TEST0002", "A1TEST0004", "A1TEST0005"]
+        host_rows = [{"F0": n} for n in names]
+        for n in ("A1TEST0002", "A1TEST0004", "A1TEST0005"):
+            (self.out / n).mkdir()                                              # 出力済み
+        product_flow.mark_incomplete(str(self.out), "A1TEST0004")               # うち 1 件は未完了マーカーあり → 再処理
+        with mock.patch.object(host_mod.HostAccess, "search_design3", return_value=host_rows):
+            n3 = host_mod.create_n3_design_list("A1")
+        normal = product_flow.include_incomplete_products(str(self.out), n3, host_mod.get_missing_folders(str(self.out), n3))
+        plan = resolve_targets(str(self.out), "A1", fetch=lambda: host_rows)
+        self.assertEqual(list(plan.targets), normal)                            # 通常バッチと同じ対象・同じ並び
+        self.assertEqual(normal, ["A1TEST0001", "A1TEST0003", "A1TEST0004"])    # 未処理は昇順、未完了の再処理はその後ろ。処理済み・A1 以外・空は除く
+
 # ------------------------------------------------------------------ 定期実行と今すぐ実行: 同じ処理
 class SameProcessingTest(Base):
     def test_scheduled_and_run_now_call_the_same_main_once_with_the_same_targets_and_no_caps(self):

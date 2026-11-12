@@ -1,8 +1,10 @@
 # 定期実行と「今すぐ実行」が共有する、今回の対象の確定(同じ関数・同じ条件)。実行のたびにホスト DB を読み取り専用で照会する。
 #
-# 対象 = 「実行月(当月〜当日)に 3 番図面が出図済み」かつ「製番が設定 `target_initial`(A1)で始まる」製番のうち、
+# 対象 = 「実行月(当月)に 3 番図面が出図済み」かつ「製番が設定 `target_initial`(A1)で始まる」製番のうち、
 #   - 出力先に製番フォルダが無いもの(未処理)、または
 #   - 出力先に製番フォルダがあっても、未完了マーカーがあるもの(再処理)。
+# ※「当日まで」の日付上限は設けない: 通常バッチ(host_mod.create_n3_design_list → HostAccess.search_design3)の SQL も、出図日の「年・月」だけで絞っていて、
+#   日の条件は無い(ログの「当月(～当日)」は表記のみ)。既存ルールをそのまま維持する(出図日が実行日より後の行がホストにあれば、通常バッチと同じく対象に含まれる)。
 # 出力済みで、未完了マーカーが無い製番は除く。固定の製番リスト・件数や時間の上限は使わない(取得した対象をすべて処理する)。
 #
 # ホストの一覧が取得できない(接続・認証・照会の失敗)ときは、0 件成功にせず `TargetError`(固定の理由)にする。
@@ -26,7 +28,7 @@ class TargetError(RuntimeError):
 @dataclass(frozen=True)
 class TargetPlan:
     targets: tuple          # 今回処理する製番(この順)
-    listed: int             # 当月(〜当日)の 3 番出図済みの製番(頭文字で絞ったあと)の件数
+    listed: int             # 当月の 3 番出図済みの製番(頭文字で絞ったあと)の件数
 
     def summary(self) -> str:
         if not self.targets:
@@ -44,8 +46,8 @@ def fetch_design3_rows(today: Optional[datetime] = None) -> List[dict]:
     table, fields = host_mod.get_tables(8)
     key = fields[7]
     sql = (f"SELECT * FROM {table} AS A "
-           f"WHERE EXTRACT(MONTH FROM A.{key}) = {int(today.strftime('%m'))} "
-           f"AND EXTRACT(YEAR FROM A.{key}) = {int(today.strftime('%Y'))}")
+           f"WHERE EXTRACT(MONTH FROM A.{key}) = {today.strftime('%m')} "
+           f"AND EXTRACT(YEAR FROM A.{key}) = {today.strftime('%Y')}")        # 通常バッチ(search_design3)と文字まで同じ SQL
     assert sql.lstrip().upper().startswith("SELECT")          # 読み取り専用であることの確認(更新系は発行しない)
     product_field = fields[0]
     local = config_loader.load_yaml(host_mod.LOCAL_CONFIG_PATH)
