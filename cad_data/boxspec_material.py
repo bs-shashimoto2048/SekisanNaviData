@@ -58,6 +58,11 @@ class MaterialDataError(Exception):
     """製番の material.csv を作れない。メッセージは製番の失敗理由(表示・記録用)。"""
 
 
+class BoxspecMissingError(MaterialDataError):
+    """設計フォルダに *.boxspec が 1 つも無い(設計データが未整備)。製番の失敗ではなく「未処理(スキップ)」として扱う。
+    解析失敗・材料行なし・書き出し失敗は、従来どおり MaterialDataError(製番の失敗)。"""
+
+
 def find_boxspec_files(design_dir) -> List[Path]:
     """設計フォルダ直下の *.boxspec(大文字小文字を問わない)をページ順に返す。フォルダが無ければ空。"""
     folder = Path(design_dir)
@@ -166,7 +171,7 @@ def build_material_rows(design_dir, log=None) -> List[dict]:
     if not files:
         reason = "設計フォルダに *.boxspec がありません(材料情報を作れません)"
         log.warning(f"boxspec: {reason}")
-        raise MaterialDataError(reason)
+        raise BoxspecMissingError(reason)
     rows: List[dict] = []
     for f in files:
         try:

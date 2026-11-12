@@ -429,6 +429,31 @@ class ServerTest(Base):
         self.assertEqual(sorted(run["results"]), ["A1TEST0001", "A1TEST0002", "A1TEST0003"])               # 完了後は製番ごとの結果が復元できる
         self.assertEqual(len(self.main_calls), 1)
 
+    def test_boxspec_skip_reason_is_shown_per_product_and_does_not_fail_the_run(self):
+        """*.boxspec が無くスキップされた製番と理由が、履歴(再読込後も)と画面に製番別に出る。完了/この理由のスキップだけなら実行全体は失敗にしない。"""
+        reason = "設計データ未整備のため未処理。*.boxspec の作成後、次回実行で再処理します"
+        self.ctx.runs.main_func = lambda **kw: {"completed": ["A1TEST0002", "A1TEST0003"], "failed": {}, "skipped": {"A1TEST0001": reason}}
+        self.assertEqual(self.call("POST", "/api/run-now", {"confirmed": True})[0], 200)
+        self.wait_idle()
+        run = self.call("GET", "/api/history")[1]["runs"][0]
+        self.assertEqual(run["status"], COMPLETED)                                      # 失敗にしない(run-scheduled の終了コードも 0)
+        self.assertEqual(run["results"]["A1TEST0001"], {"status": "スキップ", "reason": reason})
+        self.assertEqual(run["results"]["A1TEST0002"], {"status": "完了"})
+        html = (ROOT / "ops" / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("v && v.reason ? v.reason", html)                                   # 画面は、製番ごとの理由を表に出す
+        self.assertIn('"スキップ": 0', html)
+
+    def test_other_failures_still_fail_the_whole_run_after_all_products_are_tried(self):
+        reason = "設計データ未整備のため未処理。*.boxspec の作成後、次回実行で再処理します"
+        self.ctx.runs.main_func = lambda **kw: {"completed": ["A1TEST0003"], "failed": {"A1TEST0002": "[Step.2] 印刷(PDF)の成果物が不足しています"},
+                                                "skipped": {"A1TEST0001": reason}}
+        self.call("POST", "/api/run-now", {"confirmed": True})
+        self.wait_idle()
+        run = self.call("GET", "/api/history")[1]["runs"][0]
+        self.assertEqual(run["status"], FAILED)
+        self.assertEqual({k: v["status"] for k, v in run["results"].items()},
+                         {"A1TEST0001": "スキップ", "A1TEST0002": "失敗", "A1TEST0003": "完了"})
+
     def test_a_failed_whole_run_is_visible_in_the_history_with_its_reason(self):
         self.ctx.runs.target_resolver = lambda root: (_ for _ in ()).throw(TargetError(HOST_FAILED_REASON.format(kind="OSError")))
         self.assertEqual(self.call("POST", "/api/run-now", {"confirmed": True})[0], 200)

@@ -238,6 +238,7 @@ def _jpeg_extension() -> str:
 
 
 SYSTEM_EXIT_REASON = "処理が途中で終了しました(SystemExit)"
+BOXSPEC_MISSING_SKIP_REASON = "設計データ未整備のため未処理。*.boxspec の作成後、次回実行で再処理します"
 
 
 def record_result(results: dict, product: str, result: ProductResult):
@@ -424,6 +425,11 @@ def step1_design_data(ctx: ProductContext) -> Optional[ProductResult]:
     logger.info("材料情報(boxspec -> material.csv):")
     try:
         material_path = cad_mod.export_material_csv(ctx.dir_design_product, dir_product, log=logger)
+    except cad_mod.BoxspecMissingError as e:
+        # 設計データ(*.boxspec)がまだ無い。失敗ではなく未処理(スキップ)。製番フォルダと未完了マーカーを残さず(cleanup)、
+        # 次回のホスト対象選定に再び含まれる。*.boxspec が作られれば、次回は通常どおり処理する。
+        logger.warning(f"*.boxspec が無いため、製番 {ctx.product} は未処理(スキップ)にします: {e}")
+        return ProductResult(SKIPPED, BOXSPEC_MISSING_SKIP_REASON, cleanup=True)
     except cad_mod.MaterialDataError as e:
         logger.error(f"material.csv を作成できないため、製番 {ctx.product} を失敗とします: {e}\n")
         return ProductResult(FAILED, f"material.csv を作成できません: {e}", cleanup=True)
